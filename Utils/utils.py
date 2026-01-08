@@ -4,7 +4,7 @@ import os
 from typing import Dict, Optional
 
 # New: Import from settings
-from settings import (
+from bot.settings import (
     SUPPORTED_SITES,
     HIGH_DEAL_THRESHOLD,
     MEDIUM_DEAL_THRESHOLD,
