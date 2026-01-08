@@ -3,8 +3,17 @@ from config import APIFY_TOKEN
 import os
 from typing import Dict, Optional
 
+# New: Import from settings
+from settings import (
+    SUPPORTED_SITES,
+    HIGH_DEAL_THRESHOLD,
+    MEDIUM_DEAL_THRESHOLD,
+    LOW_DEAL_THRESHOLD,
+    MIN_CHANGE_TO_ALERT,
+)
+
 # Initialize client once (fallback to env if config missing)
-client = ApifyClient(APIFY_TOKEN)
+client = ApifyClient(APIFY_TOKEN or os.getenv("APIFY_TOKEN"))
 
 
 def scrape_product(url: str) -> Dict:
@@ -14,14 +23,19 @@ def scrape_product(url: str) -> Dict:
     """
     url_lower = url.lower()
 
+    # Validate supported site (extensible for Konga later)
+    if not any(site in url_lower for site in SUPPORTED_SITES):
+        raise ValueError(f"Unsupported site in MVP. Supported: {SUPPORTED_SITES}. Got: {url}")
+
     if "jumia.com.ng" not in url_lower:
-        raise ValueError(f"Only Jumia.ng supported in MVP: {url}")
+        raise NotImplementedError("Only Jumia.ng fully implemented in MVP")
 
     actor_id = "buseta/jumia-advanced-scraper"
     run_input = {
         "scrape_type": "product",
         "product_urls": [url],
-        "get_reviews": False,  # Keep fast & cheap for price monitoring
+        "get_reviews": False,
+         # Keep fast & cheap for price monitoring
         "image_resolution": "low",
     }
 
@@ -39,7 +53,6 @@ def scrape_product(url: str) -> Dict:
     price_info = raw.get("price", {})
     current_price = price_info.get("price_ngn")
     previous_price = price_info.get("old_price_ngn")
-    discount = price_info.get("discount")  # e.g., "20%"
 
     # Infer stock: most Jumia pages hide price if OOS
     stock_status = "available" if current_price is not None else "out_of_stock"
@@ -48,7 +61,7 @@ def scrape_product(url: str) -> Dict:
         "title": raw.get("name"),
         "current_price": current_price,  # Numeric NGN
         "previous_price": previous_price,
-        "discount_percent": discount,
+        "discount_percent": price_info.get("discount"),
         "stock_status": stock_status,
         "url": url,
     }
@@ -87,21 +100,22 @@ def compute_changes(old_data: Optional[Dict], new_data: Dict) -> Dict:
         "changed": changed,
         "what_changed": what_changed,
         "price_diff_percent": price_diff_percent,  # Positive = price dropped
+        "significant_change": abs(price_diff_percent) >= MIN_CHANGE_TO_ALERT or "stock" in what_changed,
     }
 
 
 def calculate_deal_score(price_diff_percent: float, historical_avg: Optional[float] = None) -> str:
     """
-    Simple deal scoring for MVP.
+    Deal scoring using thresholds from settings.py.
     Later: incorporate historical_avg and competitor data.
     """
     drop = max(price_diff_percent, 0)  # Only drops count as deals
 
-    if drop > 15:
+    if drop > HIGH_DEAL_THRESHOLD:
         return "high"
-    elif drop > 5:
+    elif drop > MEDIUM_DEAL_THRESHOLD:
         return "medium"
-    elif drop > 0:
+    elif drop > LOW_DEAL_THRESHOLD:
         return "low"
     return "none"
 
