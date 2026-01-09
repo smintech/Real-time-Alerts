@@ -3,7 +3,7 @@ import logging
 import time
 import urllib.parse
 from typing import List, Dict, Optional
-
+from telegram.ext import MessageHandler, filters
 from telegram import Update
 from telegram.ext import CommandHandler, ContextTypes
 
@@ -12,6 +12,7 @@ from bot.settings import (
     ADD_COOLDOWN_SECONDS,
     SCRAPE_TIMEOUT,
     ALLOWED_DIRECTIONS,
+    CATEGORIES,
 )
 from utils.utils import scrape_product
 
@@ -20,7 +21,6 @@ from utils.utils import scrape_product
 # -------------------------
 user_watches: Dict[int, List[Dict]] = {}
 _user_last_action: Dict[int, float] = {}
-
 # -------------------------
 # Configuration (moved to settings.py)
 # -------------------------
@@ -100,13 +100,17 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         f"   • Max {MAX_WATCHES_FREE} watches free\n"
         "/list — View watches\n"
         "/remove <number> — Delete watch\n\n"
-        "Example: /add https://www.jumia.com.ng/iphone-15 800000"
+        reply_markup=build_main_menu()
     )
 
 
 async def add_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-
+    if user_id not in user_settings:
+    user_settings[user_id] = {
+        "enabled_categories": CATEGORIES.copy(),  # all by default
+        "min_change_percent": MIN_CHANGE_TO_ALERT,
+    }
     try:
         url, target_price, direction = parse_add_args(context.args)
     except ValueError:
@@ -184,6 +188,17 @@ async def add_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def list_watches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    if user_id not in user_settings:
+    user_settings[user_id] = {
+        "enabled_categories": CATEGORIES.copy(),  # all by default
+        "min_change_percent": MIN_CHANGE_TO_ALERT,
+        # ... other settings later
+    }
+    enabled = user_settings.get(user_id, {}).get("enabled_categories", [])
+if enabled != CATEGORIES:
+    text += f"\nAlert categories enabled: {', '.join(enabled).capitalize()}"
+else:
+    text += "\nAlerts for all categories"
     watches = user_watches.get(user_id, [])
     if not watches:
         await update.message.reply_text("📭 No watches. Add with /add <URL>")
@@ -191,14 +206,15 @@ async def list_watches(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     lines = ["*Your Active Watches:*\n"]
     for i, w in enumerate(watches, 1):
+        cat = w.get("category", "—").capitalize()
         title = w.get("title", "Unknown")
         url = w.get("url", "")
         price = safe_price_format(w.get("last_price"))
         target = f" | Target ≤ {safe_price_format(w.get('target_price'))}" if w.get("target_price") else ""
         mode_text = {"low": "drops only", "high": "increases", "both": "any change"}.get(w.get("direction", "low"), "drops only")
         lines.append(
-            f"{i}. {title}{target}\n"
-            f"   Current: {price} | Mode: {mode_text}\n"
+            f"{i}. {title}{cat}\n"
+            f"   Current: {price} | Target: {target} | Mode: {mode_text}\n"
             f"   {url}"
         )
 
@@ -236,6 +252,227 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
             "⚠️ Something went wrong. Logged & will be fixed. Try again soon."
         )
 
+def build_main_menu():
+    keyboard = [
+        [InlineKeyboardButton("➕ Add New Watch", callback_data="add_watch_inline")],
+        [InlineKeyboardButton("📋 My Watches", callback_data="my_watches_inline")],
+        [InlineKeyboardButton("🔥 Hot Deals Channel", callback_data="hot_channel")],
+        [InlineKeyboardButton("📊 Dashboard", callback_data="dashboard_inline")],
+        [InlineKeyboardButton("🔔 Alert Categories", callback_data="category_settings")],
+        [InlineKeyboardButton("❓ Help", callback_data="help_inline")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_simple_back(target="main_menu_inline", label="↩️ Back"):
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=target)]])
+
+def build_category_selection():
+    keyboard = []
+    for cat in CATEGORIES:
+        # Make it look nice – you can add emojis per category later
+        emoji = {
+            'phones': '📱',
+            'gadgets': '🎧',
+            'laptops': '💻',
+            'accessories': '🔌'
+        }.get(cat, '📦')
+        
+        keyboard.append([
+            InlineKeyboardButton(f"{emoji} {cat.capitalize()}", 
+                               callback_data=f"cat_select_{cat}")
+        ])
+    
+    keyboard.append([
+        InlineKeyboardButton("↩️ Cancel", callback_data="add_watch_cancel")
+    ])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+def build_category_settings_menu(user_id):
+    current_enabled = user_settings.get(user_id, {}).get("enabled_categories", CATEGORIES.copy())
+    
+    keyboard = []
+    for cat in CATEGORIES:
+        prefix = "✅ " if cat in current_enabled else "⬜ "
+        keyboard.append([
+            InlineKeyboardButton(f"{prefix}{cat.capitalize()}", 
+                               callback_data=f"toggle_cat_{cat}")
+        ])
+    
+    keyboard.append([InlineKeyboardButton("💾 Save & Exit", callback_data="save_categories")])
+    keyboard.append([InlineKeyboardButton("↩️ Back to Main", callback_data="main_menu")])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+async def inline_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    query = update.callback_query
+    await query.answer()  # remove loading circle
+
+    data = query.data
+
+    try:
+        if data in ("main_menu_inline", "back_to_main"):
+            await query.edit_message_text(
+                "🏠 **Naija Price Alerts Menu**\n\nWhat would you like to do?",
+                parse_mode="Markdown",
+                reply_markup=build_main_menu()
+            )
+
+        # ── Add Watch with Category ───────────────────────────────
+        elif data == "add_watch_inline":
+            await query.edit_message_text(
+                "Great! First choose the **category** of the product:",
+                reply_markup=build_category_selection()
+            )
+
+        elif data.startswith("cat_select_"):
+            selected_cat = data.replace("cat_select_", "")
+            
+            if selected_cat not in CATEGORIES:
+                await query.edit_message_text("Invalid category. Try again.")
+                return
+
+            # Store in user_data (temporary session storage)
+            context.user_data["add_category"] = selected_cat
+            
+            await query.edit_message_text(
+                f"Selected category: **{selected_cat.capitalize()}**\n\n"
+                "Now send the **full Jumia product URL**:\n\n"
+                "Example:\n`https://www.jumia.com.ng/samsung-galaxy-s24-ultra...`\n\n"
+                "Or send /cancel to stop.",
+                parse_mode="Markdown",
+                reply_markup=InlineKeyboardMarkup([[
+                    InlineKeyboardButton("↩️ Cancel", callback_data="add_watch_cancel")
+                ]])
+            )
+            # Flag that next message should be treated as URL
+            context.user_data["awaiting_add_url"] = True
+        # In inline_callback_handler
+
+elif data == "category_settings":
+    await query.edit_message_text(
+        "🔔 **Select categories for which you want to receive alerts**\n\n"
+        "Toggle categories on/off (multiple allowed):",
+        reply_markup=build_category_settings_menu(user_id)
+    )
+
+elif data.startswith("toggle_cat_"):
+    cat = data.replace("toggle_cat_", "")
+    
+    if cat not in CATEGORIES:
+        return
+    
+    settings = user_settings.setdefault(user_id, {"enabled_categories": CATEGORIES.copy()})
+    enabled = settings["enabled_categories"]
+    
+    if cat in enabled:
+        enabled.remove(cat)
+    else:
+        enabled.append(cat)
+    
+    # Refresh menu
+    await query.edit_message_reply_markup(
+        reply_markup=build_category_settings_menu(user_id)
+    )
+
+elif data == "save_categories":
+    await query.edit_message_text(
+        "✅ Category preferences saved!\n\nYou'll only receive alerts for selected categories.",
+        reply_markup=build_main_menu()
+    )
+    
+        elif data == "add_watch_cancel":
+            context.user_data.pop("add_category", None)
+            context.user_data.pop("awaiting_add_url", None)
+            await query.edit_message_text(
+                "Add watch cancelled.",
+                reply_markup=build_main_menu()
+            )
+
+        elif data == "my_watches_inline":
+            await list_watches(update, context)  # reuse your existing function
+
+        elif data == "hot_channel":
+            await query.edit_message_text(
+                "🔥 Join our **Hot Deals Channel** for the best public price drops!\n\n"
+                "https://t.me/YourChannelNameHere",
+                reply_markup=build_simple_back()
+            )
+
+        elif data == "dashboard_inline":
+            watches_count = len(user_watches.get(update.effective_user.id, []))
+            text = (
+                f"👤 **Your Dashboard**\n\n"
+                f"Active watches: **{watches_count}**\n"
+                f"More stats coming soon..."
+            )
+            await query.edit_message_text(text, parse_mode="Markdown",
+                                        reply_markup=build_simple_back())
+
+        elif data == "help_inline":
+            await query.edit_message_text(
+                "❓ **Help**\n\n"
+                "• /add <url> [target] — track product\n"
+                "• /list — see your watches\n"
+                "• /remove <number> — delete one\n\n"
+                "Questions? Just message me!",
+                parse_mode="Markdown",
+                reply_markup=build_simple_back()
+            )
+
+        else:
+            await query.edit_message_text("🤔 Unknown action.", reply_markup=build_main_menu())
+
+    except Exception as e:
+        logger.exception("Inline callback error")
+        await query.message.reply_text("⚠️ Something went wrong... Try /start")
+
+async def process_add_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Handle URL when user is in 'add watch' flow"""
+    if not context.user_data.get("awaiting_add_url"):
+        return  # Not in add mode → ignore message
+
+    url = update.message.text.strip()
+    user_id = update.effective_user.id
+
+    # Basic validation
+    if not url.startswith(("http://", "https://")) or "jumia.com.ng" not in url.lower():
+        await update.message.reply_text(
+            "Please send a valid Jumia.ng product URL.\n\nTry again or /cancel",
+            reply_markup=InlineKeyboardMarkup([[
+                InlineKeyboardButton("Cancel", callback_data="add_watch_cancel")
+            ]])
+        )
+        return
+
+    category = context.user_data.get("add_category")
+    if not category:
+        await update.message.reply_text("Session expired. Please start over with Add Watch button.")
+        context.user_data.clear()
+        return
+
+    # Now call your existing logic, but with category
+    # We'll modify add_watch to accept optional parameters
+    context.args = [url]  # fake args for existing function
+
+    await add_watch(update, context)  # ← your original function
+
+    # After success, store category in the watch
+    watches = user_watches.get(user_id, [])
+    if watches:
+        # Last added watch = most recent
+        last_watch = watches[-1]
+        last_watch["category"] = category
+        logger.info(f"Added category {category} to watch: {last_watch.get('title')}")
+
+    # Clean up
+    context.user_data.clear()
+
+    await update.message.reply_text(
+        f"Watch added successfully in **{category.capitalize()}** category! 🎉",
+        reply_markup=build_main_menu()
+    )
 
 def get_application_handlers():
     return [
@@ -243,4 +480,6 @@ def get_application_handlers():
         CommandHandler("add", add_watch),
         CommandHandler("list", list_watches),
         CommandHandler("remove", remove_watch),
+        CallbackQueryHandler(inline_callback_handler),
+        MessageHandler(filters.TEXT & ~filters.COMMAND, process_add_url),
     ]
