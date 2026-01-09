@@ -9,8 +9,8 @@ MEDIUM_DEAL_THRESHOLD = 5  # 5-15% → "medium"
 LOW_DEAL_THRESHOLD = 1     # 1-5% → "low"
 
 # Freemium limits
-MAX_WATCHES_FREE = 5
-MAX_WATCHES_PAID = 50      # Future paid tier
+MAX_WATCHES_FREE = 3
+MAX_WATCHES_PAID = 20      # Future paid tier
 
 # Scraping & alert settings
 CHECK_INTERVAL_SECONDS = 3600    # 1 hour between checks (global scheduler)
