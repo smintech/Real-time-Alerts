@@ -25,3 +25,7 @@ SUPPORTED_SITES = ['jumia.ng', 'konga.com']
 ALLOWED_DIRECTIONS = ["low", "high", "both"]
 ADD_COOLDOWN_SECONDS = 10
 SCRAPE_TIMEOUT = 15
+# Scheduler failure handling
+MAX_WATCH_FAILURES = 3           # consecutive failures → pause watch
+FAILURE_BACKOFF_BASE = 60        # seconds base for exponential backoff
+NOTIFY_ON_DEL exonerated = True      # send user notice on delist/OOS/pause
