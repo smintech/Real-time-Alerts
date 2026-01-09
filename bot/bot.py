@@ -241,6 +241,30 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
         channel_price_cache[url] = current_price
         posted_count += 1
 
+async def check_trials(context: ContextTypes.DEFAULT_TYPE):
+    bot = context.bot
+    now = time.time()
+    
+    for user_id, sub in list(user_subscriptions.items()):
+        if "trial_start" in sub and not sub.get("paid", False):
+            days_since = (now - sub["trial_start"]) / 86400
+            tier = sub["tier"]
+            trial_days = PAID_TIERS.get(tier, {"trial_days": 0})["trial_days"]
+            
+            if days_since > trial_days:
+                sub["tier"] = "free"
+                del sub["trial_start"]
+                
+                # Notify
+                msg = f"⚠️ Your {PAID_TIERS[tier]['name']} trial expired. Downgraded to free tier."
+                await safe_send(bot, user_id, msg)
+                
+                # Enforce watch limit
+                watches = user_watches.get(user_id, [])
+                if len(watches) > MAX_WATCHES_FREE:
+                    msg += f"\nPlease remove {len(watches) - MAX_WATCHES_FREE} watches to comply."
+                    await safe_send(bot, user_id, msg)
+
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     LOG.exception("Unhandled handler error: %s", context.error)
 
@@ -267,6 +291,10 @@ application.job_queue.run_repeating(
     first=90,  # slight offset
     name="channel_deals"
 )
-    
+    application.job_queue.run_repeating(
+        callback=check_trials,
+        interval=86400,  # Daily
+        first=3600,     # Start after 1 hour
+        name="trial_checker"
     LOG.info("Bot + scheduler started")
     application.run_polling()
