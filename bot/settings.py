@@ -21,3 +21,7 @@ CATEGORIES = ['phones', 'gadgets', 'laptops', 'accessories']
 
 # Supported sites (for validation & future expansion)
 SUPPORTED_SITES = ['jumia.ng', 'konga.com']
+#spam protection
+ALLOWED_DIRECTIONS = ["low", "high", "both"]
+ADD_COOLDOWN_SECONDS = 10
+SCRAPE_TIMEOUT = 15
