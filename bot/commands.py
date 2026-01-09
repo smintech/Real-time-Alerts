@@ -1,11 +1,12 @@
+# bot/commands.py (with onboarding, admin command, category integration)
 import asyncio
 import logging
 import time
 import urllib.parse
 from typing import List, Dict, Optional
-from telegram.ext import MessageHandler, filters
-from telegram import Update
-from telegram.ext import CommandHandler, ContextTypes
+
+from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.ext import CommandHandler, CallbackQueryHandler, ContextTypes, MessageHandler, filters
 
 from bot.settings import (
     MAX_WATCHES_FREE,
@@ -13,20 +14,27 @@ from bot.settings import (
     SCRAPE_TIMEOUT,
     ALLOWED_DIRECTIONS,
     CATEGORIES,
+    PAID_TIERS,
+    MIN_CHANGE_TO_ALERT,
 )
+from config import ADMIN_IDS
 from utils.utils import scrape_product
 
 # -------------------------
-# In-memory store (MVP – replace with DB soon)
+# In-memory stores (MVP – replace with DB soon)
 # -------------------------
-user_watches: Dict[int, List[Dict]] = {}
-_user_last_action: Dict[int, float] = {}
-user_subscriptions = {}
+user_watches: Dict[int, List[Dict]] = {}  # {user_id: [{"url": ..., "category": ...}]}
+_user_last_action: Dict[int, float] = {}  # cooldowns
+user_subscriptions: Dict[int, Dict] = {}  # {user_id: {"type": "personal", "tier": "free", "trial_start": time?, "paid": False}}
+user_settings: Dict[int, Dict] = {}  # {user_id: {"enabled_categories": [...]}}
+
 # -------------------------
-# Configuration (moved to settings.py)
+# Configuration
 # -------------------------
 LOG = logging.getLogger(__name__)
 logging.basicConfig(level=logging.INFO)
+
+DEFAULT_FREE_LIMIT = MAX_WATCHES_FREE
 
 
 # -------------------------
@@ -86,25 +94,93 @@ def parse_add_args(args: List[str]) -> tuple[str, Optional[int], str]:
     return url, target_price, direction
 
 
+def get_user_max_watches(user_id: int) -> int:
+    sub = user_subscriptions.get(user_id, {"tier": "free"})
+    tier = sub["tier"]
+    
+    if tier == "free":
+        return DEFAULT_FREE_LIMIT
+    
+    if tier in PAID_TIERS:
+        if "trial_start" in sub:
+            days_since = (time.time() - sub["trial_start"]) / 86400
+            if days_since <= PAID_TIERS[tier]["trial_days"]:
+                return PAID_TIERS[tier]["max_watches"]
+        
+        if sub.get("paid", False):
+            return PAID_TIERS[tier]["max_watches"]
+    
+    return DEFAULT_FREE_LIMIT
+
+
+def build_main_menu() -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton("➕ Add New Watch", callback_data="add_watch_inline")],
+        [InlineKeyboardButton("📋 My Watches", callback_data="my_watches_inline")],
+        [InlineKeyboardButton("🔥 Hot Deals Channel", callback_data="hot_channel")],
+        [InlineKeyboardButton("📊 Dashboard", callback_data="dashboard_inline")],
+        [InlineKeyboardButton("🔔 Alert Categories", callback_data="category_settings")],
+        [InlineKeyboardButton("❓ Help", callback_data="help_inline")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_simple_back(target="main_menu_inline", label="↩️ Back") -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=target)]])
+
+
+def build_category_selection() -> InlineKeyboardMarkup:
+    keyboard = []
+    emoji_map = {
+        'phones': '📱',
+        'gadgets': '🎧',
+        'laptops': '💻',
+        'accessories': '🔌'
+    }
+    for cat in CATEGORIES:
+        emoji = emoji_map.get(cat, '📦')
+        keyboard.append([
+            InlineKeyboardButton(f"{emoji} {cat.capitalize()}", callback_data=f"cat_select_{cat}")
+        ])
+    
+    keyboard.append([
+        InlineKeyboardButton("↩️ Cancel", callback_data="add_watch_cancel")
+    ])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+
+def build_category_settings_menu(user_id: int) -> InlineKeyboardMarkup:
+    current_enabled = user_settings.get(user_id, {}).get("enabled_categories", CATEGORIES.copy())
+    
+    keyboard = []
+    for cat in CATEGORIES:
+        prefix = "✅ " if cat in current_enabled else "⬜ "
+        keyboard.append([
+            InlineKeyboardButton(f"{prefix}{cat.capitalize()}", callback_data=f"toggle_cat_{cat}")
+        ])
+    
+    keyboard.append([InlineKeyboardButton("💾 Save & Exit", callback_data="save_categories")])
+    keyboard.append([InlineKeyboardButton("↩️ Back to Main", callback_data="main_menu_inline")])
+    
+    return InlineKeyboardMarkup(keyboard)
+
+
 # -------------------------
 # Handlers
 # -------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Welcome to Naija Price Alerts! (MVP)\n\n"
-        "Track Jumia phones/gadgets. Get pings on price changes.\n\n"
-        "Commands:\n"
-        "/add <Jumia URL> [target_price] [low|high|both] — Add watch\n"
-        "   • Default: alert on price DROPS only (free)\n"
-        "   • target_price: alert when ≤ this amount\n"
-        "   • high/both: premium (coming soon)\n"
-        f"   • Max {MAX_WATCHES_FREE} watches free\n"
-        "/list — View watches\n"
-        "/remove <number> — Delete watch\n\n"
-        reply_markup=build_main_menu()
-             return
+    user_id = update.effective_user.id
+    
+    if user_id in user_subscriptions:
+        # Existing user → show main menu
+        await update.message.reply_text(
+            "👋 Welcome back to Naija Price Alerts!\n\nWhat would you like to do?",
+            reply_markup=build_main_menu()
+        )
+        return
 
-    # New user → force type selection
+    # New user → onboarding
     keyboard = [
         [InlineKeyboardButton("🛍️ Personal (myself/family)", callback_data="onboard_personal")],
         [InlineKeyboardButton("🏪 Merchant/Reseller", callback_data="onboard_merchant")],
@@ -122,43 +198,29 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
-def get_user_max_watches(user_id):
-    sub = user_subscriptions.get(user_id, {})
-    tier = sub.get("tier")
-    
-    if tier in PAID_TIERS:
-        # Check if still in trial
-        if "trial_start" in sub:
-            days_since = (time.time() - sub["trial_start"]) / 86400
-            if days_since <= PAID_TIERS[tier]["trial_days"]:
-                return PAID_TIERS[tier]["max_watches"]  # Trial active → paid limit
-        
-        # Trial ended, but paid?
-        if sub.get("paid", False):
-            return PAID_TIERS[tier]["max_watches"]
-    
-    # Default free
-    return DEFAULT_FREE_LIMIT
 
 async def add_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
-    if user_id not in user_settings:
-    user_settings[user_id] = {
-        "enabled_categories": CATEGORIES.copy(),  # all by default
-        "min_change_percent": MIN_CHANGE_TO_ALERT,
-    }
-    max_allowed = get_user_max_watches(user_id)
-    current_count = len(user_watches.get(user_id, []))
     
-    if current_count >= max_allowed:
-        tier_name = "Free" if max_allowed == DEFAULT_FREE_LIMIT else "your current plan"
+    # Ensure settings exist
+    if user_id not in user_settings:
+        user_settings[user_id] = {
+            "enabled_categories": CATEGORIES.copy(),
+            "min_change_percent": MIN_CHANGE_TO_ALERT,
+        }
+    
+    max_allowed = get_user_max_watches(user_id)
+    watches = user_watches.get(user_id, [])
+    if len(watches) >= max_allowed:
+        tier_name = user_subscriptions.get(user_id, {}).get("tier", "free").capitalize()
         msg = (
-            f"🚫 You've reached the limit ({max_allowed} watches) for {tier_name}.\n\n"
-            "Upgrade to get more tracking capacity!"
+            f"🚫 Limit reached ({max_allowed} watches) for {tier_name} tier.\n\n"
+            "Upgrade for more!"
         )
-        keyboard = [[InlineKeyboardButton("See Upgrade Options", callback_data="upgrade_plans")]]
+        keyboard = [[InlineKeyboardButton("See Upgrades", callback_data="upgrade_plans")]]
         await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
         return
+    
     try:
         url, target_price, direction = parse_add_args(context.args)
     except ValueError:
@@ -174,20 +236,12 @@ async def add_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     cooldown_left = user_cooldown_check(user_id)
     if cooldown_left > 0:
-        await update.message.reply_text(f"⏳ Chill — try again in {int(cooldown_left)}s.")
-        return
-
-    watches = user_watches.get(user_id, [])
-    if len(watches) >= MAX_WATCHES_FREE:
-        await update.message.reply_text(
-            f"🚫 Free limit: {MAX_WATCHES_FREE} watches. Remove one or upgrade later."
-        )
+        await update.message.reply_text(f"⏳ Wait {int(cooldown_left)}s.")
         return
 
     if direction in ["high", "both"]:
         await update.message.reply_text(
-            "ℹ️ Price increase/any-change alerts are premium (coming soon).\n"
-            "Defaulting to drops only."
+            "ℹ️ Increase/any-change alerts premium. Defaulting to drops."
         )
         direction = "low"
 
@@ -202,7 +256,7 @@ async def add_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         current_price = data.get("current_price")
 
         if current_price is None:
-            raise ValueError("Product out of stock or delisted")
+            raise ValueError("Out of stock or delisted")
 
         watch = {
             "url": url,
@@ -212,328 +266,279 @@ async def add_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
             "direction": direction,
             "added_at": int(time.time()),
             "status": "active"
+            # category added via inline flow
         }
         watches.append(watch)
         user_watches[user_id] = watches
 
-        msg = f"✅ Watch added: {title}\nCurrent: {safe_price_format(current_price)}"
+        msg = f"✅ Added: {title}\nCurrent: {safe_price_format(current_price)}"
         if target_price:
-            msg += f"\nTarget: {safe_price_format(target_price)} (alert when ≤)"
-        msg += f"\nMode: drops only"
+            msg += f"\nTarget: {safe_price_format(target_price)}"
+        msg += f"\nMode: {direction}"
         await update.message.reply_text(msg)
 
     except asyncio.TimeoutError:
-        await update.message.reply_text("⚠️ Validation timed out — Jumia slow. Try again soon.")
+        await update.message.reply_text("⚠️ Timeout - try again.")
     except ValueError as ve:
-        await update.message.reply_text(f"❌ Invalid product: {str(ve)}")
+        await update.message.reply_text(f"❌ {str(ve)}")
     except Exception as exc:
-        LOG.exception("Add failed for %s: %s", user_id, exc)
-        await update.message.reply_text(
-            "❌ Could not validate product (possible 404/block).\n"
-            "Check URL and try again in a minute."
-        )
+        LOG.exception("Add failed: %s", exc)
+        await update.message.reply_text("❌ Validation failed - check URL.")
 
 
 async def list_watches(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
+    
     if user_id not in user_settings:
-    user_settings[user_id] = {
-        "enabled_categories": CATEGORIES.copy(),  # all by default
-        "min_change_percent": MIN_CHANGE_TO_ALERT,
-        # ... other settings later
-    }
-    enabled = user_settings.get(user_id, {}).get("enabled_categories", [])
-if enabled != CATEGORIES:
-    text += f"\nAlert categories enabled: {', '.join(enabled).capitalize()}"
-else:
-    text += "\nAlerts for all categories"
+        user_settings[user_id] = {"enabled_categories": CATEGORIES.copy()}
+    
+    enabled = user_settings[user_id]["enabled_categories"]
+    text = "*Your Watches*\n"
+    if enabled != CATEGORIES:
+        text += f"\nEnabled categories: {', '.join(enabled)}"
+    else:
+        text += "\nAll categories enabled"
+    
     watches = user_watches.get(user_id, [])
     if not watches:
-        await update.message.reply_text("📭 No watches. Add with /add <URL>")
+        await update.message.reply_text(f"{text}\n\n📭 No watches yet.")
         return
 
-    lines = ["*Your Active Watches:*\n"]
+    lines = [text]
     for i, w in enumerate(watches, 1):
-        cat = w.get("category", "—").capitalize()
+        cat = w.get("category", "--").capitalize()
         title = w.get("title", "Unknown")
         url = w.get("url", "")
         price = safe_price_format(w.get("last_price"))
-        target = f" | Target ≤ {safe_price_format(w.get('target_price'))}" if w.get("target_price") else ""
-        mode_text = {"low": "drops only", "high": "increases", "both": "any change"}.get(w.get("direction", "low"), "drops only")
-        lines.append(
-            f"{i}. {title}{cat}\n"
-            f"   Current: {price} | Target: {target} | Mode: {mode_text}\n"
-            f"   {url}"
-        )
+        target = f" Target ≤ {safe_price_format(w.get('target_price'))}" if w.get("target_price") else ""
+        mode = {"low": "drops", "high": "increases", "both": "any"}.get(w.get("direction", "low"), "drops")
+        lines.append(f"{i}. {title} ({cat})\n   Price: {price}{target} | Mode: {mode}\n   {url}")
 
     message = "\n\n".join(lines)
-    for i in range(0, len(message), 3500):
-        await update.message.reply_text(message[i:i+3500], parse_mode="Markdown")
+    for chunk in [message[i:i+3500] for i in range(0, len(message), 3500)]:
+        await update.message.reply_text(chunk, parse_mode="Markdown")
 
 
 async def remove_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     if not context.args:
-        await update.message.reply_text("Usage: /remove <number> (see /list)")
+        await update.message.reply_text("Usage: /remove <number>")
         return
 
     try:
         idx = int(context.args[0]) - 1
     except ValueError:
-        await update.message.reply_text("❌ Provide a valid number.")
+        await update.message.reply_text("❌ Valid number required.")
         return
 
     watches = user_watches.get(user_id, [])
-    if not (0 <= idx < len(watches)):
-        await update.message.reply_text("❌ Invalid number. Use /list.")
+    if not 0 <= idx < len(watches):
+        await update.message.reply_text("❌ Invalid number.")
         return
 
     removed = watches.pop(idx)
-    user_watches[user_id] = watches
     await update.message.reply_text(f"🗑️ Removed: {removed.get('title', 'Watch')}")
 
 
-async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    LOG.exception("Unhandled error: %s", update)
-    if update and hasattr(update, "message") and update.message:
-        await update.message.reply_text(
-            "⚠️ Something went wrong. Logged & will be fixed. Try again soon."
-        )
+async def assign_trial(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    if user_id not in ADMIN_IDS:
+        await update.message.reply_text("❌ Admin only.")
+        return
 
-def build_main_menu():
-    keyboard = [
-        [InlineKeyboardButton("➕ Add New Watch", callback_data="add_watch_inline")],
-        [InlineKeyboardButton("📋 My Watches", callback_data="my_watches_inline")],
-        [InlineKeyboardButton("🔥 Hot Deals Channel", callback_data="hot_channel")],
-        [InlineKeyboardButton("📊 Dashboard", callback_data="dashboard_inline")],
-        [InlineKeyboardButton("🔔 Alert Categories", callback_data="category_settings")],
-        [InlineKeyboardButton("❓ Help", callback_data="help_inline")],
-    ]
-    return InlineKeyboardMarkup(keyboard)
+    if len(context.args) < 2:
+        await update.message.reply_text("Usage: /assign_trial <user_id> <tier>")
+        return
 
-
-def build_simple_back(target="main_menu_inline", label="↩️ Back"):
-    return InlineKeyboardMarkup([[InlineKeyboardButton(label, callback_data=target)]])
-
-def build_category_selection():
-    keyboard = []
-    for cat in CATEGORIES:
-        # Make it look nice – you can add emojis per category later
-        emoji = {
-            'phones': '📱',
-            'gadgets': '🎧',
-            'laptops': '💻',
-            'accessories': '🔌'
-        }.get(cat, '📦')
+    try:
+        target_id = int(context.args[0])
+        tier = context.args[1].lower()
+        if tier not in PAID_TIERS:
+            await update.message.reply_text(f"Invalid tier. Available: {', '.join(PAID_TIERS)}")
+            return
         
-        keyboard.append([
-            InlineKeyboardButton(f"{emoji} {cat.capitalize()}", 
-                               callback_data=f"cat_select_{cat}")
-        ])
-    
-    keyboard.append([
-        InlineKeyboardButton("↩️ Cancel", callback_data="add_watch_cancel")
-    ])
-    
-    return InlineKeyboardMarkup(keyboard)
+        user_subscriptions[target_id] = {
+            "tier": tier,
+            "trial_start": time.time(),
+            "paid": False
+        }
+        
+        await update.message.reply_text(f"✅ Assigned {tier} trial to user {target_id}")
+        
+        # Notify user
+        msg = f"🎉 You've been granted a {PAID_TIERS[tier]['trial_days']}-day free trial for {PAID_TIERS[tier]['name']}!"
+        await context.bot.send_message(chat_id=target_id, text=msg)
+        
+    except ValueError:
+        await update.message.reply_text("❌ Invalid user ID.")
 
-def build_category_settings_menu(user_id):
-    current_enabled = user_settings.get(user_id, {}).get("enabled_categories", CATEGORIES.copy())
-    
-    keyboard = []
-    for cat in CATEGORIES:
-        prefix = "✅ " if cat in current_enabled else "⬜ "
-        keyboard.append([
-            InlineKeyboardButton(f"{prefix}{cat.capitalize()}", 
-                               callback_data=f"toggle_cat_{cat}")
-        ])
-    
-    keyboard.append([InlineKeyboardButton("💾 Save & Exit", callback_data="save_categories")])
-    keyboard.append([InlineKeyboardButton("↩️ Back to Main", callback_data="main_menu")])
-    
-    return InlineKeyboardMarkup(keyboard)
 
 async def inline_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
-    await query.answer()  # remove loading circle
+    await query.answer()
 
     data = query.data
+    user_id = query.from_user.id
 
     try:
-        if data in ("main_menu_inline", "back_to_main"):
+        if data.startswith("onboard_"):
+            user_type = data.replace("onboard_", "")
+            tier = "free"
+            trial_days = 0
+            
+            if user_type == "merchant":
+                tier = "merchant"
+                trial_days = PAID_TIERS[tier]["trial_days"]
+            elif user_type == "business":
+                tier = "business"
+                trial_days = PAID_TIERS[tier]["trial_days"]
+            
+            user_subscriptions[user_id] = {
+                "type": user_type,
+                "tier": tier,
+                "trial_start": time.time() if trial_days > 0 else None,
+                "paid": False
+            }
+            
+            msg = f"✅ Set as {user_type.capitalize()} user."
+            if trial_days > 0:
+                msg += f" Starting {trial_days}-day free trial!"
+            
+            await query.edit_message_text(msg + "\n\nWhat next?", reply_markup=build_main_menu())
+            return
+
+        if data == "main_menu_inline":
             await query.edit_message_text(
-                "🏠 **Naija Price Alerts Menu**\n\nWhat would you like to do?",
-                parse_mode="Markdown",
+                "🏠 Main Menu\n\nWhat would you like to do?",
                 reply_markup=build_main_menu()
             )
 
-        # ── Add Watch with Category ───────────────────────────────
         elif data == "add_watch_inline":
             await query.edit_message_text(
-                "Great! First choose the **category** of the product:",
+                "Choose category:",
                 reply_markup=build_category_selection()
             )
 
         elif data.startswith("cat_select_"):
-            selected_cat = data.replace("cat_select_", "")
-            
-            if selected_cat not in CATEGORIES:
-                await query.edit_message_text("Invalid category. Try again.")
+            cat = data.replace("cat_select_", "")
+            if cat not in CATEGORIES:
                 return
-
-            # Store in user_data (temporary session storage)
-            context.user_data["add_category"] = selected_cat
             
+            context.user_data["add_category"] = cat
             await query.edit_message_text(
-                f"Selected category: **{selected_cat.capitalize()}**\n\n"
-                "Now send the **full Jumia product URL**:\n\n"
-                "Example:\n`https://www.jumia.com.ng/samsung-galaxy-s24-ultra...`\n\n"
-                "Or send /cancel to stop.",
-                parse_mode="Markdown",
+                f"Category: {cat.capitalize()}\n\nSend the Jumia URL:",
                 reply_markup=InlineKeyboardMarkup([[
-                    InlineKeyboardButton("↩️ Cancel", callback_data="add_watch_cancel")
+                    InlineKeyboardButton("Cancel", callback_data="add_watch_cancel")
                 ]])
             )
-            # Flag that next message should be treated as URL
             context.user_data["awaiting_add_url"] = True
-        # In inline_callback_handler
 
-elif data == "category_settings":
-    await query.edit_message_text(
-        "🔔 **Select categories for which you want to receive alerts**\n\n"
-        "Toggle categories on/off (multiple allowed):",
-        reply_markup=build_category_settings_menu(user_id)
-    )
-
-elif data.startswith("toggle_cat_"):
-    cat = data.replace("toggle_cat_", "")
-    
-    if cat not in CATEGORIES:
-        return
-    
-    settings = user_settings.setdefault(user_id, {"enabled_categories": CATEGORIES.copy()})
-    enabled = settings["enabled_categories"]
-    
-    if cat in enabled:
-        enabled.remove(cat)
-    else:
-        enabled.append(cat)
-    
-    # Refresh menu
-    await query.edit_message_reply_markup(
-        reply_markup=build_category_settings_menu(user_id)
-    )
-
-elif data == "save_categories":
-    await query.edit_message_text(
-        "✅ Category preferences saved!\n\nYou'll only receive alerts for selected categories.",
-        reply_markup=build_main_menu()
-    )
-    
         elif data == "add_watch_cancel":
-            context.user_data.pop("add_category", None)
-            context.user_data.pop("awaiting_add_url", None)
+            context.user_data.clear()
+            await query.edit_message_text("Cancelled.", reply_markup=build_main_menu())
+
+        elif data == "category_settings":
             await query.edit_message_text(
-                "Add watch cancelled.",
+                "🔔 Select alert categories:",
+                reply_markup=build_category_settings_menu(user_id)
+            )
+
+        elif data.startswith("toggle_cat_"):
+            cat = data.replace("toggle_cat_", "")
+            if cat not in CATEGORIES:
+                return
+            
+            settings = user_settings.setdefault(user_id, {"enabled_categories": CATEGORIES.copy()})
+            enabled = settings["enabled_categories"]
+            
+            if cat in enabled:
+                enabled.remove(cat)
+            else:
+                enabled.append(cat)
+            
+            await query.edit_message_reply_markup(
+                reply_markup=build_category_settings_menu(user_id)
+            )
+
+        elif data == "save_categories":
+            await query.edit_message_text(
+                "✅ Categories saved!",
                 reply_markup=build_main_menu()
             )
+
         elif data == "upgrade_plans":
-    lines = ["💎 **Upgrade Options**\n\n"]
-    for key, info in PAID_TIERS.items():
-        trial = f"{info['trial_days']}-day free trial" if info['trial_days'] > 0 else ""
-        lines.append(
-            f"**{info['name']}** — ₦{info['price_monthly_ngn']:,}/month\n"
-            f"• Max watches: {info['max_watches']}\n"
-            f"• {trial}\n"
-            f"• Features: {', '.join(info['features'])}\n\n"
-        )
-    lines.append("Contact @YourSupportHandle to start your free trial!")
-    
-    await query.edit_message_text("".join(lines), reply_markup=build_back_button())
-    
+            lines = ["💎 Upgrade Options\n"]
+            for key, info in PAID_TIERS.items():
+                trial = f"{info['trial_days']}-day trial" if info['trial_days'] > 0 else ""
+                lines.append(
+                    f"**{info['name']}** - ₦{info['price_monthly_ngn']:,}/mo\n"
+                    f"• Watches: {info['max_watches']}\n"
+                    f"• {trial}\n"
+                    f"• {', '.join(info['features'])}\n"
+                )
+            lines.append("Contact support to upgrade!")
+            
+            await query.edit_message_text("\n".join(lines), reply_markup=build_simple_back())
+
         elif data == "my_watches_inline":
-            await list_watches(update, context)  # reuse your existing function
+            # Call list, but since it's callback, simulate update
+            temp_update = Update(update.update_id, message=query.message)
+            await list_watches(temp_update, context)
 
         elif data == "hot_channel":
             await query.edit_message_text(
-                "🔥 Join our **Hot Deals Channel** for the best public price drops!\n\n"
-                "https://t.me/YourChannelNameHere",
+                "🔥 Join Hot Deals: https://t.me/YourChannelNameHere",
                 reply_markup=build_simple_back()
             )
 
         elif data == "dashboard_inline":
-            watches_count = len(user_watches.get(update.effective_user.id, []))
-            text = (
-                f"👤 **Your Dashboard**\n\n"
-                f"Active watches: **{watches_count}**\n"
-                f"More stats coming soon..."
-            )
-            await query.edit_message_text(text, parse_mode="Markdown",
-                                        reply_markup=build_simple_back())
-
-        elif data == "help_inline":
+            count = len(user_watches.get(user_id, []))
             await query.edit_message_text(
-                "❓ **Help**\n\n"
-                "• /add <url> [target] — track product\n"
-                "• /list — see your watches\n"
-                "• /remove <number> — delete one\n\n"
-                "Questions? Just message me!",
-                parse_mode="Markdown",
+                f"📊 Dashboard\n\nWatches: {count}",
                 reply_markup=build_simple_back()
             )
 
-        else:
-            await query.edit_message_text("🤔 Unknown action.", reply_markup=build_main_menu())
+        elif data == "help_inline":
+            await query.edit_message_text(
+                "❓ Help\n\n/add <url>\n/list\n/remove <num>\n\nMessage for questions!",
+                reply_markup=build_simple_back()
+            )
 
-    except Exception as e:
-        logger.exception("Inline callback error")
-        await query.message.reply_text("⚠️ Something went wrong... Try /start")
+    except Exception as exc:
+        LOG.exception("Inline error")
+        await query.edit_message_text("⚠️ Error - try /start")
+
 
 async def process_add_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Handle URL when user is in 'add watch' flow"""
     if not context.user_data.get("awaiting_add_url"):
-        return  # Not in add mode → ignore message
+        return
 
     url = update.message.text.strip()
     user_id = update.effective_user.id
 
-    # Basic validation
-    if not url.startswith(("http://", "https://")) or "jumia.com.ng" not in url.lower():
-        await update.message.reply_text(
-            "Please send a valid Jumia.ng product URL.\n\nTry again or /cancel",
-            reply_markup=InlineKeyboardMarkup([[
-                InlineKeyboardButton("Cancel", callback_data="add_watch_cancel")
-            ]])
-        )
+    if not is_valid_jumia_url(url):
+        await update.message.reply_text("Invalid Jumia URL. Try again or cancel.")
         return
 
     category = context.user_data.get("add_category")
     if not category:
-        await update.message.reply_text("Session expired. Please start over with Add Watch button.")
+        await update.message.reply_text("Session expired. Start over.")
         context.user_data.clear()
         return
 
-    # Now call your existing logic, but with category
-    # We'll modify add_watch to accept optional parameters
-    context.args = [url]  # fake args for existing function
+    # Fake args for add_watch
+    context.args = [url]  # Add target/direction parsing if needed
 
-    await add_watch(update, context)  # ← your original function
+    await add_watch(update, context)
 
-    # After success, store category in the watch
+    # Add category to last watch
     watches = user_watches.get(user_id, [])
     if watches:
-        # Last added watch = most recent
-        last_watch = watches[-1]
-        last_watch["category"] = category
-        logger.info(f"Added category {category} to watch: {last_watch.get('title')}")
+        watches[-1]["category"] = category
 
-    # Clean up
     context.user_data.clear()
+    await update.message.reply_text(f"Added in {category.capitalize()}! 🎉", reply_markup=build_main_menu())
 
-    await update.message.reply_text(
-        f"Watch added successfully in **{category.capitalize()}** category! 🎉",
-        reply_markup=build_main_menu()
-    )
 
 def get_application_handlers():
     return [
@@ -541,6 +546,7 @@ def get_application_handlers():
         CommandHandler("add", add_watch),
         CommandHandler("list", list_watches),
         CommandHandler("remove", remove_watch),
+        CommandHandler("assign_trial", assign_trial),  # New admin command
         CallbackQueryHandler(inline_callback_handler),
         MessageHandler(filters.TEXT & ~filters.COMMAND, process_add_url),
     ]
