@@ -28,4 +28,4 @@ SCRAPE_TIMEOUT = 15
 # Scheduler failure handling
 MAX_WATCH_FAILURES = 3           # consecutive failures → pause watch
 FAILURE_BACKOFF_BASE = 60        # seconds base for exponential backoff
-NOTIFY_ON_DEL exonerated = True      # send user notice on delist/OOS/pause
+NOTIFY_ON_DELISTED = True      # send user notice on delist/OOS/pause
