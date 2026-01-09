@@ -71,3 +71,27 @@ MIN_DROP_PERCENT_FOR_CHANNEL = 5.0   # % price drop
 MIN_SAVINGS_FOR_CHANNEL = 15000      # ₦15,000 minimum savings
 MIN_DEAL_SCORE_FOR_CHANNEL = "medium"  # only medium/high
 MAX_CHANNEL_POSTS_PER_RUN = 12       # safety cap per hour
+
+PAID_TIERS = {
+    "basic": {
+        "name": "Basic Pro",
+        "max_watches": 20,
+        "trial_days": 3,          # Free trial length
+        "price_monthly_ngn": 1500,
+        "features": ["More watches", "Priority alerts", "Category filters"]
+    },
+    "merchant": {
+        "name": "Merchant Plan",
+        "max_watches": 50,
+        "trial_days": 7,
+        "price_monthly_ngn": 8000,
+        "features": ["Bulk add", "Price history export", "Competitor tracking"]
+    },
+    "business": {
+        "name": "Business Plan",
+        "max_watches": 500,      # or "unlimited"
+        "trial_days": 14,
+        "price_monthly_ngn": 20000,
+        "features": ["Team accounts", "API access (coming)", "Custom reports"]
+    }
+}
