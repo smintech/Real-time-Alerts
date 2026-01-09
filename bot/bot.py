@@ -12,6 +12,9 @@ from bot.settings import (
     MAX_WATCH_FAILURES,
     FAILURE_BACKOFF_BASE,
     NOTIFY_ON_DELISTED,
+    CHANNEL_MONITORED_URLS,
+    AUTO_POST_TO_CHANNEL,
+    CHANNEL_DEAL_CHAT_ID,
 )
 from utils.utils import scrape_product, compute_changes, calculate_deal_score
 from utils.format import format_telegram_alert  # renamed file
@@ -168,6 +171,69 @@ async def check_all_watches(context: ContextTypes.DEFAULT_TYPE):
                 LOG.exception("Unexpected scheduler error user=%s watch=%s", user_id, watch.get("url"))
                 await handle_watch_failure(context, user_id, watch, exc=exc, reason="unexpected")
 
+async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
+    global channel_posted_today, last_cache_date
+
+    if not AUTO_POST_TO_CHANNEL or not CHANNEL_DEAL_CHAT_ID or not CHANNEL_MONITORED_URLS:
+        return
+
+    # Daily reset of posted set
+    today = datetime.now(TIMEZONE).date()
+    if last_cache_date != today:
+        channel_posted_today.clear()
+        last_cache_date = today
+
+    posted_count = 0
+    for url in CHANNEL_MONITORED_URLS:
+        if posted_count >= MAX_CHANNEL_POSTS_PER_RUN:
+            break
+
+        ok, data, err = safe_scrape_product(url)  # use your existing safe wrapper
+        if not ok or not data or data.get("current_price") is None or data.get("stock_status") != "available":
+            continue
+
+        old_price = channel_price_cache.get(url)
+        current_price = data["current_price"]
+
+        if old_price is None:
+            channel_price_cache[url] = current_price
+            continue
+
+        if current_price >= old_price:
+            channel_price_cache[url] = current_price
+            continue
+
+        drop_pct = round(((old_price - current_price) / old_price) * 100, 1)
+        savings = old_price - current_price
+
+        if (drop_pct < MIN_DROP_PERCENT_FOR_CHANNEL or
+            savings < MIN_SAVINGS_FOR_CHANNEL):
+            channel_price_cache[url] = current_price
+            continue
+
+        deal_score = calculate_deal_score(drop_pct)
+        if deal_score not in ("high", "medium"):
+            channel_price_cache[url] = current_price
+            continue
+
+        if url in channel_posted_today:
+            channel_price_cache[url] = current_price
+            continue
+
+        enriched = {
+            **data,
+            "previous_price": old_price,
+            "price_diff_percent": drop_pct,
+            "deal_score": deal_score,
+        }
+        msg = format_channel_deal(enriched)
+
+        await safe_send(context.bot, CHANNEL_DEAL_CHAT_ID, msg,
+                        parse_mode="Markdown", disable_web_page_preview=True)
+
+        channel_posted_today.add(url)
+        channel_price_cache[url] = current_price
+        posted_count += 1
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     LOG.exception("Unhandled handler error: %s", context.error)
@@ -188,6 +254,13 @@ def run_bot():
         first=30,
         name="price_checker"
     )
-
+    
+application.job_queue.run_repeating(
+    callback=check_and_post_channel_deals,
+    interval=CHECK_INTERVAL_SECONDS,  # hourly, same as personal checks
+    first=90,  # slight offset
+    name="channel_deals"
+)
+    
     LOG.info("Bot + scheduler started")
     application.run_polling()
