@@ -1,4 +1,3 @@
-# bot/commands.py (with onboarding, admin command, category integration)
 import asyncio
 import logging
 import time
