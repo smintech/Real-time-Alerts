@@ -95,3 +95,4 @@ PAID_TIERS = {
         "features": ["Team accounts", "API access (coming)", "Custom reports"]
     }
 }
+DEFAULT_FREE_LIMIT = MAX_WATCHES_FREE
