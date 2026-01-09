@@ -1,4 +1,3 @@
-# apify_scraper.py
 import os
 import time
 import logging
