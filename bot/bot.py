@@ -64,7 +64,13 @@ async def check_all_watches(context: ContextTypes.DEFAULT_TYPE):
 
     user_ids = list(user_watches.keys())
     now = datetime.now(TIMEZONE)
+    user_settings_for_id = user_settings.get(user_id, {})
+enabled_cats = user_settings_for_id.get("enabled_categories", CATEGORIES.copy())
 
+watch_category = watch.get("category")  # from when user added the watch
+
+if watch_category not in enabled_cats:
+    continue
     for user_id in user_ids:
         watches = user_watches.get(user_id, [])
         for watch in list(watches):
