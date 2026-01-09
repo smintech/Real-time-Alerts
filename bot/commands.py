@@ -21,6 +21,7 @@ from utils.utils import scrape_product
 # -------------------------
 user_watches: Dict[int, List[Dict]] = {}
 _user_last_action: Dict[int, float] = {}
+user_subscriptions = {}
 # -------------------------
 # Configuration (moved to settings.py)
 # -------------------------
@@ -101,8 +102,43 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "/list — View watches\n"
         "/remove <number> — Delete watch\n\n"
         reply_markup=build_main_menu()
+             return
+
+    # New user → force type selection
+    keyboard = [
+        [InlineKeyboardButton("🛍️ Personal (myself/family)", callback_data="onboard_personal")],
+        [InlineKeyboardButton("🏪 Merchant/Reseller", callback_data="onboard_merchant")],
+        [InlineKeyboardButton("🏢 Business/Agency", callback_data="onboard_business")],
+    ]
+
+    await update.message.reply_text(
+        "👋 **Welcome to Naija Price Alerts!**\n\n"
+        "To get started, please tell us who you are (this helps us give you the right limits and features):\n\n"
+        "• **Personal** – track a few items for shopping\n"
+        "• **Merchant** – monitor competitors & market prices\n"
+        "• **Business** – bulk tracking & advanced use\n\n"
+        "Choose your type below ↓",
+        parse_mode="Markdown",
+        reply_markup=InlineKeyboardMarkup(keyboard)
     )
 
+def get_user_max_watches(user_id):
+    sub = user_subscriptions.get(user_id, {})
+    tier = sub.get("tier")
+    
+    if tier in PAID_TIERS:
+        # Check if still in trial
+        if "trial_start" in sub:
+            days_since = (time.time() - sub["trial_start"]) / 86400
+            if days_since <= PAID_TIERS[tier]["trial_days"]:
+                return PAID_TIERS[tier]["max_watches"]  # Trial active → paid limit
+        
+        # Trial ended, but paid?
+        if sub.get("paid", False):
+            return PAID_TIERS[tier]["max_watches"]
+    
+    # Default free
+    return DEFAULT_FREE_LIMIT
 
 async def add_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
@@ -111,6 +147,18 @@ async def add_watch(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "enabled_categories": CATEGORIES.copy(),  # all by default
         "min_change_percent": MIN_CHANGE_TO_ALERT,
     }
+    max_allowed = get_user_max_watches(user_id)
+    current_count = len(user_watches.get(user_id, []))
+    
+    if current_count >= max_allowed:
+        tier_name = "Free" if max_allowed == DEFAULT_FREE_LIMIT else "your current plan"
+        msg = (
+            f"🚫 You've reached the limit ({max_allowed} watches) for {tier_name}.\n\n"
+            "Upgrade to get more tracking capacity!"
+        )
+        keyboard = [[InlineKeyboardButton("See Upgrade Options", callback_data="upgrade_plans")]]
+        await update.message.reply_text(msg, reply_markup=InlineKeyboardMarkup(keyboard))
+        return
     try:
         url, target_price, direction = parse_add_args(context.args)
     except ValueError:
@@ -389,7 +437,20 @@ elif data == "save_categories":
                 "Add watch cancelled.",
                 reply_markup=build_main_menu()
             )
-
+        elif data == "upgrade_plans":
+    lines = ["💎 **Upgrade Options**\n\n"]
+    for key, info in PAID_TIERS.items():
+        trial = f"{info['trial_days']}-day free trial" if info['trial_days'] > 0 else ""
+        lines.append(
+            f"**{info['name']}** — ₦{info['price_monthly_ngn']:,}/month\n"
+            f"• Max watches: {info['max_watches']}\n"
+            f"• {trial}\n"
+            f"• Features: {', '.join(info['features'])}\n\n"
+        )
+    lines.append("Contact @YourSupportHandle to start your free trial!")
+    
+    await query.edit_message_text("".join(lines), reply_markup=build_back_button())
+    
         elif data == "my_watches_inline":
             await list_watches(update, context)  # reuse your existing function
 
