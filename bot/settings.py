@@ -34,7 +34,38 @@ AUTO_POST_TO_CHANNEL = True  # Set to False to disable entirely
 CHANNEL_DEAL_CHAT_ID = -1001234567890  # Your channel ID (make bot admin with post rights)
 
 # Channel monitoring settings
-CHANNEL_MONITORED_URLS = []  # We'll fill this below – start with 30-50 hot ones
+CHANNEL_MONITORED_URLS = [
+    # Flagship Phones
+    "https://www.jumia.com.ng/mlp-iphone-15-pro-max/",
+    "https://www.jumia.com.ng/mlp-samsung-galaxy-s24-ultra/",
+    "https://www.jumia.com.ng/mlp-samsung-galaxy-z-fold-7/",
+
+    # Popular Mid-Range
+    "https://www.jumia.com.ng/mlp-infinix-note-50-pro/",
+    "https://www.jumia.com.ng/mlp-infinix-hot-50/",
+    "https://www.jumia.com.ng/mlp-tecno-spark-20-pro/",
+    "https://www.jumia.com.ng/mlp-tecno-camon-20/",
+    "https://www.jumia.com.ng/mlp-xiaomi-redmi-note-13-pro/",
+    "https://www.jumia.com.ng/mlp-samsung-galaxy-a16/",
+
+    # Budget Hits
+    "https://www.jumia.com.ng/mlp-itel-a100/",
+    "https://www.jumia.com.ng/mlp-infinix-smart-10/",
+    "https://www.jumia.com.ng/mlp-tecno-pop-8/",
+    "https://www.jumia.com.ng/mlp-xiaomi-redmi-a3-pro/",
+
+    # Laptops (high demand)
+    "https://www.jumia.com.ng/catalog/?q=hp+elitebook+840+g6",
+    "https://www.jumia.com.ng/catalog/?q=dell+latitude+7490",
+    "https://www.jumia.com.ng/catalog/?q=macbook+pro+a1278",
+    "https://www.jumia.com.ng/catalog/?q=hp+stream+11",
+
+    # TVs & Gadgets
+    "https://www.jumia.com.ng/catalog/?q=tcl+55+inches+uhd",
+    "https://www.jumia.com.ng/catalog/?q=hisense+65+uhd",
+    "https://www.jumia.com.ng/catalog/?q=oraimo+powerbank",
+    "https://www.jumia.com.ng/catalog/?q=zealot+s67+speaker",
+]
 
 MIN_DROP_PERCENT_FOR_CHANNEL = 5.0   # % price drop
 MIN_SAVINGS_FOR_CHANNEL = 15000      # ₦15,000 minimum savings
