@@ -194,3 +194,31 @@ def format_json_response(enriched_data: Dict, timestamp: Optional[str] = None) -
         result["warning_summary"] = "; ".join(warnings)
 
     return result
+
+def format_channel_deal(data: dict) -> str:
+    title = data["title"]
+    curr = f"₦{int(data['current_price']):,}"
+    prev = f"₦{int(data['previous_price']):,}"
+    drop_pct = data["price_diff_percent"]
+    savings = int(data["previous_price"] - data["current_price"])
+    score_text = {"high": "⭐⭐⭐ HIGH DEAL", "medium": "⭐⭐ MEDIUM DEAL", "low": "⭐ LOW"}.get(data["deal_score"], "")
+
+    return f"""
+🔥 HOT PRICE DROP ON JUMIA!
+
+📱 {title}
+
+💰 New: {curr}
+👴 Was: {prev}
+📉 Saved: ₦{savings:,} ({drop_pct}% off)
+
+{score_text}
+
+✅ In stock • Nationwide delivery
+
+🛒 Grab it: {data['product_url']}
+
+⏰ Spotted just now — prices change fast!
+
+Personal alerts → @YourBotUsername
+    """.strip()
