@@ -70,7 +70,7 @@ CHANNEL_MONITORED_URLS = [
 MIN_DROP_PERCENT_FOR_CHANNEL = 5.0   # % price drop
 MIN_SAVINGS_FOR_CHANNEL = 15000      # ₦15,000 minimum savings
 MIN_DEAL_SCORE_FOR_CHANNEL = "medium"  # only medium/high
-MAX_CHANNEL_POSTS_PER_RUN = 5       # safety cap per hour
+MAX_CHANNEL_POSTS_PER_RUN = 10       # safety cap per hour
 
 PAID_TIERS = {
     "basic": {
