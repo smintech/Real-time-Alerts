@@ -1,11 +1,14 @@
+# bot/bot.py
 import logging
 import asyncio
+import time
 from datetime import datetime, timedelta
+from typing import Dict, Any
 
 from telegram.ext import Application, ContextTypes
 
 from config import TELEGRAM_TOKEN
-from bot.commands import get_application_handlers, user_watches  # renamed file
+from bot.commands import get_application_handlers, user_watches, user_settings, user_subscriptions
 from bot.settings import (
     CHECK_INTERVAL_SECONDS,
     TIMEZONE,
@@ -15,14 +18,33 @@ from bot.settings import (
     CHANNEL_MONITORED_URLS,
     AUTO_POST_TO_CHANNEL,
     CHANNEL_DEAL_CHAT_ID,
+    MAX_CHANNEL_POSTS_PER_RUN,
+    MIN_DROP_PERCENT_FOR_CHANNEL,
+    MIN_SAVINGS_FOR_CHANNEL,
+    CATEGORIES,
+    MAX_WATCHES_FREE,
+    PAID_TIERS,
 )
-from utils.utils import scrape_product, compute_changes, calculate_deal_score
-from utils.format import format_telegram_alert  # renamed file
+
+from utils.utils import (
+    scrape_product,
+    compute_changes,
+    calculate_deal_score,
+    normalize_product_key,
+    scrape_site,   # used by channel checker (if implemented)
+    _get_domain_from_url  # helper from utils (if present)
+)
+from utils.format import format_telegram_alert, _safe_currency
 
 logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger(__name__)
 
 application: Application | None = None  # global if needed elsewhere
+
+# Channel caches (in-memory). Consider Redis/DB for persistence later.
+channel_price_cache: Dict[str, float] = {}
+channel_posted_today = set()
+last_cache_date = None
 
 
 async def safe_send(bot, chat_id: int, text: str, **kwargs):
@@ -51,9 +73,12 @@ async def handle_watch_failure(context: ContextTypes.DEFAULT_TYPE, user_id: int,
         msg = (
             f"⚠️ Watch for *{watch.get('title', 'product')}* paused after repeated failures.\n\n"
             "Possible causes: product removed, site changes, or temporary issues.\n"
-            "We'll resume automatically if it recovers, or remove then add again."
+            "We'll resume automatically if it recovers, or you can re-add it."
         )
-        await safe_send(context.bot, user_id, msg, parse_mode="Markdown")
+        try:
+            await safe_send(context.bot, user_id, msg, parse_mode="Markdown")
+        except Exception:
+            LOG.exception("Failed to notify user about paused watch")
         LOG.info("Paused watch user=%s url=%s after %d failures", user_id, watch.get("url"), watch["fail_count"])
 
 
@@ -62,125 +87,146 @@ async def check_all_watches(context: ContextTypes.DEFAULT_TYPE):
     if not user_watches:
         return
 
-    user_ids = list(user_watches.keys())
     now = datetime.now(TIMEZONE)
-    user_settings_for_id = user_settings.get(user_id, {})
-enabled_cats = user_settings_for_id.get("enabled_categories", CATEGORIES.copy())
 
-watch_category = watch.get("category")  # from when user added the watch
+    # Each user separately to respect per-user settings
+    for user_id, watches in list(user_watches.items()):
+        try:
+            # user settings with defaults
+            user_settings_for_id = user_settings.get(user_id, {})
+            enabled_cats = user_settings_for_id.get("enabled_categories", CATEGORIES.copy())
 
-if watch_category not in enabled_cats:
-    continue
-    for user_id in user_ids:
-        watches = user_watches.get(user_id, [])
-        for watch in list(watches):
-            try:
-                if watch.get("status") != "active":
-                    continue
-
-                next_check = watch.get("next_check")
-                if next_check and now < next_check:
-                    continue
-
-                # Scrape
+            for watch in list(watches):
                 try:
-                    new_data = await asyncio.get_event_loop().run_in_executor(None, scrape_product, watch["url"])
-                except Exception as exc:
-                    await handle_watch_failure(context, user_id, watch, exc=exc, reason="scrape_error")
-                    continue
+                    # skip non-active
+                    if watch.get("status") != "active":
+                        continue
 
-                if not new_data or new_data.get("current_price") is None:
-                    if NOTIFY_ON_DELISTED:
-                        await safe_send(
-                            context.bot,
-                            user_id,
-                            f"⚠️ *{watch.get('title', 'Product')}* delisted or OOS — pausing watch.\n{watch['url']}",
-                            parse_mode="Markdown"
-                        )
-                    watch["status"] = "paused"
-                    continue
+                    # category check
+                    watch_category = watch.get("category")
+                    if watch_category and watch_category not in enabled_cats:
+                        continue
 
-                # Reset failures on success
-                watch["fail_count"] = 0
-                watch.pop("next_check", None)
+                    # next_check backoff check
+                    next_check = watch.get("next_check")
+                    if next_check and now < next_check:
+                        continue
 
-                old_price = watch.get("last_price")
-                current_price = new_data["current_price"]
+                    # run scrape in executor so blocking IO doesn't block the loop
+                    try:
+                        new_data = await asyncio.get_event_loop().run_in_executor(None, scrape_product, watch["url"])
+                    except Exception as exc:
+                        await handle_watch_failure(context, user_id, watch, exc=exc, reason="scrape_error")
+                        continue
 
-                if old_price is None:
+                    # if no usable price -> consider delisted/OOS
+                    if not new_data or new_data.get("current_price") is None:
+                        if NOTIFY_ON_DELISTED:
+                            await safe_send(
+                                context.bot,
+                                user_id,
+                                f"⚠️ *{watch.get('title', 'Product')}* delisted or out of stock — pausing watch.\n{watch['url']}",
+                                parse_mode="Markdown"
+                            )
+                        watch["status"] = "paused"
+                        continue
+
+                    # success: reset failure counters
+                    watch["fail_count"] = 0
+                    watch.pop("next_check", None)
+
+                    old_price = watch.get("last_price")
+                    current_price = new_data["current_price"]
+
+                    # if no previous stored price for this watch, seed and skip alerts
+                    if old_price is None:
+                        watch["last_price"] = current_price
+                        continue
+
+                    # compute changes
+                    changes = compute_changes(
+                        {"current_price": old_price, "stock_status": watch.get("last_stock", "available")},
+                        {"current_price": current_price, "stock_status": new_data.get("stock_status", "available")}
+                    )
+
+                    if not changes.get("significant_change"):
+                        # update last seen and continue
+                        watch["last_price"] = current_price
+                        watch["last_stock"] = new_data.get("stock_status", "available")
+                        continue
+
+                    price_diff_percent = changes.get("price_diff_percent", 0.0)  # positive => drop
+                    direction = watch.get("direction", "low")
+                    deal_score = calculate_deal_score(price_diff_percent)
+
+                    # Trigger logic based on direction or target_price
+                    trigger = False
+                    if direction == "low" and price_diff_percent > 0:
+                        trigger = True
+                    elif direction == "high" and price_diff_percent < 0:
+                        trigger = True
+                    elif direction == "both":
+                        trigger = True
+
+                    # Target price override
+                    target_price = watch.get("target_price")
+                    target_hit = False
+                    try:
+                        if target_price is not None and current_price <= target_price:
+                            target_hit = True
+                            trigger = True
+                    except Exception:
+                        pass
+
+                    if not trigger:
+                        watch["last_price"] = current_price
+                        watch["last_stock"] = new_data.get("stock_status", "available")
+                        continue
+
+                    # Build enriched alert data and send
+                    enriched = {
+                        "title": new_data.get("title", watch.get("title", "Product")),
+                        "current_price": current_price,
+                        "previous_price": old_price,
+                        "price_diff_percent": abs(price_diff_percent),
+                        "deal_score": deal_score,
+                        "suggested_action": (
+                            f"Hit target ≤ ₦{int(target_price):,}" if target_hit
+                            else "Price dropped!" if price_diff_percent > 0
+                            else "Price increased!"
+                        ),
+                        "product_url": watch["url"],
+                        "changed": True,
+                        "what_changed": changes.get("what_changed", []),
+                    }
+
+                    msg = format_telegram_alert(enriched)
+
+                    await safe_send(
+                        context.bot,
+                        user_id,
+                        msg,
+                        parse_mode="Markdown",
+                        disable_web_page_preview=True
+                    )
+
+                    # update watch snapshot
                     watch["last_price"] = current_price
-                    continue
+                    watch["last_stock"] = new_data.get("stock_status", "available")
 
-                changes = compute_changes(
-                    {"current_price": old_price, "stock_status": "available"},
-                    {"current_price": current_price, "stock_status": new_data.get("stock_status", "available")}
-                )
+                except Exception as exc_inner:
+                    LOG.exception("Unexpected scheduler error user=%s watch=%s", user_id, watch.get("url"))
+                    await handle_watch_failure(context, user_id, watch, exc=exc_inner, reason="unexpected")
 
-                if not changes.get("significant_change"):
-                    watch["last_price"] = current_price
-                    continue
+        except Exception as exc_user:
+            LOG.exception("Unexpected error processing watches for user=%s", user_id)
+            # can't continue for this user — move to next
 
-                price_diff_percent = changes["price_diff_percent"]  # positive = drop
-                direction = watch.get("direction", "low")
-                deal_score = calculate_deal_score(price_diff_percent)
-
-                # Trigger logic
-                trigger = False
-                if direction == "low" and price_diff_percent > 0:
-                    trigger = True
-                elif direction == "high" and price_diff_percent < 0:
-                    trigger = True
-                elif direction == "both":
-                    trigger = True
-
-                # Target price
-                target_price = watch.get("target_price")
-                target_hit = False
-                if target_price is not None and current_price <= target_price:
-                    target_hit = True
-                    trigger = True
-
-                if not trigger:
-                    watch["last_price"] = current_price
-                    continue
-
-                # Enriched alert data
-                enriched = {
-                    "title": new_data.get("title", watch.get("title", "Product")),
-                    "current_price": current_price,
-                    "previous_price": old_price,
-                    "price_diff_percent": abs(price_diff_percent),
-                    "deal_score": deal_score,
-                    "suggested_action": (
-                        f"Hit target ≤ ₦{int(target_price):,}" if target_hit
-                        else "Price dropped!" if price_diff_percent > 0
-                        else "Price increased!"
-                    ),
-                    "product_url": watch["url"],
-                    "changed": True,
-                    "what_changed": changes.get("what_changed", []),
-                }
-
-                msg = format_telegram_alert(enriched)
-
-                await safe_send(
-                    context.bot,
-                    user_id,
-                    msg,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True
-                )
-
-                watch["last_price"] = current_price
-
-            except Exception as exc:
-                LOG.exception("Unexpected scheduler error user=%s watch=%s", user_id, watch.get("url"))
-                await handle_watch_failure(context, user_id, watch, exc=exc, reason="unexpected")
 
 async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
     """
     Unified channel posting:
-      - Scrapes every ref in CHANNEL_MONITORED_URLS (via scrape_site)
+      - Scrapes every ref in CHANNEL_MONITORED_URLS (via scrape_site/scrape_product)
       - Groups by normalize_product_key()
       - Posts one unified comparison per product group if drop/savings thresholds met.
     """
@@ -195,17 +241,15 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
         channel_posted_today.clear()
         last_cache_date = today
 
-    from utils.utils import scrape_site, normalize_product_key  # local helpers
-    from utils.format import _safe_currency  # re-use existing currency formatter
-    grouped = {}
-
     loop = asyncio.get_event_loop()
+    grouped = {}
 
     # 1) fetch (run blocking scrapes in executor)
     for ref in CHANNEL_MONITORED_URLS:
         try:
-            # run sync scrape in executor to avoid blocking
-            data = await loop.run_in_executor(None, scrape_site, ref)
+            # prefer scrape_site if available; fallback to scrape_product
+            scrape_fn = scrape_site if "scrape_site" in globals() else scrape_product
+            data = await loop.run_in_executor(None, scrape_fn, ref)
         except Exception as e:
             LOG.warning("Channel scrape failed for %s: %s", ref, e)
             continue
@@ -221,15 +265,20 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
 
         data["current_price"] = cur
         data["url"] = data.get("url") or ref
-        data["site"] = data.get("site") or _get_domain_from_url(data["url"])
+        data["site"] = data.get("site") or (_get_domain_from_url(data["url"]) if "_get_domain_from_url" in globals() else data["url"])
+
         # build group key
-        key = normalize_product_key(data)
+        try:
+            key = normalize_product_key(data)
+        except Exception:
+            key = f"UNK::{data['site']}::{int(cur)}"
+
         grouped.setdefault(key, []).append({"ref": ref, "data": data, "price": cur})
 
     # 2) evaluate groups and post at most MAX_CHANNEL_POSTS_PER_RUN
     posted_count = 0
     for product_key, entries in grouped.items():
-        if posted_count >= MAX_CHANNEL_POSTS_PER_RUN:
+        if posted_count >= (MAX_CHANNEL_POSTS_PER_RUN or 10):
             break
         try:
             # find best (lowest) price across entries and site-specific minima
@@ -255,7 +304,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             drop_pct = round(((highest_old - best_price) / highest_old) * 100, 1)
             savings = highest_old - best_price
 
-            if drop_pct < MIN_DROP_PERCENT_FOR_CHANNEL or savings < MIN_SAVINGS_FOR_CHANNEL:
+            if drop_pct < (MIN_DROP_PERCENT_FOR_CHANNEL or 5.0) or savings < (MIN_SAVINGS_FOR_CHANNEL or 15000):
                 # update cache and skip
                 for e in entries:
                     channel_price_cache[e["ref"]] = e["price"]
@@ -306,60 +355,82 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             LOG.exception("Failed evaluating channel product %s", product_key)
             continue
 
+
 async def check_trials(context: ContextTypes.DEFAULT_TYPE):
+    """Validate trials and downgrade users whose trial expired."""
     bot = context.bot
     now = time.time()
-    
+
     for user_id, sub in list(user_subscriptions.items()):
-        if "trial_start" in sub and not sub.get("paid", False):
-            days_since = (now - sub["trial_start"]) / 86400
-            tier = sub["tier"]
-            trial_days = PAID_TIERS.get(tier, {"trial_days": 0})["trial_days"]
-            
-            if days_since > trial_days:
-                sub["tier"] = "free"
-                del sub["trial_start"]
-                
-                # Notify
-                msg = f"⚠️ Your {PAID_TIERS[tier]['name']} trial expired. Downgraded to free tier."
-                await safe_send(bot, user_id, msg)
-                
-                # Enforce watch limit
-                watches = user_watches.get(user_id, [])
-                if len(watches) > MAX_WATCHES_FREE:
-                    msg += f"\nPlease remove {len(watches) - MAX_WATCHES_FREE} watches to comply."
-                    await safe_send(bot, user_id, msg)
+        try:
+            if not sub:
+                continue
+            if "trial_start" in sub and not sub.get("paid", False):
+                days_since = (now - sub["trial_start"]) / 86400
+                tier = sub["tier"]
+                trial_days = PAID_TIERS.get(tier, {"trial_days": 0})["trial_days"]
+
+                if days_since > trial_days:
+                    sub["tier"] = "free"
+                    sub.pop("trial_start", None)
+
+                    # Notify
+                    msg = f"⚠️ Your {tier.capitalize()} trial expired. Downgraded to free tier."
+                    try:
+                        await safe_send(bot, user_id, msg)
+                    except Exception:
+                        LOG.exception("Failed to notify user about trial expiry")
+
+                    # Enforce watch limit
+                    watches = user_watches.get(user_id, [])
+                    if len(watches) > MAX_WATCHES_FREE:
+                        extra = len(watches) - MAX_WATCHES_FREE
+                        msg2 = f"\nPlease remove {extra} watches to comply with the free tier limit."
+                        try:
+                            await safe_send(bot, user_id, msg2)
+                        except Exception:
+                            LOG.exception("Failed to notify user about watches limit after downgrade")
+        except Exception:
+            LOG.exception("Error while checking trials for user %s", user_id)
+            continue
+
 
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     LOG.exception("Unhandled handler error: %s", context.error)
 
 
 def run_bot():
+    """Start the Telegram bot application and scheduler jobs."""
     global application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
+    # register handlers
     for handler in get_application_handlers():
         application.add_handler(handler)
 
     application.add_error_handler(global_error_handler)
 
+    # schedule jobs
     application.job_queue.run_repeating(
         callback=check_all_watches,
         interval=CHECK_INTERVAL_SECONDS,
         first=30,
         name="price_checker"
     )
-    
-application.job_queue.run_repeating(
-    callback=check_and_post_channel_deals,
-    interval=CHECK_INTERVAL_SECONDS,  # hourly, same as personal checks
-    first=90,  # slight offset
-    name="channel_deals"
-)
+
+    application.job_queue.run_repeating(
+        callback=check_and_post_channel_deals,
+        interval=CHECK_INTERVAL_SECONDS,
+        first=90,
+        name="channel_deals"
+    )
+
     application.job_queue.run_repeating(
         callback=check_trials,
-        interval=86400,  # Daily
-        first=3600,     # Start after 1 hour
+        interval=86400,  # daily
+        first=3600,
         name="trial_checker"
+    )
+
     LOG.info("Bot + scheduler started")
     application.run_polling()
