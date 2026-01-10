@@ -178,68 +178,133 @@ if watch_category not in enabled_cats:
                 await handle_watch_failure(context, user_id, watch, exc=exc, reason="unexpected")
 
 async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
-    global channel_posted_today, last_cache_date
+    """
+    Unified channel posting:
+      - Scrapes every ref in CHANNEL_MONITORED_URLS (via scrape_site)
+      - Groups by normalize_product_key()
+      - Posts one unified comparison per product group if drop/savings thresholds met.
+    """
+    global channel_posted_today, last_cache_date, channel_price_cache
 
     if not AUTO_POST_TO_CHANNEL or not CHANNEL_DEAL_CHAT_ID or not CHANNEL_MONITORED_URLS:
         return
 
-    # Daily reset of posted set
+    # daily reset
     today = datetime.now(TIMEZONE).date()
     if last_cache_date != today:
         channel_posted_today.clear()
         last_cache_date = today
 
+    from utils.utils import scrape_site, normalize_product_key  # local helpers
+    from utils.format import _safe_currency  # re-use existing currency formatter
+    grouped = {}
+
+    loop = asyncio.get_event_loop()
+
+    # 1) fetch (run blocking scrapes in executor)
+    for ref in CHANNEL_MONITORED_URLS:
+        try:
+            # run sync scrape in executor to avoid blocking
+            data = await loop.run_in_executor(None, scrape_site, ref)
+        except Exception as e:
+            LOG.warning("Channel scrape failed for %s: %s", ref, e)
+            continue
+
+        # normalize numeric price
+        try:
+            cur = float(data.get("current_price")) if data.get("current_price") is not None else None
+        except Exception:
+            cur = None
+        if cur is None:
+            # skip delisted / no price
+            continue
+
+        data["current_price"] = cur
+        data["url"] = data.get("url") or ref
+        data["site"] = data.get("site") or _get_domain_from_url(data["url"])
+        # build group key
+        key = normalize_product_key(data)
+        grouped.setdefault(key, []).append({"ref": ref, "data": data, "price": cur})
+
+    # 2) evaluate groups and post at most MAX_CHANNEL_POSTS_PER_RUN
     posted_count = 0
-    for url in CHANNEL_MONITORED_URLS:
+    for product_key, entries in grouped.items():
         if posted_count >= MAX_CHANNEL_POSTS_PER_RUN:
             break
+        try:
+            # find best (lowest) price across entries and site-specific minima
+            site_prices = {}
+            for e in entries:
+                site = e["data"]["site"]
+                site_prices[site] = min(site_prices.get(site, float("inf")), e["price"])
 
-        ok, data, err = safe_scrape_product(url)  # use your existing safe wrapper
-        if not ok or not data or data.get("current_price") is None or data.get("stock_status") != "available":
+            best_site, best_price = min(site_prices.items(), key=lambda kv: kv[1])
+
+            # compute highest historical price among these refs (to measure drop)
+            highest_old = 0
+            for e in entries:
+                old = channel_price_cache.get(e["ref"]) or 0
+                highest_old = max(highest_old, old)
+
+            if highest_old <= 0:
+                # seed cache and skip first-time notifications
+                for e in entries:
+                    channel_price_cache[e["ref"]] = e["price"]
+                continue
+
+            drop_pct = round(((highest_old - best_price) / highest_old) * 100, 1)
+            savings = highest_old - best_price
+
+            if drop_pct < MIN_DROP_PERCENT_FOR_CHANNEL or savings < MIN_SAVINGS_FOR_CHANNEL:
+                # update cache and skip
+                for e in entries:
+                    channel_price_cache[e["ref"]] = e["price"]
+                continue
+
+            # score with existing helper
+            score = calculate_deal_score(drop_pct)
+            if score not in ("high", "medium"):
+                for e in entries:
+                    channel_price_cache[e["ref"]] = e["price"]
+                continue
+
+            # dedupe: if any of the refs were posted today, skip (avoid duplication)
+            if any(e["ref"] in channel_posted_today for e in entries):
+                for e in entries:
+                    channel_price_cache[e["ref"]] = e["price"]
+                continue
+
+            # Build message: unified comparison
+            prod_title = entries[0]["data"].get("title") or product_key
+            lines = []
+            lines.append(f"🔥 *{prod_title}* — BEST PRICE: {_safe_currency(best_price)} on *{best_site}*")
+            lines.append(f"📉 Drop: *{drop_pct}%* • Saved: *{_safe_currency(savings)}*")
+            lines.append("")
+            lines.append("💱 Prices across monitored sites:")
+            for site, price in sorted(site_prices.items(), key=lambda kv: kv[1]):
+                lines.append(f"- *{site}*: {_safe_currency(price)}")
+
+            # prefer the first entry that matches best_site to provide a link
+            best_entry = next((e for e in entries if e["data"]["site"] == best_site), entries[0])
+            lines.append("")
+            lines.append(f"🛒 Buy: {best_entry['data'].get('url')}")
+            lines.append("")
+            lines.append("⏰ Spotted now — prices move fast. Personal alerts → @YourBotUsername")
+
+            msg = "\n".join(lines)
+
+            await safe_send(context.bot, CHANNEL_DEAL_CHAT_ID, msg,
+                            parse_mode="Markdown", disable_web_page_preview=True)
+
+            # update caches and posted set
+            for e in entries:
+                channel_price_cache[e["ref"]] = e["price"]
+                channel_posted_today.add(e["ref"])
+            posted_count += 1
+
+        except Exception:
+            LOG.exception("Failed evaluating channel product %s", product_key)
             continue
-
-        old_price = channel_price_cache.get(url)
-        current_price = data["current_price"]
-
-        if old_price is None:
-            channel_price_cache[url] = current_price
-            continue
-
-        if current_price >= old_price:
-            channel_price_cache[url] = current_price
-            continue
-
-        drop_pct = round(((old_price - current_price) / old_price) * 100, 1)
-        savings = old_price - current_price
-
-        if (drop_pct < MIN_DROP_PERCENT_FOR_CHANNEL or
-            savings < MIN_SAVINGS_FOR_CHANNEL):
-            channel_price_cache[url] = current_price
-            continue
-
-        deal_score = calculate_deal_score(drop_pct)
-        if deal_score not in ("high", "medium"):
-            channel_price_cache[url] = current_price
-            continue
-
-        if url in channel_posted_today:
-            channel_price_cache[url] = current_price
-            continue
-
-        enriched = {
-            **data,
-            "previous_price": old_price,
-            "price_diff_percent": drop_pct,
-            "deal_score": deal_score,
-        }
-        msg = format_channel_deal(enriched)
-
-        await safe_send(context.bot, CHANNEL_DEAL_CHAT_ID, msg,
-                        parse_mode="Markdown", disable_web_page_preview=True)
-
-        channel_posted_today.add(url)
-        channel_price_cache[url] = current_price
-        posted_count += 1
 
 async def check_trials(context: ContextTypes.DEFAULT_TYPE):
     bot = context.bot
