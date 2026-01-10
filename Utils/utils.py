@@ -3,7 +3,9 @@ import time
 import logging
 from typing import Dict, Optional, Any, Tuple, Callable
 from functools import wraps
-
+import requests
+from difflib import SequenceMatcher
+import asyncio
 from apify_client import ApifyClient
 
 # Settings / thresholds (imported from your project)
