@@ -51,7 +51,7 @@ async def handle_watch_failure(context: ContextTypes.DEFAULT_TYPE, user_id: int,
         msg = (
             f"⚠️ Watch for *{watch.get('title', 'product')}* paused after repeated failures.\n\n"
             "Possible causes: product removed, site changes, or temporary issues.\n"
-            "We'll resume automatically if it recovers, or remove/re-add."
+            "We'll resume automatically if it recovers, or remove then add again."
         )
         await safe_send(context.bot, user_id, msg, parse_mode="Markdown")
         LOG.info("Paused watch user=%s url=%s after %d failures", user_id, watch.get("url"), watch["fail_count"])
