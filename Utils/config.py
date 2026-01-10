@@ -8,7 +8,6 @@ APIFY_TOKEN = os.getenv('APIFY_TOKEN')
 DB_URL = os.getenv('DB_URL')
 REDIS_URL = os.getenv('REDIS_URL')
 ADMIN_IDS = os.getenv(ADMIN_IDS)
-SUPPORTED_SITES = ['Jumia.ng', 'konga.com','binance.com']
 SITE_ACTOR_MAP = {
     'jumia.ng': 'buseta/jumia-advanced-scraper'
 }
