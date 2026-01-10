@@ -8,4 +8,4 @@ APIFY_TOKEN = os.getenv('APIFY_TOKEN')
 DB_URL = os.getenv('DB_URL', 'postgresql://user:pass@localhost/naija_db')
 REDIS_URL = os.getenv('REDIS_URL', 'redis://localhost:6379/0')
 ADMIN_IDS = [123456789]
-SUPPORTED_SITES = ['Julia.ng', 'konga.com']
+SUPPORTED_SITES = ['Jumia.ng', 'konga.com','binance.com']
