@@ -7,7 +7,9 @@ import requests
 from difflib import SequenceMatcher
 import asyncio
 from apify_client import ApifyClient
-
+from urllib.parse import urlparse
+import re
+from config import SITE_ACTOR_MAP
 # Settings / thresholds (imported from your project)
 from bot.settings import (
     SUPPORTED_SITES,
@@ -76,7 +78,7 @@ def retry(max_attempts: int = 3, backoff: float = 1.5, allowed_exceptions: Tuple
 
 
 # ---------------------------
-# Core scraping function
+# Core scraping function (Apify helper already present)
 # ---------------------------
 @retry(max_attempts=3, backoff=2, allowed_exceptions=(ApifyError, ConnectionError, TimeoutError, OSError))
 def _call_apify_actor_and_get_items(actor_id: str, run_input: Dict[str, Any]) -> list:
@@ -122,81 +124,225 @@ def _call_apify_actor_and_get_items(actor_id: str, run_input: Dict[str, Any]) ->
     return items
 
 
-def scrape_product(url: str) -> Dict[str, Any]:
+# ---------------------------
+# Helpers: domain parsing, normalization, product key
+# ---------------------------
+def _get_domain_from_url(u: str) -> str:
+    try:
+        p = urlparse(u)
+        host = p.netloc.lower()
+        return host.replace("www.", "")
+    except Exception:
+        return ""
+
+def _slugify(s: str) -> str:
+    return re.sub(r'[^a-z0-9]+', '-', (s or "").lower()).strip('-')
+
+def _best_identifier(raw: Dict[str, Any]) -> Optional[str]:
     """
-    Scrape a single product URL using the best available Apify actor for Jumia.
-    Returns a normalized product dict or raises an exception on failure.
-
-    Raises:
-      - ValueError for invalid input
-      - ApifyError for actor/dataset related problems
-      - NoDataError when actor returned no items
+    Try common canonical fields present in many scrapers: sku, model, upc, ean, mpn, id, product_code.
     """
-    if not isinstance(url, str) or not url.strip():
-        raise ValueError("url must be a non-empty string")
+    if not raw or not isinstance(raw, dict):
+        return None
+    for key in ("sku", "model", "upc", "ean", "mpn", "item_id", "id"):
+        v = raw.get(key)
+        if v:
+            return str(v).strip().lower()
+    # sometimes nested under raw payload
+    nested = raw.get("raw") if isinstance(raw.get("raw"), dict) else None
+    if nested:
+        for key in ("sku", "model", "product_code", "mpn", "id"):
+            v = nested.get(key)
+            if v:
+                return str(v).strip().lower()
+    return None
 
-    url_lower = url.lower().strip()
+def normalize_product_key(scrape_result: Dict[str, Any]) -> str:
+    """
+    Best-effort unique key for same product across sites.
+    Order:
+      1. canonical id fields (sku/model/upc/...)
+      2. slug(title)
+      3. fallback to site+slug(title)
+    """
+    raw = scrape_result.get("raw") or {}
+    ident = _best_identifier(scrape_result) or _best_identifier(raw)
+    if ident:
+        return f"ID::{ident}"
+    title = (scrape_result.get("title") or (raw.get("name") if isinstance(raw, dict) else "") or "")
+    slug = _slugify(title)
+    if slug:
+        return f"SLUG::{slug}"
+    # final fallback
+    site = scrape_result.get("site") or scrape_result.get("url") or "unknown"
+    return f"UNK::{site}::{int(scrape_result.get('current_price') or 0)}"
 
-    # Validate supported site
-    if not any(site in url_lower for site in SUPPORTED_SITES):
-        raise ValueError(f"Unsupported site in MVP. Supported: {SUPPORTED_SITES}. Got: {url}")
 
-    if "jumia.com.ng" not in url_lower:
-        # Keep clear and explicit — avoid partial behavior for unsupported sites
-        raise NotImplementedError("Only Jumia.ng fully implemented in MVP")
+# ---------------------------
+# Adapters
+# ---------------------------
+def _apify_product_scrape_for_domain(domain: str, url: str) -> Dict[str, Any]:
+    """
+    Use SITE_ACTOR_MAP to call appropriate Apify actor for domain.
+    """
+    actor_id = SITE_ACTOR_MAP.get(domain)
+    if not actor_id:
+        # try to find an actor by partial match
+        for k, v in SITE_ACTOR_MAP.items():
+            if k in domain and v:
+                actor_id = v
+                break
+    if not actor_id:
+        raise NotImplementedError(f"No Apify actor configured for domain '{domain}'")
 
-    actor_id = "buseta/jumia-advanced-scraper"
     run_input = {
         "scrape_type": "product",
         "product_urls": [url],
         "get_reviews": False,
-        # Keep fast & cheap for price monitoring
         "image_resolution": "low",
     }
 
-    try:
-        items = _call_apify_actor_and_get_items(actor_id, run_input)
-    except ApifyError as e:
-        # Bubble up Apify problems with context
-        logger.error("ApifyError while scraping product: %s (retryable=%s)", e, getattr(e, "retryable", False))
-        raise
-    except Exception as e:
-        logger.exception("Unexpected error during Apify scraping")
-        raise ApifyError(f"Unexpected error during scraping: {e}", retryable=True)
-
+    items = _call_apify_actor_and_get_items(actor_id, run_input)
     if not items:
-        logger.info("Apify actor returned empty items for %s", url)
-        raise NoDataError(f"No data extracted for {url}")
+        raise NoDataError(f"No data extracted for {url} (actor {actor_id})")
 
-    # We expect a single product entry
     raw = items[0]
     if not isinstance(raw, dict):
-        logger.warning("Unexpected item type from dataset: %s", type(raw))
         raise NoDataError(f"Dataset item for {url} is not a dict")
 
-    # Defensive extraction of price info
     price_info = raw.get("price") or {}
-    current_price = price_info.get("price_ngn") or price_info.get("price") or None
+    current_price = price_info.get("price_ngn") or price_info.get("price") or raw.get("price") or None
     previous_price = price_info.get("old_price_ngn") or price_info.get("old_price") or None
 
-    # stock inference
     stock_status = "available" if current_price is not None else "out_of_stock"
-
-    # Normalize title safely
     title = raw.get("name") or raw.get("title") or raw.get("product_name") or None
 
-    product = {
+    return {
         "title": title,
         "current_price": current_price,
         "previous_price": previous_price,
         "discount_percent": price_info.get("discount"),
         "stock_status": stock_status,
         "url": url,
-        "raw": raw,  # keep raw payload for debugging (consumer may ignore)
+        "site": domain,
+        "currency": price_info.get("currency") or "NGN",
+        "raw": raw,
     }
 
-    logger.info("Scraped product '%s' price=%s previous=%s", product.get("title"), current_price, previous_price)
-    return product
+def _scrape_binance_ref(ref: str) -> Dict[str, Any]:
+    """
+    Resolve a Binance symbol from a URL or 'SYMBOL:BTCUSDT' style string and fetch the public ticker price.
+    Returns normalized dict (currency = USDT).
+    """
+    symbol = None
+    # Accept "SYMBOL:BTCUSDT"
+    if isinstance(ref, str) and ref.upper().startswith("SYMBOL:"):
+        symbol = ref.split(":", 1)[1].strip().upper()
+    else:
+        try:
+            p = urlparse(ref)
+            # look for symbol= in query
+            q = p.query or ""
+            for kv in q.split("&"):
+                if kv.startswith("symbol="):
+                    symbol = kv.split("=", 1)[1].upper()
+                    break
+            # fallback: /trade/BTC_USDT or similar in path
+            if not symbol:
+                m = re.search(r'/trade/([A-Z0-9_]+)', p.path or "")
+                if m:
+                    symbol = m.group(1).replace("_", "").upper()
+        except Exception:
+            symbol = None
+
+    if not symbol:
+        raise ValueError("Could not determine Binance symbol from: " + str(ref))
+
+    # public endpoint ticker
+    try:
+        resp = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}", timeout=10)
+        if resp.status_code != 200:
+            logger.error("Binance API returned %s for symbol %s", resp.status_code, symbol)
+            raise RuntimeError(f"Binance API error: status {resp.status_code}")
+        data = resp.json()
+        price_val = float(data.get("price"))
+    except Exception as e:
+        logger.exception("Failed fetching Binance ticker for %s: %s", symbol, e)
+        raise
+
+    return {
+        "title": symbol,
+        "current_price": price_val,
+        "previous_price": None,
+        "discount_percent": None,
+        "stock_status": "available",
+        "url": ref,
+        "site": "binance.com",
+        "currency": "USDT",
+        "raw": data,
+    }
+
+
+# ---------------------------
+# Public scrape_product (router) — replaced single-site-only behavior
+# ---------------------------
+def scrape_product(url: str) -> Dict[str, Any]:
+    """
+    Scrape a single product reference (URL or symbol).
+    Routes to:
+      - Binance REST adapter if domain contains binance or ref like 'SYMBOL:...'
+      - Apify actor if SITE_ACTOR_MAP has a mapping for domain
+    Returns normalized product dict similar to previous shape.
+    """
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("url must be a non-empty string")
+
+    raw_ref = url.strip()
+    low = raw_ref.lower()
+
+    # quick validation against SUPPORTED_SITES (config-driven)
+    if not any(site in low for site in SUPPORTED_SITES):
+        # allow binance symbol style even if not in SUPPORTED_SITES
+        if not raw_ref.upper().startswith("SYMBOL:") and "binance" not in low:
+            raise ValueError(f"Unsupported site in config. Supported: {SUPPORTED_SITES}. Got: {url}")
+
+    domain = _get_domain_from_url(raw_ref)
+
+    try:
+        # Binance path
+        if raw_ref.upper().startswith("SYMBOL:") or "binance" in domain:
+            product = _scrape_binance_ref(raw_ref)
+            logger.info("Scraped Binance symbol %s price=%s", product.get("title"), product.get("current_price"))
+            return product
+
+        # Try Apify actor mapping from config
+        actor_domain = None
+        # exact domain lookup
+        if domain in SITE_ACTOR_MAP and SITE_ACTOR_MAP.get(domain):
+            actor_domain = domain
+        else:
+            # fallback: find any configured map whose key is contained in the URL
+            for key in SITE_ACTOR_MAP:
+                if key in low and SITE_ACTOR_MAP.get(key):
+                    actor_domain = key
+                    break
+
+        if actor_domain:
+            product = _apify_product_scrape_for_domain(actor_domain, raw_ref)
+            logger.info("Scraped product '%s' from %s price=%s", product.get("title"), actor_domain, product.get("current_price"))
+            return product
+
+        # Not implemented for this URL
+        raise NotImplementedError(f"No scraper available for {url} — ensure SITE_ACTOR_MAP contains an actor for the domain")
+
+    except ApifyError:
+        # bubble up ApifyError unchanged
+        raise
+    except NoDataError:
+        raise
+    except Exception as exc:
+        logger.exception("Unexpected error during scraping for %s", url)
+        raise ApifyError(f"Unexpected error during scraping: {exc}", retryable=True)
 
 
 # ---------------------------
