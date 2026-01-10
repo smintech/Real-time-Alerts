@@ -36,7 +36,7 @@ def health():
     return {"status": "ok", "pid": os.getpid()}
 
 # ---------- Redis client (sync) ----------
-REDIS_URL = os.getenv("REDIS_URL", "redis://localhost:6379/0")
+REDIS_URL = os.getenv("REDIS_URL")
 _redis = None
 
 def get_redis():
@@ -205,7 +205,7 @@ async def track_product(payload: dict = Body(...)):
         "deal_score": deal_score,
         "severity": severity,
         "suggested_action": (
-            "Buy now — strong price drop" if deal_score == "high"
+            "Buy now ,strong price drop" if deal_score == "high"
             else "Monitor price" if deal_score == "medium"
             else "No immediate action"
         ),
