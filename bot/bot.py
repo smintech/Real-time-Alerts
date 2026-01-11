@@ -433,4 +433,7 @@ def run_bot():
     )
 
     LOG.info("Bot + scheduler started")
-    application.run_polling()
+    application.run_polling(
+    drop_pending_updates=True,
+    allowed_updates=["message", "callback_query"]  # limit to what you handle
+)
