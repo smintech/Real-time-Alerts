@@ -9,5 +9,5 @@ DB_URL = os.getenv('DB_URL')
 REDIS_URL = os.getenv('REDIS_URL')
 ADMIN_IDS = os.getenv(ADMIN_IDS)
 SITE_ACTOR_MAP = {
-    'jumia.ng': 'buseta/jumia-advanced-scraper'
+    'jumia.ng': 'reverent_greeting/jumia-scraper-2-5-1k-all-in-one-task'
 }
