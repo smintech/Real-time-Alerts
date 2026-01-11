@@ -77,21 +77,21 @@ PAID_TIERS = {
         "name": "Basic Pro",
         "max_watches": 20,
         "trial_days": 3,          # Free trial length
-        "price_monthly_ngn": 1500,
+        "price_monthly_ngn": 5000,
         "features": ["More watches", "Priority alerts", "Category filters"]
     },
     "merchant": {
         "name": "Merchant Plan",
-        "max_watches": 50,
+        "max_watches": 75,
         "trial_days": 7,
-        "price_monthly_ngn": 8000,
+        "price_monthly_ngn": 15000,
         "features": ["Bulk add", "Price history export", "Competitor tracking"]
     },
     "business": {
         "name": "Business Plan",
-        "max_watches": 500,      # or "unlimited"
+        "max_watches": 1000,      # or "unlimited"
         "trial_days": 14,
-        "price_monthly_ngn": 20000,
+        "price_monthly_ngn": 40000,
         "features": ["Team accounts", "API access (coming)", "Custom reports"]
     }
 }
