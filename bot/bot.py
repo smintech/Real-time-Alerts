@@ -88,7 +88,18 @@ async def check_all_watches(context: ContextTypes.DEFAULT_TYPE):
         return
 
     now = datetime.now(TIMEZONE)
-
+    last_check = watch.get("last_checked_at")
+    if last_check:
+        try:
+            last_dt = datetime.fromisoformat(last_check)
+            diff = (now - last_dt).total_seconds()
+        except Exception:
+            diff = None
+    else:
+        diff = None
+    if diff is not None and diff < (CHECK_INTERVAL_SECONDS * 0.33):
+        continue
+    watch["last_checked_at"] = now.isoformat()
     # Each user separately to respect per-user settings
     for user_id, watches in list(user_watches.items()):
         try:
