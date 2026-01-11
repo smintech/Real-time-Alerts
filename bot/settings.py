@@ -91,7 +91,7 @@ PAID_TIERS = {
         "name": "Business Plan",
         "max_watches": 1000,      # or "unlimited"
         "trial_days": 14,
-        "price_monthly_ngn": 40000,
+        "price_monthly_ngn": 30000,
         "features": ["Team accounts", "API access (coming)", "Custom reports"]
     }
 }
