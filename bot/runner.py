@@ -400,10 +400,13 @@ def on_startup():
         logger.exception("Error during startup sequence")
 
 @app.on_event("shutdown")
-def on_shutdown():
-    # Cleanly stop bot process
-    logger.info("Application shutdown: stopping bot process")
-    bot_manager.request_stop()
+def _on_shutdown():
+    LOG.info("App shutdown: stopping bot manager")
+    try:
+        bot_manager.request_stop()
+        # give small grace
+    except Exception:
+        LOG.exception("Error during shutdown sequence")
 
 # -----------------------
 # Main runner (keeps your original pattern but safer)
