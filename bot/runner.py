@@ -33,7 +33,7 @@ def health():
       - returns OK if process running,
       - returns details otherwise
     """
-    return {"status": "ok", "pid": os.getpid()}
+    return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
 
 # ---------- Redis client (sync) ----------
 REDIS_URL = os.getenv("REDIS_URL")
