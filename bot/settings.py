@@ -76,7 +76,7 @@ PAID_TIERS = {
     "basic": {
         "name": "Basic Pro",
         "max_watches": 20,
-        "trial_days": 3,          # Free trial length
+        "trial_days": 3,          
         "price_monthly_ngn": 5000,
         "features": ["More watches", "Priority alerts", "Category filters"]
     },
@@ -89,10 +89,10 @@ PAID_TIERS = {
     },
     "business": {
         "name": "Business Plan",
-        "max_watches": 1000,      # or "unlimited"
+        "max_watches": 1000,      
         "trial_days": 14,
         "price_monthly_ngn": 30000,
-        "features": ["Team accounts", "API access (coming)", "Custom reports"]
+        "features": ["Team accounts(shared dashboard for multiple users)", "Priority alert notifications (faster scheduler checks)", "Custom reports(export price history CSV/PDF)"]
     }
 }
 DEFAULT_FREE_LIMIT = MAX_WATCHES_FREE
