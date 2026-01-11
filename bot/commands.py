@@ -1,3 +1,4 @@
+# commands.py (updated)
 import asyncio
 import logging
 import time
@@ -112,7 +113,7 @@ def get_user_max_watches(user_id: int) -> int:
     return DEFAULT_FREE_LIMIT
 
 
-def build_main_menu() -> InlineKeyboardMarkup:
+def build_main_menu(user_id: Optional[int] = None) -> InlineKeyboardMarkup:
     keyboard = [
         [InlineKeyboardButton("➕ Add New Watch", callback_data="add_watch_inline")],
         [InlineKeyboardButton("📋 My Watches", callback_data="my_watches_inline")],
@@ -121,6 +122,9 @@ def build_main_menu() -> InlineKeyboardMarkup:
         [InlineKeyboardButton("🔔 Alert Categories", callback_data="category_settings")],
         [InlineKeyboardButton("❓ Help", callback_data="help_inline")],
     ]
+    # Admin button visible only to admins
+    if user_id is not None and user_id in ADMIN_IDS:
+        keyboard.insert(0, [InlineKeyboardButton("🛠️ Admin Panel", callback_data="admin_panel")])
     return InlineKeyboardMarkup(keyboard)
 
 
@@ -166,6 +170,67 @@ def build_category_settings_menu(user_id: int) -> InlineKeyboardMarkup:
 
 
 # -------------------------
+# Admin helpers: stats & user list pagination (10 per page)
+# -------------------------
+def _build_admin_panel() -> InlineKeyboardMarkup:
+    keyboard = [
+        [InlineKeyboardButton("📊 User Stats", callback_data="admin_stats")],
+        [InlineKeyboardButton("📣 Broadcast", callback_data="admin_broadcast")],
+        [InlineKeyboardButton("↩️ Back", callback_data="main_menu_inline")],
+    ]
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _build_users_page(page: int = 0, per_page: int = 10) -> InlineKeyboardMarkup:
+    """
+    Build inline keyboard of user IDs (paginated).
+    """
+    all_user_ids = list(user_watches.keys())
+    total = len(all_user_ids)
+    start = page * per_page
+    end = start + per_page
+    page_items = all_user_ids[start:end]
+
+    keyboard = []
+    for uid in page_items:
+        # show small stats per user if available
+        watches = user_watches.get(uid, [])
+        label = f"{uid} ({len(watches)} watches)"
+        keyboard.append([InlineKeyboardButton(label, callback_data=f"admin_user_{uid}")])
+
+    nav_row = []
+    if start > 0:
+        nav_row.append(InlineKeyboardButton("⬅️ Prev", callback_data=f"admin_users_page_{page-1}"))
+    if end < total:
+        nav_row.append(InlineKeyboardButton("Next ➡️", callback_data=f"admin_users_page_{page+1}"))
+    if nav_row:
+        keyboard.append(nav_row)
+
+    keyboard.append([InlineKeyboardButton("↩️ Back to Admin", callback_data="admin_panel")])
+    return InlineKeyboardMarkup(keyboard)
+
+
+def _compute_user_stats() -> Dict[str, Any]:
+    """
+    Return simple aggregated stats for admin dashboard.
+    """
+    total_users = len(user_watches)
+    total_watches = sum(len(w) for w in user_watches.values())
+    active_watches = sum(1 for watches in user_watches.values() for w in watches if w.get("status") == "active")
+    tiers = {}
+    for uid, sub in user_subscriptions.items():
+        tier = sub.get("tier", "free")
+        tiers[tier] = tiers.get(tier, 0) + 1
+
+    return {
+        "total_users": total_users,
+        "total_watches": total_watches,
+        "active_watches": active_watches,
+        "by_tier": tiers
+    }
+
+
+# -------------------------
 # Handlers
 # -------------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -175,7 +240,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         # Existing user → show main menu
         await update.message.reply_text(
             "👋 Welcome back to Naija Price Alerts!\n\nWhat would you like to do?",
-            reply_markup=build_main_menu()
+            reply_markup=build_main_menu(user_id)
         )
         return
 
@@ -372,6 +437,9 @@ async def assign_trial(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("❌ Invalid user ID.")
 
 
+# -------------------------
+# Inline callback handler (extended for admin flows)
+# -------------------------
 async def inline_callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
@@ -380,6 +448,7 @@ async def inline_callback_handler(update: Update, context: ContextTypes.DEFAULT_
     user_id = query.from_user.id
 
     try:
+        # --- Onboarding and core flows (unchanged) ---
         if data.startswith("onboard_"):
             user_type = data.replace("onboard_", "")
             tier = "free"
@@ -403,20 +472,22 @@ async def inline_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             if trial_days > 0:
                 msg += f" Starting {trial_days}-day free trial!"
             
-            await query.edit_message_text(msg + "\n\nWhat next?", reply_markup=build_main_menu())
+            await query.edit_message_text(msg + "\n\nWhat next?", reply_markup=build_main_menu(user_id))
             return
 
         if data == "main_menu_inline":
             await query.edit_message_text(
                 "🏠 Main Menu\n\nWhat would you like to do?",
-                reply_markup=build_main_menu()
+                reply_markup=build_main_menu(user_id)
             )
+            return
 
         elif data == "add_watch_inline":
             await query.edit_message_text(
                 "Choose category:",
                 reply_markup=build_category_selection()
             )
+            return
 
         elif data.startswith("cat_select_"):
             cat = data.replace("cat_select_", "")
@@ -431,16 +502,19 @@ async def inline_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                 ]])
             )
             context.user_data["awaiting_add_url"] = True
+            return
 
         elif data == "add_watch_cancel":
             context.user_data.clear()
-            await query.edit_message_text("Cancelled.", reply_markup=build_main_menu())
+            await query.edit_message_text("Cancelled.", reply_markup=build_main_menu(user_id))
+            return
 
         elif data == "category_settings":
             await query.edit_message_text(
                 "🔔 Select alert categories:",
                 reply_markup=build_category_settings_menu(user_id)
             )
+            return
 
         elif data.startswith("toggle_cat_"):
             cat = data.replace("toggle_cat_", "")
@@ -458,12 +532,14 @@ async def inline_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             await query.edit_message_reply_markup(
                 reply_markup=build_category_settings_menu(user_id)
             )
+            return
 
         elif data == "save_categories":
             await query.edit_message_text(
                 "✅ Categories saved!",
-                reply_markup=build_main_menu()
+                reply_markup=build_main_menu(user_id)
             )
+            return
 
         elif data == "upgrade_plans":
             lines = ["💎 Upgrade Options\n"]
@@ -478,17 +554,20 @@ async def inline_callback_handler(update: Update, context: ContextTypes.DEFAULT_
             lines.append("Contact support to upgrade!")
             
             await query.edit_message_text("\n".join(lines), reply_markup=build_simple_back())
+            return
 
         elif data == "my_watches_inline":
             # Call list, but since it's callback, simulate update
             temp_update = Update(update.update_id, message=query.message)
             await list_watches(temp_update, context)
+            return
 
         elif data == "hot_channel":
             await query.edit_message_text(
                 "🔥 Join Hot Deals: https://t.me/YourChannelNameHere",
                 reply_markup=build_simple_back()
             )
+            return
 
         elif data == "dashboard_inline":
             count = len(user_watches.get(user_id, []))
@@ -496,19 +575,181 @@ async def inline_callback_handler(update: Update, context: ContextTypes.DEFAULT_
                 f"📊 Dashboard\n\nWatches: {count}",
                 reply_markup=build_simple_back()
             )
+            return
 
         elif data == "help_inline":
             await query.edit_message_text(
                 "❓ Help\n\n/add <url>\n/list\n/remove <num>\n\nMessage for questions!",
                 reply_markup=build_simple_back()
             )
+            return
 
+        # ----------------- ADMIN flows (inline only) -----------------
+        if data == "admin_panel":
+            # Only admins allowed
+            if user_id not in ADMIN_IDS:
+                await query.edit_message_text("⛔ Admin only.", reply_markup=build_main_menu(user_id))
+                return
+            await query.edit_message_text("🛠️ Admin Panel", reply_markup=_build_admin_panel())
+            return
+
+        if data == "admin_stats":
+            if user_id not in ADMIN_IDS:
+                await query.edit_message_text("⛔ Admin only.", reply_markup=build_main_menu(user_id))
+                return
+            stats = _compute_user_stats()
+            lines = [
+                "📊 User Stats",
+                f"• Total users: {stats['total_users']}",
+                f"• Total watches: {stats['total_watches']}",
+                f"• Active watches: {stats['active_watches']}",
+                "• By tier:"
+            ]
+            for tier, count in stats["by_tier"].items():
+                lines.append(f"   - {tier}: {count}")
+            await query.edit_message_text("\n".join(lines), reply_markup=_build_admin_panel())
+            return
+
+        if data == "admin_broadcast":
+            if user_id not in ADMIN_IDS:
+                await query.edit_message_text("⛔ Admin only.", reply_markup=build_main_menu(user_id))
+                return
+            keyboard = [
+                [InlineKeyboardButton("📣 Broadcast to all users", callback_data="admin_broadcast_all")],
+                [InlineKeyboardButton("👤 Broadcast to single user", callback_data="admin_broadcast_single")],
+                [InlineKeyboardButton("↩️ Back", callback_data="admin_panel")]
+            ]
+            await query.edit_message_text("Broadcast options:", reply_markup=InlineKeyboardMarkup(keyboard))
+            return
+
+        if data == "admin_broadcast_all":
+            if user_id not in ADMIN_IDS:
+                await query.edit_message_text("⛔ Admin only.", reply_markup=build_main_menu(user_id))
+                return
+            # set state and prompt admin to send the message as text
+            context.user_data["awaiting_broadcast"] = True
+            context.user_data["broadcast_target"] = "all"
+            await query.edit_message_text(
+                "📣 Send the message you want to broadcast to *all users*.\n\n"
+                "Type the message now. To cancel, send 'CANCEL'.",
+                parse_mode="Markdown",
+                reply_markup=build_simple_back("admin_panel", "↩️ Cancel")
+            )
+            return
+
+        if data == "admin_broadcast_single":
+            if user_id not in ADMIN_IDS:
+                await query.edit_message_text("⛔ Admin only.", reply_markup=build_main_menu(user_id))
+                return
+            # show first page of users
+            await query.edit_message_text("Select a user to message:", reply_markup=_build_users_page(0))
+            return
+
+        # pagination for users list
+        if data.startswith("admin_users_page_"):
+            if user_id not in ADMIN_IDS:
+                return
+            try:
+                page = int(data.replace("admin_users_page_", ""))
+            except Exception:
+                page = 0
+            await query.edit_message_text("Select a user to message:", reply_markup=_build_users_page(page))
+            return
+
+        # single user selected
+        if data.startswith("admin_user_"):
+            if user_id not in ADMIN_IDS:
+                return
+            try:
+                target_user_id = int(data.replace("admin_user_", ""))
+            except Exception:
+                await query.edit_message_text("Invalid user selection.", reply_markup=_build_users_page(0))
+                return
+            # ask admin to send the message body; record target in user_data
+            context.user_data["awaiting_broadcast"] = True
+            context.user_data["broadcast_target"] = target_user_id
+            await query.edit_message_text(
+                f"📩 Send the message you want to deliver to user `{target_user_id}`.\n\n"
+                "Type the message now. To cancel, send 'CANCEL'.",
+                parse_mode="Markdown",
+                reply_markup=build_simple_back("admin_panel", "↩️ Cancel")
+            )
+            return
+
+        # fallback for other inline handlers already implemented above
     except Exception as exc:
         LOG.exception("Inline error")
-        await query.edit_message_text("⚠️ Error - try /start")
+        try:
+            await query.edit_message_text("⚠️ Error - try /start")
+        except Exception:
+            pass
 
 
+# This handler already exists in your original file; extended to handle awaiting_broadcast in context.user_data
 async def process_add_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    # First: handle broadcast flow if admin initiated it
+    if context.user_data.get("awaiting_broadcast"):
+        admin_id = update.effective_user.id
+        if admin_id not in ADMIN_IDS:
+            await update.message.reply_text("⛔ Admin only.")
+            context.user_data.pop("awaiting_broadcast", None)
+            context.user_data.pop("broadcast_target", None)
+            return
+
+        text = update.message.text.strip()
+        if not text or text.upper() == "CANCEL":
+            await update.message.reply_text("Broadcast cancelled.", reply_markup=build_main_menu(admin_id))
+            context.user_data.pop("awaiting_broadcast", None)
+            context.user_data.pop("broadcast_target", None)
+            return
+
+        target = context.user_data.get("broadcast_target")
+        sent = 0
+        failed = 0
+        failed_ids = []
+
+        # Broadcast to all users
+        if target == "all":
+            # send messages sequentially with small delay to avoid rate limits
+            for uid in list(user_watches.keys()):
+                try:
+                    await context.bot.send_message(chat_id=uid, text=text)
+                    sent += 1
+                    # small throttle
+                    await asyncio.sleep(0.05)
+                except Exception:
+                    failed += 1
+                    failed_ids.append(uid)
+                    # continue to next user
+            summary = f"Broadcast complete.\nSent: {sent}\nFailed: {failed}"
+            if failed_ids:
+                summary += f"\nFailed IDs: {failed_ids[:10]}{'...' if len(failed_ids) > 10 else ''}"
+            await update.message.reply_text(summary, reply_markup=build_main_menu(admin_id))
+            context.user_data.pop("awaiting_broadcast", None)
+            context.user_data.pop("broadcast_target", None)
+            return
+
+        # Broadcast to single user id
+        try:
+            target_uid = int(target)
+        except Exception:
+            await update.message.reply_text("Invalid target for broadcast.", reply_markup=build_main_menu(admin_id))
+            context.user_data.pop("awaiting_broadcast", None)
+            context.user_data.pop("broadcast_target", None)
+            return
+
+        try:
+            await context.bot.send_message(chat_id=target_uid, text=text)
+            await update.message.reply_text(f"Message sent to {target_uid}.", reply_markup=build_main_menu(admin_id))
+        except Exception as e:
+            LOG.exception("Failed sending broadcast to %s", target_uid)
+            await update.message.reply_text(f"Failed to send to {target_uid}: {e}", reply_markup=build_main_menu(admin_id))
+
+        context.user_data.pop("awaiting_broadcast", None)
+        context.user_data.pop("broadcast_target", None)
+        return
+
+    # Otherwise preserve original add URL flow (as in your file)
     if not context.user_data.get("awaiting_add_url"):
         return
 
@@ -536,7 +777,7 @@ async def process_add_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
         watches[-1]["category"] = category
 
     context.user_data.clear()
-    await update.message.reply_text(f"Added in {category.capitalize()}! 🎉", reply_markup=build_main_menu())
+    await update.message.reply_text(f"Added in {category.capitalize()}! 🎉", reply_markup=build_main_menu(user_id))
 
 
 def get_application_handlers():
