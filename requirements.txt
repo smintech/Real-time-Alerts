@@ -1,4 +1,3 @@
-pyTelegramBotAPI
 fastapi
 uvicorn
 apify-client
