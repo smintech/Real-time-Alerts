@@ -17,7 +17,7 @@ from bot.settings import (
     PAID_TIERS,
     MIN_CHANGE_TO_ALERT,
 )
-from config import ADMIN_IDS
+from utils.config import ADMIN_IDS
 from utils.utils import scrape_product
 
 # -------------------------
