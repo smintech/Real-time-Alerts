@@ -17,8 +17,8 @@ from bot.settings import (
     PAID_TIERS,
     MIN_CHANGE_TO_ALERT,
 )
-from utils.config import ADMIN_IDS
-from utils.utils import scrape_product
+from Utils.config import ADMIN_IDS
+from Utils.utils import scrape_product
 
 # -------------------------
 # In-memory stores (MVP – replace with DB soon)
