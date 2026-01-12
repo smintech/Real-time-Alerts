@@ -1,4 +1,3 @@
-# bot/bot.py
 import logging
 import asyncio
 import time
@@ -7,7 +6,7 @@ from typing import Dict, Any
 
 from telegram.ext import Application, ContextTypes
 
-from config import TELEGRAM_TOKEN,DB_URL
+from config import TELEGRAM_TOKEN, DB_URL
 from bot.commands import get_application_handlers, user_watches, user_settings, user_subscriptions
 from bot.settings import (
     CHECK_INTERVAL_SECONDS,
@@ -33,18 +32,16 @@ from utils.utils import (
     normalize_product_key,
     scrape_site,   # used by channel checker (if implemented)
     _get_domain_from_url,  # helper from utils (if present)
-    load_last_snapshot,
-    save_snapshot,
 )
 from bot.runner import (
-load_last_snapshot,
-save_snapshot,
-load_channel_snapshot,
-save_channel_snapshot,
-ensure_channel_table_exists,
-delete_expired_channel_snapshots,
+    load_last_snapshot,
+    save_snapshot,
+    load_channel_snapshot,
+    save_channel_snapshot,
+    ensure_channel_table_exists,
+    delete_expired_channel_snapshots,
 )
-from utils.format import format_telegram_alert, _safe_currency
+from utils.format import format_telegram_alert
 
 logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger(__name__)
@@ -345,26 +342,26 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             LOG.warning("Channel scrape failed for %s: %s", ref, e)
             continue
 
-        # normalize numeric price
-        try:
-            cur = float(data.get("current_price")) if data.get("current_price") is not None else None
-        except Exception:
-            cur = None
-        if cur is None:
-            # skip delisted / no price
-            continue
+            # normalize numeric price
+            try:
+                cur = float(data.get("current_price")) if data.get("current_price") is not None else None
+            except Exception:
+                cur = None
+            if cur is None:
+                # skip delisted / no price
+                continue
 
-        data["current_price"] = cur
-        data["url"] = data.get("url") or ref
-        data["site"] = data.get("site") or (_get_domain_from_url(data["url"]) if "_get_domain_from_url" in globals() else data["url"])
+            data["current_price"] = cur
+            data["url"] = data.get("url") or ref
+            data["site"] = data.get("site") or (_get_domain_from_url(data["url"]) if "_get_domain_from_url" in globals() else data["url"])
 
-        # build group key
-        try:
-            key = normalize_product_key(data)
-        except Exception:
-            key = f"UNK::{data['site']}::{int(cur)}"
+            # build group key
+            try:
+                key = normalize_product_key(data)
+            except Exception:
+                key = f"UNK::{data['site']}::{int(cur)}"
 
-        grouped.setdefault(key, []).append({"ref": ref, "data": data, "price": cur})
+            grouped.setdefault(key, []).append({"ref": ref, "data": data, "price": cur})
 
     # 2) evaluate groups and post at most MAX_CHANNEL_POSTS_PER_RUN
     posted_count = 0
@@ -417,12 +414,12 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             # Build message: unified comparison
             prod_title = entries[0]["data"].get("title") or product_key
             lines = []
-            lines.append(f"🔥 *{prod_title}* — BEST PRICE: {_safe_currency(best_price)} on *{best_site}*")
-            lines.append(f"📉 Drop: *{drop_pct}%* • Saved: *{_safe_currency(savings)}*")
+            lines.append(f"🔥 *{prod_title}* — BEST PRICE: ₦{int(best_price):,} on *{best_site}*")
+            lines.append(f"📉 Drop: *{drop_pct}%* • Saved: *₦{int(savings):,}*")
             lines.append("")
             lines.append("💱 Prices across monitored sites:")
             for site, price in sorted(site_prices.items(), key=lambda kv: kv[1]):
-                lines.append(f"- *{site}*: {_safe_currency(price)}")
+                lines.append(f"- *{site}*: ₦{int(price):,}")
 
             # prefer the first entry that matches best_site to provide a link
             best_entry = next((e for e in entries if e["data"]["site"] == best_site), entries[0])
