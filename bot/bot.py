@@ -7,7 +7,7 @@ from typing import Dict, Any
 
 from telegram.ext import Application, ContextTypes
 
-from config import TELEGRAM_TOKEN
+from config import TELEGRAM_TOKEN,DB_URL
 from bot.commands import get_application_handlers, user_watches, user_settings, user_subscriptions
 from bot.settings import (
     CHECK_INTERVAL_SECONDS,
@@ -35,6 +35,14 @@ from utils.utils import (
     _get_domain_from_url,  # helper from utils (if present)
     load_last_snapshot,
     save_snapshot,
+)
+from bot.runner import (
+load_last_snapshot,
+save_snapshot,
+load_channel_snapshot,
+save_channel_snapshot,
+ensure_channel_table_exists,
+delete_expired_channel_snapshots,
 )
 from utils.format import format_telegram_alert, _safe_currency
 
