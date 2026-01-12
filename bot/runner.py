@@ -24,7 +24,7 @@ from utils.utils import (
 )
 from psycopg2 import pool
 import psycopg2.extras
-from config import DB_URL
+from utils.config import DB_URL
 from typing import Optional, Dict, Any
 
 # -----------------------
