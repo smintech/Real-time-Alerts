@@ -6,7 +6,7 @@ from typing import Dict, Any
 
 from telegram.ext import Application, ContextTypes
 
-from utils.config import TELEGRAM_TOKEN, DB_URL
+from Utils.config import TELEGRAM_TOKEN, DB_URL
 from bot.commands import get_application_handlers, user_watches, user_settings, user_subscriptions
 from bot.settings import (
     CHECK_INTERVAL_SECONDS,
@@ -25,7 +25,7 @@ from bot.settings import (
     PAID_TIERS,
 )
 
-from utils.utils import (
+from Utils.utils import (
     scrape_product,
     compute_changes,
     calculate_deal_score,
@@ -42,7 +42,7 @@ from bot.runner import (
     ensure_channel_table_exists,
     delete_expired_channel_snapshots,
 )
-from utils.format import format_telegram_alert, _safe_currency
+from Utils.format import format_telegram_alert, _safe_currency
 
 logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger(__name__)
