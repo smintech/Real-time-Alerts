@@ -32,7 +32,9 @@ from utils.utils import (
     calculate_deal_score,
     normalize_product_key,
     scrape_site,   # used by channel checker (if implemented)
-    _get_domain_from_url  # helper from utils (if present)
+    _get_domain_from_url,  # helper from utils (if present)
+    load_last_snapshot,
+    save_snapshot,
 )
 from utils.format import format_telegram_alert, _safe_currency
 
@@ -87,19 +89,6 @@ async def check_all_watches(context: ContextTypes.DEFAULT_TYPE):
     if not user_watches:
         return
 
-    now = datetime.now(TIMEZONE)
-    last_check = watch.get("last_checked_at")
-    if last_check:
-        try:
-            last_dt = datetime.fromisoformat(last_check)
-            diff = (now - last_dt).total_seconds()
-        except Exception:
-            diff = None
-    else:
-        diff = None
-    if diff is not None and diff < (CHECK_INTERVAL_SECONDS * 0.33):
-        continue
-    watch["last_checked_at"] = now.isoformat()
     # Each user separately to respect per-user settings
     for user_id, watches in list(user_watches.items()):
         try:
@@ -117,6 +106,8 @@ async def check_all_watches(context: ContextTypes.DEFAULT_TYPE):
                     watch_category = watch.get("category")
                     if watch_category and watch_category not in enabled_cats:
                         continue
+
+                    now = datetime.now(TIMEZONE)
 
                     # next_check backoff check
                     next_check = watch.get("next_check")
@@ -146,24 +137,79 @@ async def check_all_watches(context: ContextTypes.DEFAULT_TYPE):
                     watch["fail_count"] = 0
                     watch.pop("next_check", None)
 
-                    old_price = watch.get("last_price")
+                    # --- LOAD previous snapshot (redis 1st, db fallback) ---
+                    try:
+                        prev_snapshot = await load_last_snapshot(watch["url"])
+                    except Exception:
+                        LOG.exception("Failed loading last snapshot for %s", watch.get("url"))
+                        prev_snapshot = None
+
+                    old_price = None
+                    old_stock = watch.get("last_stock", "available")
+                    last_checked_iso = None
+
+                    if prev_snapshot:
+                        old_price = prev_snapshot.get("current_price")
+                        old_stock = prev_snapshot.get("stock_status", old_stock)
+                        last_checked_iso = prev_snapshot.get("last_checked_at")
+
+                    # mark last_checked logic (avoid duplicate immediate runs)
+                    if last_checked_iso:
+                        try:
+                            last_dt = datetime.fromisoformat(last_checked_iso)
+                            if (now - last_dt).total_seconds() < (CHECK_INTERVAL_SECONDS * 0.33):
+                                # skip if we checked recently (self-heal)
+                                continue
+                        except Exception:
+                            # if parsing fails, ignore and proceed
+                            pass
+
                     current_price = new_data["current_price"]
 
-                    # if no previous stored price for this watch, seed and skip alerts
+                    # If no previous stored price, seed snapshot then continue (no alert first time)
                     if old_price is None:
+                        try:
+                            await save_snapshot({
+                                "url": watch["url"],
+                                "site": new_data.get("site"),
+                                "title": new_data.get("title"),
+                                "current_price": current_price,
+                                "previous_price": new_data.get("previous_price"),
+                                "stock_status": new_data.get("stock_status"),
+                                "raw": new_data.get("raw"),
+                            })
+                        except Exception:
+                            LOG.exception("Failed saving initial snapshot for %s", watch.get("url"))
+
+                        # update in-memory watch for immediate scheduling
                         watch["last_price"] = current_price
+                        watch["last_stock"] = new_data.get("stock_status")
+                        watch["last_checked_at"] = datetime.now(TIMEZONE).isoformat()
                         continue
 
                     # compute changes
                     changes = compute_changes(
-                        {"current_price": old_price, "stock_status": watch.get("last_stock", "available")},
+                        {"current_price": old_price, "stock_status": old_stock},
                         {"current_price": current_price, "stock_status": new_data.get("stock_status", "available")}
                     )
 
                     if not changes.get("significant_change"):
-                        # update last seen and continue
+                        # update last seen and persist snapshot (update last_checked_at)
                         watch["last_price"] = current_price
                         watch["last_stock"] = new_data.get("stock_status", "available")
+                        watch["last_checked_at"] = datetime.now(TIMEZONE).isoformat()
+                        try:
+                            await save_snapshot({
+                                "url": watch["url"],
+                                "site": new_data.get("site"),
+                                "title": new_data.get("title"),
+                                "current_price": current_price,
+                                "previous_price": old_price,
+                                "stock_status": new_data.get("stock_status"),
+                                "raw": new_data.get("raw"),
+                            })
+                        except Exception:
+                            LOG.exception("Failed saving snapshot (no-significant-change) for %s", watch.get("url"))
                         continue
 
                     price_diff_percent = changes.get("price_diff_percent", 0.0)  # positive => drop
@@ -192,6 +238,19 @@ async def check_all_watches(context: ContextTypes.DEFAULT_TYPE):
                     if not trigger:
                         watch["last_price"] = current_price
                         watch["last_stock"] = new_data.get("stock_status", "available")
+                        # persist snapshot update
+                        try:
+                            await save_snapshot({
+                                "url": watch["url"],
+                                "site": new_data.get("site"),
+                                "title": new_data.get("title"),
+                                "current_price": current_price,
+                                "previous_price": old_price,
+                                "stock_status": new_data.get("stock_status"),
+                                "raw": new_data.get("raw"),
+                            })
+                        except Exception:
+                            LOG.exception("Failed saving snapshot (post-no-trigger) for %s", watch.get("url"))
                         continue
 
                     # Build enriched alert data and send
@@ -221,9 +280,22 @@ async def check_all_watches(context: ContextTypes.DEFAULT_TYPE):
                         disable_web_page_preview=True
                     )
 
-                    # update watch snapshot
+                    # update watch snapshot (persist current state)
                     watch["last_price"] = current_price
                     watch["last_stock"] = new_data.get("stock_status", "available")
+                    watch["last_checked_at"] = datetime.now(TIMEZONE).isoformat()
+                    try:
+                        await save_snapshot({
+                            "url": watch["url"],
+                            "site": new_data.get("site"),
+                            "title": new_data.get("title"),
+                            "current_price": current_price,
+                            "previous_price": old_price,
+                            "stock_status": new_data.get("stock_status"),
+                            "raw": new_data.get("raw"),
+                        })
+                    except Exception:
+                        LOG.exception("Failed saving snapshot after alert for %s", watch.get("url"))
 
                 except Exception as exc_inner:
                     LOG.exception("Unexpected scheduler error user=%s watch=%s", user_id, watch.get("url"))
@@ -445,6 +517,6 @@ def run_bot():
 
     LOG.info("Bot + scheduler started")
     application.run_polling(
-    drop_pending_updates=True,
-    allowed_updates=["message", "callback_query"]  # limit to what you handle
-)
+        drop_pending_updates=True,
+        allowed_updates=["message", "callback_query"]  # limit to what you handle
+    )
