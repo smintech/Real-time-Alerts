@@ -1,3 +1,4 @@
+# runner.py (replace your current app runner with this)
 import os
 import time
 import logging
@@ -10,15 +11,35 @@ import traceback
 import json
 import hashlib
 from urllib.parse import quote_plus, urlparse
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import redis        # pip install redis
 import asyncio
 from fastapi import FastAPI, HTTPException, Body
 from bot.bot import run_bot  # blocking polling function
-from utils.utils import scrape_product, compute_changes, calculate_deal_score, normalize_product_key, NoDataError, ApifyError
+from utils.utils import (
+    scrape_product,
+    compute_changes,
+    calculate_deal_score,
+    normalize_product_key,
+    NoDataError,
+    ApifyError,
+)
 from psycopg2 import pool, sql
 import psycopg2.extras
 from config import DB_URL
+
+from typing import Optional, Dict, Any
+
+# -----------------------
+# Logging configuration (early so handlers can use it)
+# -----------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
+)
+logger = logging.getLogger("app")
 
 app = FastAPI()
 
@@ -62,11 +83,11 @@ def get_pg_pool():
     return _pg_pool
 
 def _db_ensure_table():
-    """Ensure table exists (safe to call on startup)."""
+    """Ensure product_snapshots table exists (safe to call on startup)."""
     conn = None
     try:
-        pool = get_pg_pool()
-        conn = pool.getconn()
+        pool_conn = get_pg_pool()
+        conn = pool_conn.getconn()
         conn.autocommit = True
         cur = conn.cursor()
         cur.execute("""
@@ -82,16 +103,17 @@ def _db_ensure_table():
         );
         """)
         cur.close()
+        logger.info("Ensured product_snapshots table exists")
     finally:
         if conn:
-            pool.putconn(conn)
+            pool_conn.putconn(conn)
 
 def _db_get_snapshot(url: str) -> Optional[Dict[str, Any]]:
     """Return latest snapshot row for url or None. Blocking."""
     conn = None
     try:
-        pool = get_pg_pool()
-        conn = pool.getconn()
+        pool_conn = get_pg_pool()
+        conn = pool_conn.getconn()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
             SELECT url, site, title, current_price, previous_price, stock_status, raw,
@@ -105,19 +127,19 @@ def _db_get_snapshot(url: str) -> Optional[Dict[str, Any]]:
         return dict(row) if row else None
     finally:
         if conn:
-            pool.putconn(conn)
+            pool_conn.putconn(conn)
 
 def _db_upsert_snapshot(snapshot: Dict[str, Any]) -> None:
     """Insert or update snapshot for url. Blocking."""
     conn = None
     try:
-        pool = get_pg_pool()
-        conn = pool.getconn()
+        pool_conn = get_pg_pool()
+        conn = pool_conn.getconn()
         cur = conn.cursor()
         cur.execute("""
             INSERT INTO product_snapshots
               (url, site, title, current_price, previous_price, stock_status, raw, last_checked_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (url) DO UPDATE SET
               site = EXCLUDED.site,
               title = EXCLUDED.title,
@@ -140,7 +162,7 @@ def _db_upsert_snapshot(snapshot: Dict[str, Any]) -> None:
         cur.close()
     finally:
         if conn:
-            pool.putconn(conn)
+            pool_conn.putconn(conn)
 
 def _channel_key(ref: str) -> str:
     return CHANNEL_REDIS_PREFIX + quote_plus(ref)
@@ -155,8 +177,113 @@ def _product_site_key(product_key: str, site: str) -> str:
 def _product_sites_set_key(product_key: str) -> str:
     return f"product:{product_key}:sites"
 
-# Persistence API helpers (non-blocking in FastAPI)
+# -------------------------
+# Channel table helpers (blocking)
+# -------------------------
+def _db_create_channel_table():
+    """Create channel_snapshots table if missing."""
+    conn = None
+    try:
+        pool_conn = get_pg_pool()
+        conn = pool_conn.getconn()
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS channel_snapshots (
+          ref TEXT PRIMARY KEY,
+          site TEXT,
+          title TEXT,
+          url TEXT,
+          current_price NUMERIC,
+          raw JSONB,
+          last_seen TIMESTAMPTZ DEFAULT NOW(),
+          expires_at TIMESTAMPTZ
+        );
+        """)
+        cur.close()
+        logger.info("Ensured channel_snapshots table exists")
+    finally:
+        if conn:
+            pool_conn.putconn(conn)
 
+def _db_upsert_channel_snapshot(ref: str, snapshot: dict, expires_hours: int = 48):
+    """Blocking DB upsert for a single channel snapshot."""
+    conn = None
+    try:
+        pool_conn = get_pg_pool()
+        conn = pool_conn.getconn()
+        cur = conn.cursor()
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=expires_hours)
+        cur.execute("""
+            INSERT INTO channel_snapshots (ref, site, title, url, current_price, raw, last_seen, expires_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (ref) DO UPDATE SET
+              site = EXCLUDED.site,
+              title = EXCLUDED.title,
+              url = EXCLUDED.url,
+              current_price = EXCLUDED.current_price,
+              raw = EXCLUDED.raw,
+              last_seen = EXCLUDED.last_seen,
+              expires_at = EXCLUDED.expires_at
+        """, (
+            ref,
+            snapshot.get("site"),
+            snapshot.get("title"),
+            snapshot.get("url"),
+            snapshot.get("current_price"),
+            json.dumps(snapshot.get("raw") or {}),
+            datetime.now(timezone.utc),
+            expires_at
+        ))
+        conn.commit()
+        cur.close()
+    finally:
+        if conn:
+            pool_conn.putconn(conn)
+
+def _db_get_channel_snapshot(ref: str) -> Optional[Dict[str, Any]]:
+    """Blocking DB read for channel snapshot. Returns None if expired/missing."""
+    conn = None
+    try:
+        pool_conn = get_pg_pool()
+        conn = pool_conn.getconn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT ref, site, title, url, current_price, raw, last_seen, expires_at
+            FROM channel_snapshots
+            WHERE ref = %s
+            LIMIT 1
+        """, (ref,))
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+        # expire check
+        exp = row.get("expires_at")
+        if exp and exp <= datetime.now(timezone.utc):
+            return None
+        return dict(row)
+    finally:
+        if conn:
+            pool_conn.putconn(conn)
+
+def _db_delete_expired_channel_snapshots():
+    """Blocking cleanup: remove DB rows where expires_at <= now()."""
+    conn = None
+    try:
+        pool_conn = get_pg_pool()
+        conn = pool_conn.getconn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM channel_snapshots WHERE expires_at <= NOW()")
+        deleted = cur.rowcount
+        conn.commit()
+        cur.close()
+        return deleted
+    finally:
+        if conn:
+            pool_conn.putconn(conn)
+
+# ---------- Async-friendly persistence API helpers (non-blocking) ----------
 async def load_last_snapshot(url: str) -> Optional[Dict[str, Any]]:
     """
     Try Redis first (fast). If missing, fallback to Postgres and return that.
@@ -180,16 +307,18 @@ async def load_last_snapshot(url: str) -> Optional[Dict[str, Any]]:
                 return data
             except Exception:
                 # fallback to DB if Redis data corrupted
+                logger.exception("Corrupt redis snapshot for %s", url)
                 pass
     except Exception:
         # Redis might be down — fallback to DB
-        pass
+        logger.exception("Redis read failed for %s", url)
 
     # fallback to DB (blocking call in executor)
     try:
         db_row = await loop.run_in_executor(None, _db_get_snapshot, url)
         return db_row
     except Exception:
+        logger.exception("DB read failed for %s", url)
         return None
 
 async def save_snapshot(snapshot: Dict[str, Any], redis_ttl: int = REDIS_TTL_SECONDS) -> None:
@@ -222,123 +351,16 @@ async def save_snapshot(snapshot: Dict[str, Any], redis_ttl: int = REDIS_TTL_SEC
         await loop.run_in_executor(None, _write_redis)
     except Exception:
         # Redis might be down — continue, DB is fallback
-        pass
+        logger.exception("Failed writing snapshot to Redis for %s", snapshot.get("url"))
 
     # always persist to Postgres in background (we don't block scheduler)
     try:
         await loop.run_in_executor(None, _db_upsert_snapshot, payload)
     except Exception:
         # DB failure — log at caller; not raising here for resilience
-        LOGGER = logging.getLogger(__name__)
-        LOGGER.exception("Failed to persist snapshot to Postgres for %s", snapshot.get("url"))
+        logger.exception("Failed to persist snapshot to Postgres for %s", snapshot.get("url"))
 
-def _db_create_channel_table():
-    """Create channel_snapshots table if missing."""
-    conn = None
-    try:
-        pool = get_pg_pool()
-        conn = pool.getconn()
-        conn.autocommit = True
-        cur = conn.cursor()
-        cur.execute("""
-        CREATE TABLE IF NOT EXISTS channel_snapshots (
-          ref TEXT PRIMARY KEY,
-          site TEXT,
-          title TEXT,
-          url TEXT,
-          current_price NUMERIC,
-          raw JSONB,
-          last_seen TIMESTAMPTZ DEFAULT NOW(),
-          expires_at TIMESTAMPTZ
-        );
-        """)
-        cur.close()
-    finally:
-        if conn:
-            pool.putconn(conn)
-
-
-def _db_upsert_channel_snapshot(ref: str, snapshot: dict, expires_hours: int = 48):
-    """Blocking DB upsert for a single channel snapshot."""
-    conn = None
-    try:
-        pool = get_pg_pool()
-        conn = pool.getconn()
-        cur = conn.cursor()
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=expires_hours)
-        cur.execute("""
-            INSERT INTO channel_snapshots (ref, site, title, url, current_price, raw, last_seen, expires_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (ref) DO UPDATE SET
-              site = EXCLUDED.site,
-              title = EXCLUDED.title,
-              url = EXCLUDED.url,
-              current_price = EXCLUDED.current_price,
-              raw = EXCLUDED.raw,
-              last_seen = EXCLUDED.last_seen,
-              expires_at = EXCLUDED.expires_at
-        """, (
-            ref,
-            snapshot.get("site"),
-            snapshot.get("title"),
-            snapshot.get("url"),
-            snapshot.get("current_price"),
-            json.dumps(snapshot.get("raw") or {}),
-            datetime.now(timezone.utc),
-            expires_at
-        ))
-        conn.commit()
-        cur.close()
-    finally:
-        if conn:
-            pool.putconn(conn)
-
-
-def _db_get_channel_snapshot(ref: str) -> Optional[Dict[str, Any]]:
-    """Blocking DB read for channel snapshot. Returns None if expired/missing."""
-    conn = None
-    try:
-        pool = get_pg_pool()
-        conn = pool.getconn()
-        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
-        cur.execute("""
-            SELECT ref, site, title, url, current_price, raw, last_seen, expires_at
-            FROM channel_snapshots
-            WHERE ref = %s
-            LIMIT 1
-        """, (ref,))
-        row = cur.fetchone()
-        cur.close()
-        if not row:
-            return None
-        # expire check
-        exp = row.get("expires_at")
-        if exp and exp <= datetime.now(timezone.utc):
-            return None
-        return dict(row)
-    finally:
-        if conn:
-            pool.putconn(conn)
-
-
-def _db_delete_expired_channel_snapshots():
-    """Blocking cleanup: remove DB rows where expires_at <= now()."""
-    conn = None
-    try:
-        pool = get_pg_pool()
-        conn = pool.getconn()
-        cur = conn.cursor()
-        cur.execute("DELETE FROM channel_snapshots WHERE expires_at <= NOW()")
-        deleted = cur.rowcount
-        conn.commit()
-        cur.close()
-        return deleted
-    finally:
-        if conn:
-            pool.putconn(conn)
-
-
-# ---------- Async-friendly wrappers ----------
+# ---------- Channel snapshot async wrappers ----------
 async def save_channel_snapshot(ref: str, snapshot: dict, ttl_seconds: int = 48 * 3600):
     """
     Save channel snapshot to Redis (ttl) and persist to Postgres as fallback.
@@ -361,19 +383,18 @@ async def save_channel_snapshot(ref: str, snapshot: dict, ttl_seconds: int = 48 
                 "last_seen": datetime.now(timezone.utc).isoformat()
             }), ex=ttl_seconds)
         except Exception:
-            LOGGER.exception("Redis write failed for channel snapshot %s", ref)
+            logger.exception("Redis write failed for channel snapshot %s", ref)
 
     try:
         await loop.run_in_executor(None, _write_redis)
     except Exception:
-        LOGGER.exception("Redis executor error while saving channel snapshot %s", ref)
+        logger.exception("Redis executor error while saving channel snapshot %s", ref)
 
     # DB upsert (background)
     try:
         await loop.run_in_executor(None, _db_upsert_channel_snapshot, ref, snapshot)
     except Exception:
-        LOGGER.exception("DB upsert failed for channel snapshot %s", ref)
-
+        logger.exception("DB upsert failed for channel snapshot %s", ref)
 
 async def load_channel_snapshot(ref: str) -> Optional[Dict[str, Any]]:
     """Load channel snapshot from Redis first, fallback to DB. Returns None if expired/missing."""
@@ -394,19 +415,18 @@ async def load_channel_snapshot(ref: str) -> Optional[Dict[str, Any]]:
             try:
                 return json.loads(val)
             except Exception:
-                LOGGER.exception("Corrupt Redis channel snapshot %s", ref)
+                logger.exception("Corrupt Redis channel snapshot %s", ref)
                 # fall back to DB below
     except Exception:
-        LOGGER.exception("Redis read executor error for channel snapshot %s", ref)
+        logger.exception("Redis read executor error for channel snapshot %s", ref)
 
     # fallback to DB
     try:
         row = await loop.run_in_executor(None, _db_get_channel_snapshot, ref)
         return row
     except Exception:
-        LOGGER.exception("DB fallback read error for channel snapshot %s", ref)
+        logger.exception("DB fallback read error for channel snapshot %s", ref)
         return None
-
 
 async def delete_expired_channel_snapshots() -> int:
     """Run DB cleanup to delete expired channel snapshots. Returns number deleted."""
@@ -415,19 +435,10 @@ async def delete_expired_channel_snapshots() -> int:
         deleted = await loop.run_in_executor(None, _db_delete_expired_channel_snapshots)
         return deleted or 0
     except Exception:
-        LOGGER.exception("Failed deleting expired channel snapshots")
+        logger.exception("Failed deleting expired channel snapshots")
         return 0
 
-
-# optional: ensure channel table exists (call once on startup)
-def ensure_channel_table_exists():
-    try:
-        _db_create_channel_table()
-    except Exception:
-        LOGGER.exception("Failed to ensure channel table exists")
-
 # Alternatives helper (returns list of {site, price})
-
 async def fetch_alternatives(product_key: str, exclude_site: str = None) -> list:
     """
     Return other site snapshots for same product_key (quick, from Redis).
@@ -454,9 +465,9 @@ async def fetch_alternatives(product_key: str, exclude_site: str = None) -> list
 
     return await loop.run_in_executor(None, _fetch)
 
-
+# -----------------------
 # The /v1/track endpoint
-
+# -----------------------
 @app.post("/v1/track")
 async def track_product(payload: dict = Body(...)):
     url = payload.get("url") or payload.get("product_url")
@@ -500,9 +511,9 @@ async def track_product(payload: dict = Body(...)):
 
     severity = deal_score if deal_score in ("high", "medium") else "low"
 
-    # 5) persist snapshot (async)
+    # 5) persist snapshot (async) -- CORRECTED: pass product dict (not url+product)
     try:
-        await save_snapshot(url, product)
+        await save_snapshot(product)
     except Exception:
         logger.exception("Failed saving snapshot for %s", url)
 
@@ -536,18 +547,7 @@ async def track_product(payload: dict = Body(...)):
     return response
 
 # -----------------------
-# Logging configuration
-# -----------------------
-LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
-logging.basicConfig(
-    level=LOG_LEVEL,
-    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
-    handlers=[logging.StreamHandler(sys.stdout)]
-)
-logger = logging.getLogger("app")
-
-# -----------------------
-# Bot process manager
+# Bot process manager (unchanged)
 # -----------------------
 class BotManager:
     def __init__(self, target_callable, max_restarts=5, restart_window_seconds=300):
@@ -646,9 +646,9 @@ class BotManager:
                 logger.error("Bot process exited (pid=%s, code=%s)", getattr(proc, "pid", None), exitcode)
 
                 # Enforce restart policy: do not restart more than max_restarts within restart_window
-                now = time.time()
+                now_ts = time.time()
                 # remove old timestamps out of the restart window
-                self.restart_timestamps = [t for t in self.restart_timestamps if now - t <= self.restart_window]
+                self.restart_timestamps = [t for t in self.restart_timestamps if now_ts - t <= self.restart_window]
 
                 if len(self.restart_timestamps) >= self.max_restarts:
                     logger.critical(
@@ -660,7 +660,7 @@ class BotManager:
                     break
 
                 # record restart and restart with exponential backoff
-                self.restart_timestamps.append(now)
+                self.restart_timestamps.append(now_ts)
                 backoff = min(2 ** len(self.restart_timestamps), 30)
                 logger.info("Restarting bot process in %s seconds (attempt #%s)...", backoff, len(self.restart_timestamps))
                 time.sleep(backoff)
@@ -704,10 +704,50 @@ signal.signal(signal.SIGINT, _on_terminate)
 signal.signal(signal.SIGTERM, _on_terminate)
 
 # -----------------------
+# Background cleanup task for channel snapshots
+# -----------------------
+_cleanup_task = None
+async def _channel_cleanup_loop():
+    """Periodically delete expired channel snapshots (once every 24 hours)."""
+    while True:
+        try:
+            deleted = await delete_expired_channel_snapshots()
+            if deleted:
+                logger.info("Deleted %d expired channel snapshots", deleted)
+        except Exception:
+            logger.exception("Channel cleanup loop error")
+        # sleep 24 hours
+        await asyncio.sleep(24 * 3600)
+
+# -----------------------
 # Startup / Shutdown events for FastAPI
 # -----------------------
 @app.on_event("startup")
 def on_startup():
+    # Ensure DB tables exist
+    try:
+        _db_ensure_table()
+    except Exception:
+        logger.exception("Failed ensuring product_snapshots table")
+
+    try:
+        _db_create_channel_table()
+    except Exception:
+        logger.exception("Failed ensuring channel_snapshots table")
+
+    # Start channel cleanup loop (background)
+    global _cleanup_task
+    try:
+        loop = asyncio.get_event_loop()
+        if loop.is_running():
+            # schedule background task
+            _cleanup_task = asyncio.ensure_future(_channel_cleanup_loop())
+        else:
+            # if not running yet, create a thread that will start cleanup after loop runs
+            pass
+    except Exception:
+        logger.exception("Failed to start channel cleanup task")
+
     # Start the bot + monitor thread
     try:
         logger.info("Application startup: starting bot process & monitor")
@@ -721,12 +761,18 @@ def on_startup():
 
 @app.on_event("shutdown")
 def _on_shutdown():
-    LOG.info("App shutdown: stopping bot manager")
+    logger.info("App shutdown: stopping bot manager and cleanup task")
     try:
         bot_manager.request_stop()
-        # give small grace
     except Exception:
-        LOG.exception("Error during shutdown sequence")
+        logger.exception("Error while stopping bot manager")
+
+    # cancel cleanup task if running
+    try:
+        if _cleanup_task and not _cleanup_task.done():
+            _cleanup_task.cancel()
+    except Exception:
+        logger.exception("Error cancelling cleanup task")
 
 # -----------------------
 # Main runner (keeps your original pattern but safer)
