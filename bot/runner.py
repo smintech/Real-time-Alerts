@@ -13,7 +13,6 @@ from datetime import datetime, timezone, timedelta
 import redis  # pip install redis
 import asyncio
 from fastapi import FastAPI, HTTPException, Body
-from bot.bot import run_bot  # blocking polling function
 from Utils.utils import (
     scrape_product,
     compute_changes,
@@ -670,9 +669,6 @@ class BotManager:
         except Exception:
             logger.exception("Error while stopping bot on request")
 
-# Global manager instance
-bot_manager = BotManager(target_callable=run_bot, max_restarts=6, restart_window_seconds=300)
-
 # Signal handling
 def _on_terminate(signum, frame):
     logger.info("Received termination signal (%s). Shutting down...", signum)
@@ -741,8 +737,10 @@ def _on_shutdown():
 
 # Main runner
 if __name__ == "__main__":
+    from bot.bot import run_bot
     port = int(os.getenv("PORT", "8000"))
     logger.info("Starting FastAPI + bot runner (uvicorn will block). PID=%s", os.getpid())
+    bot_manager = BotManager(target_callable=run_bot, max_restarts=6, restart_window_seconds=300)
     try:
         uvicorn.run(app, host="0.0.0.0", port=port, log_level=LOG_LEVEL.lower())
     except Exception as e:
