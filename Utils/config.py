@@ -7,7 +7,7 @@ TELEGRAM_TOKEN = os.getenv('TELEGRAM_TOKEN')
 APIFY_TOKEN = os.getenv('APIFY_TOKEN')
 DB_URL = os.getenv('DB_URL')
 REDIS_URL = os.getenv('REDIS_URL')
-ADMIN_IDS = = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
+ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 SITE_ACTOR_MAP = {
     'jumia.ng': 'reverent_greeting/jumia-scraper-2-5-1k-all-in-one-task'
 }
