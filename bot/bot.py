@@ -1,7 +1,7 @@
 import logging
 import asyncio
 import time
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
 
 from telegram.ext import Application, ContextTypes
@@ -30,8 +30,9 @@ from utils.utils import (
     compute_changes,
     calculate_deal_score,
     normalize_product_key,
-    scrape_site,   # used by channel checker (if implemented)
     _get_domain_from_url,  # helper from utils (if present)
+    load_last_snapshot,
+    save_snapshot,
 )
 from bot.runner import (
     load_last_snapshot,
@@ -41,17 +42,12 @@ from bot.runner import (
     ensure_channel_table_exists,
     delete_expired_channel_snapshots,
 )
-from utils.format import format_telegram_alert
+from utils.format import format_telegram_alert, _safe_currency
 
 logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger(__name__)
 
 application: Application | None = None  # global if needed elsewhere
-
-# Channel caches (in-memory). Consider Redis/DB for persistence later.
-channel_price_cache: Dict[str, float] = {}
-channel_posted_today = set()
-last_cache_date = None
 
 
 async def safe_send(bot, chat_id: int, text: str, **kwargs):
@@ -313,135 +309,147 @@ async def check_all_watches(context: ContextTypes.DEFAULT_TYPE):
 
 async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
     """
-    Unified channel posting:
-      - Scrapes every ref in CHANNEL_MONITORED_URLS (via scrape_site/scrape_product)
-      - Groups by normalize_product_key()
-      - Posts one unified comparison per product group if drop/savings thresholds met.
+    Unified channel posting – now uses persistent channel snapshots (Redis + DB fallback).
+    - Price history persists across restarts.
+    - Daily deduplication persists across restarts (via last_posted_at in Redis payload).
     """
-    global channel_posted_today, last_cache_date, channel_price_cache
-
     if not AUTO_POST_TO_CHANNEL or not CHANNEL_DEAL_CHAT_ID or not CHANNEL_MONITORED_URLS:
         return
 
-    # daily reset
-    today = datetime.now(TIMEZONE).date()
-    if last_cache_date != today:
-        channel_posted_today.clear()
-        last_cache_date = today
-
     loop = asyncio.get_event_loop()
-    grouped = {}
+    grouped: Dict[str, list] = {}
 
-    # 1) fetch (run blocking scrapes in executor)
+    # 1) Scrape all references
     for ref in CHANNEL_MONITORED_URLS:
         try:
-            # prefer scrape_site if available; fallback to scrape_product
-            scrape_fn = scrape_site if "scrape_site" in globals() else scrape_product
-            data = await loop.run_in_executor(None, scrape_fn, ref)
+            data = await loop.run_in_executor(None, scrape_product, ref)
         except Exception as e:
             LOG.warning("Channel scrape failed for %s: %s", ref, e)
             continue
 
-            # normalize numeric price
-            try:
-                cur = float(data.get("current_price")) if data.get("current_price") is not None else None
-            except Exception:
-                cur = None
-            if cur is None:
-                # skip delisted / no price
-                continue
+        try:
+            cur = float(data.get("current_price")) if data.get("current_price") is not None else None
+        except Exception:
+            cur = None
 
-            data["current_price"] = cur
-            data["url"] = data.get("url") or ref
-            data["site"] = data.get("site") or (_get_domain_from_url(data["url"]) if "_get_domain_from_url" in globals() else data["url"])
+        if cur is None:
+            continue
 
-            # build group key
-            try:
-                key = normalize_product_key(data)
-            except Exception:
-                key = f"UNK::{data['site']}::{int(cur)}"
+        data["current_price"] = cur
+        data["url"] = data.get("url") or ref
+        data["site"] = data.get("site") or (_get_domain_from_url(data["url"]) if "_get_domain_from_url" in globals() else "Unknown")
 
-            grouped.setdefault(key, []).append({"ref": ref, "data": data, "price": cur})
+        try:
+            key = normalize_product_key(data)
+        except Exception as exc:
+            LOG.warning("Normalize key failed for %s: %s", ref, exc)
+            key = f"UNK::{data['site']}::{int(cur)}"
 
-    # 2) evaluate groups and post at most MAX_CHANNEL_POSTS_PER_RUN
+        grouped.setdefault(key, []).append({"ref": ref, "data": data, "price": cur})
+
+    # 2) Process groups
     posted_count = 0
+    today_str = datetime.now(timezone.utc).date().isoformat()  # 'YYYY-MM-DD'
+
     for product_key, entries in grouped.items():
         if posted_count >= (MAX_CHANNEL_POSTS_PER_RUN or 10):
             break
-        try:
-            # find best (lowest) price across entries and site-specific minima
-            site_prices = {}
+
+        # Site → lowest price on that site
+        site_prices: Dict[str, float] = {}
+        for e in entries:
+            site = e["data"]["site"]
+            site_prices[site] = min(site_prices.get(site, float("inf")), e["price"])
+
+        best_price = min(site_prices.values())
+        best_site = min(site_prices, key=site_prices.get)
+
+        # Load previous snapshots to get old prices + check if posted today
+        old_prices = []
+        any_posted_today = False
+
+        for e in entries:
+            old_snap = await load_channel_snapshot(e["ref"])
+            if old_snap:
+                old_p = old_snap.get("current_price")
+                if old_p is not None:
+                    old_prices.append(old_p)
+
+                lpa = old_snap.get("last_posted_at")
+                if lpa and lpa.startswith(today_str):  # date match
+                    any_posted_today = True
+
+        highest_old = max(old_prices or [0.0])
+
+        # First-time seen → seed and skip alert
+        if highest_old <= 0:
             for e in entries:
-                site = e["data"]["site"]
-                site_prices[site] = min(site_prices.get(site, float("inf")), e["price"])
-
-            best_site, best_price = min(site_prices.items(), key=lambda kv: kv[1])
-
-            # compute highest historical price among these refs (to measure drop)
-            highest_old = 0
-            for e in entries:
-                old = channel_price_cache.get(e["ref"]) or 0
-                highest_old = max(highest_old, old)
-
-            if highest_old <= 0:
-                # seed cache and skip first-time notifications
-                for e in entries:
-                    channel_price_cache[e["ref"]] = e["price"]
-                continue
-
-            drop_pct = round(((highest_old - best_price) / highest_old) * 100, 1)
-            savings = highest_old - best_price
-
-            if drop_pct < (MIN_DROP_PERCENT_FOR_CHANNEL or 5.0) or savings < (MIN_SAVINGS_FOR_CHANNEL or 15000):
-                # update cache and skip
-                for e in entries:
-                    channel_price_cache[e["ref"]] = e["price"]
-                continue
-
-            # score with existing helper
-            score = calculate_deal_score(drop_pct)
-            if score not in ("high", "medium"):
-                for e in entries:
-                    channel_price_cache[e["ref"]] = e["price"]
-                continue
-
-            # dedupe: if any of the refs were posted today, skip (avoid duplication)
-            if any(e["ref"] in channel_posted_today for e in entries):
-                for e in entries:
-                    channel_price_cache[e["ref"]] = e["price"]
-                continue
-
-            # Build message: unified comparison
-            prod_title = entries[0]["data"].get("title") or product_key
-            lines = []
-            lines.append(f"🔥 *{prod_title}* — BEST PRICE: ₦{int(best_price):,} on *{best_site}*")
-            lines.append(f"📉 Drop: *{drop_pct}%* • Saved: *₦{int(savings):,}*")
-            lines.append("")
-            lines.append("💱 Prices across monitored sites:")
-            for site, price in sorted(site_prices.items(), key=lambda kv: kv[1]):
-                lines.append(f"- *{site}*: ₦{int(price):,}")
-
-            # prefer the first entry that matches best_site to provide a link
-            best_entry = next((e for e in entries if e["data"]["site"] == best_site), entries[0])
-            lines.append("")
-            lines.append(f"🛒 Buy: {best_entry['data'].get('url')}")
-            lines.append("")
-            lines.append("⏰ Spotted now — prices move fast. Personal alerts → @YourBotUsername")
-
-            msg = "\n".join(lines)
-
-            await safe_send(context.bot, CHANNEL_DEAL_CHAT_ID, msg,
-                            parse_mode="Markdown", disable_web_page_preview=True)
-
-            # update caches and posted set
-            for e in entries:
-                channel_price_cache[e["ref"]] = e["price"]
-                channel_posted_today.add(e["ref"])
-            posted_count += 1
-
-        except Exception:
-            LOG.exception("Failed evaluating channel product %s", product_key)
+                await save_channel_snapshot(e["ref"], e["data"])
             continue
+
+        drop_pct = round(((highest_old - best_price) / highest_old) * 100, 1)
+        savings = highest_old - best_price
+
+        # No price drop → just update snapshots
+        if drop_pct <= 0:
+            for e in entries:
+                await save_channel_snapshot(e["ref"], e["data"])
+            continue
+
+        # Threshold / score checks
+        if drop_pct < (MIN_DROP_PERCENT_FOR_CHANNEL or 5.0) or savings < (MIN_SAVINGS_FOR_CHANNEL or 15000):
+            for e in entries:
+                await save_channel_snapshot(e["ref"], e["data"])
+            continue
+
+        score = calculate_deal_score(drop_pct)
+        if score not in ("high", "medium"):
+            for e in entries:
+                await save_channel_snapshot(e["ref"], e["data"])
+            continue
+
+        # Already posted today → update but don't post again
+        if any_posted_today:
+            for e in entries:
+                await save_channel_snapshot(e["ref"], e["data"])
+            continue
+
+        # === POST DEAL ===
+        prod_title = entries[0]["data"].get("title") or product_key
+        lines = [
+            f"🔥 *{prod_title}* — BEST PRICE: {_safe_currency(best_price)} on *{best_site}*",
+            f"📉 Drop: *{drop_pct}%* • Saved: *{_safe_currency(savings)}*",
+            "",
+            "💱 Prices across monitored sites:",
+        ]
+        for site, price in sorted(site_prices.items(), key=lambda kv: kv[1]):
+            lines.append(f"- *{site}*: {_safe_currency(price)}")
+
+        best_entry = next((e for e in entries if e["data"]["site"] == best_site), entries[0])
+        lines += [
+            "",
+            f"🛒 Buy: {best_entry['data'].get('url')}",
+            "",
+            "⏰ Spotted now — prices move fast. Personal alerts → @YourBotUsername"
+        ]
+
+        msg = "\n".join(lines)
+
+        await safe_send(
+            context.bot,
+            CHANNEL_DEAL_CHAT_ID,
+            msg,
+            parse_mode="Markdown",
+            disable_web_page_preview=True
+        )
+
+        # Save with last_posted_at (persistent dedupe)
+        now_iso = datetime.now(timezone.utc).isoformat()
+        for e in entries:
+            posted_data = {**e["data"], "last_posted_at": now_iso}
+            await save_channel_snapshot(e["ref"], posted_data)
+
+        posted_count += 1
 
 
 async def check_trials(context: ContextTypes.DEFAULT_TYPE):
