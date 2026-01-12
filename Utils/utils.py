@@ -9,7 +9,7 @@ import asyncio
 from apify_client import ApifyClient
 from urllib.parse import urlparse
 import re
-from config import SITE_ACTOR_MAP
+from Utils.config import SITE_ACTOR_MAP
 # Settings / thresholds (imported from your project)
 from bot.settings import (
     SUPPORTED_SITES,
