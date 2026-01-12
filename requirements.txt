@@ -10,3 +10,4 @@ celery
 redis
 python-dotenv
 pytz
+python-telegram-bot
