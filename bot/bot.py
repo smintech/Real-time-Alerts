@@ -31,8 +31,6 @@ from Utils.utils import (
     calculate_deal_score,
     normalize_product_key,
     _get_domain_from_url,  # helper from utils (if present)
-    load_last_snapshot,
-    save_snapshot,
 )
 from bot.runner import (
     load_last_snapshot,
