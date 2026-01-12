@@ -16,6 +16,9 @@ import asyncio
 from fastapi import FastAPI, HTTPException, Body
 from bot.bot import run_bot  # blocking polling function
 from utils.utils import scrape_product, compute_changes, calculate_deal_score, normalize_product_key, NoDataError, ApifyError
+from psycopg2 import pool, sql
+import psycopg2.extras
+from config import DB_URL
 
 app = FastAPI()
 
@@ -38,6 +41,7 @@ def health():
 # ---------- Redis client (sync) ----------
 REDIS_URL = os.getenv("REDIS_URL")
 _redis = None
+REDIS_TTL_SECONDS = 24 * 3600
 
 def get_redis():
     global _redis
@@ -45,6 +49,97 @@ def get_redis():
         # Use redis-py sync client. We will call it inside run_in_executor for async safety.
         _redis = redis.from_url(REDIS_URL, decode_responses=True)
     return _redis
+
+_pg_pool = None
+def get_pg_pool():
+    global _pg_pool
+    if _pg_pool is None:
+        if not DB_URL:
+            raise RuntimeError("DB_URL not set for Postgres fallback")
+        # ThreadedConnectionPool from psycopg2
+        _pg_pool = pool.ThreadedConnectionPool(minconn=1, maxconn=10, dsn=DB_URL)
+    return _pg_pool
+
+def _db_ensure_table():
+    """Ensure table exists (safe to call on startup)."""
+    conn = None
+    try:
+        pool = get_pg_pool()
+        conn = pool.getconn()
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS product_snapshots (
+          url TEXT PRIMARY KEY,
+          site TEXT,
+          title TEXT,
+          current_price NUMERIC,
+          previous_price NUMERIC,
+          stock_status TEXT,
+          raw JSONB,
+          last_checked_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        """)
+        cur.close()
+    finally:
+        if conn:
+            pool.putconn(conn)
+
+def _db_get_snapshot(url: str) -> Optional[Dict[str, Any]]:
+    """Return latest snapshot row for url or None. Blocking."""
+    conn = None
+    try:
+        pool = get_pg_pool()
+        conn = pool.getconn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT url, site, title, current_price, previous_price, stock_status, raw,
+                   last_checked_at
+            FROM product_snapshots
+            WHERE url = %s
+            LIMIT 1
+        """, (url,))
+        row = cur.fetchone()
+        cur.close()
+        return dict(row) if row else None
+    finally:
+        if conn:
+            pool.putconn(conn)
+
+def _db_upsert_snapshot(snapshot: Dict[str, Any]) -> None:
+    """Insert or update snapshot for url. Blocking."""
+    conn = None
+    try:
+        pool = get_pg_pool()
+        conn = pool.getconn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO product_snapshots
+              (url, site, title, current_price, previous_price, stock_status, raw, last_checked_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (url) DO UPDATE SET
+              site = EXCLUDED.site,
+              title = EXCLUDED.title,
+              current_price = EXCLUDED.current_price,
+              previous_price = EXCLUDED.previous_price,
+              stock_status = EXCLUDED.stock_status,
+              raw = EXCLUDED.raw,
+              last_checked_at = EXCLUDED.last_checked_at
+        """, (
+            snapshot.get("url"),
+            snapshot.get("site"),
+            snapshot.get("title"),
+            snapshot.get("current_price"),
+            snapshot.get("previous_price"),
+            snapshot.get("stock_status"),
+            json.dumps(snapshot.get("raw") or {}),
+            datetime.now(timezone.utc)
+        ))
+        conn.commit()
+        cur.close()
+    finally:
+        if conn:
+            pool.putconn(conn)
 
 def _url_key(url: str) -> str:
     # key for storing last snapshot by URL
@@ -56,54 +151,82 @@ def _product_site_key(product_key: str, site: str) -> str:
 def _product_sites_set_key(product_key: str) -> str:
     return f"product:{product_key}:sites"
 
-
 # Persistence API helpers (non-blocking in FastAPI)
 
-async def load_last_snapshot(url: str) -> Optional[Dict]:
-    """Return last snapshot stored for url or None."""
+async def load_last_snapshot(url: str) -> Optional[Dict[str, Any]]:
+    """
+    Try Redis first (fast). If missing, fallback to Postgres and return that.
+    Returns snapshot dict or None.
+    """
+    # try redis
     loop = asyncio.get_event_loop()
     key = _url_key(url)
-    def _load():
+
+    def _read_redis():
         r = get_redis()
         v = r.get(key)
-        return json.loads(v) if v else None
-    return await loop.run_in_executor(None, _load)
+        return v
 
-async def save_snapshot(url: str, product: Dict) -> None:
+    try:
+        val = await loop.run_in_executor(None, _read_redis)
+        if val:
+            try:
+                data = json.loads(val)
+                # ensure last_checked_at is parsed to ISO string if present
+                return data
+            except Exception:
+                # fallback to DB if Redis data corrupted
+                pass
+    except Exception:
+        # Redis might be down — fallback to DB
+        pass
+
+    # fallback to DB (blocking call in executor)
+    try:
+        db_row = await loop.run_in_executor(None, _db_get_snapshot, url)
+        return db_row
+    except Exception:
+        return None
+
+async def save_snapshot(snapshot: Dict[str, Any], redis_ttl: int = REDIS_TTL_SECONDS) -> None:
     """
-    Save snapshot under URL and also under product_key/site mapping.
-    product expected to have keys: 'url', 'site', 'current_price', 'title', 'raw', etc.
+    Save snapshot to Redis (with TTL) and persist to Postgres (background).
+    Snapshot should include: url, site, title, current_price, previous_price, stock_status, raw.
     """
     loop = asyncio.get_event_loop()
+    key = _url_key(snapshot.get("url"))
 
-    # ensure product_key exists
-    try:
-        prod_key = normalize_product_key(product)
-    except Exception:
-        prod_key = None
+    # prepare redis payload
+    now_iso = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "url": snapshot.get("url"),
+        "site": snapshot.get("site"),
+        "title": snapshot.get("title"),
+        "current_price": snapshot.get("current_price"),
+        "previous_price": snapshot.get("previous_price"),
+        "stock_status": snapshot.get("stock_status"),
+        "raw": snapshot.get("raw") or {},
+        "last_checked_at": now_iso
+    }
 
-    def _save():
+    def _write_redis():
         r = get_redis()
-        now_iso = datetime.now(timezone.utc).isoformat()
-        snapshot = {
-            "url": product.get("url"),
-            "site": product.get("site"),
-            "title": product.get("title"),
-            "current_price": product.get("current_price"),
-            "previous_price": product.get("previous_price"),
-            "stock_status": product.get("stock_status"),
-            "raw": product.get("raw"),
-            "timestamp": now_iso,
-        }
-        # Save main URL snapshot
-        r.set(_url_key(product.get("url")), json.dumps(snapshot))
+        r.set(key, json.dumps(payload), ex=redis_ttl)
 
-        # Save per-product/per-site entry so alternatives can be fetched
-        if prod_key:
-            r.set(_product_site_key(prod_key, snapshot["site"]), json.dumps(snapshot))
-            r.sadd(_product_sites_set_key(prod_key), snapshot["site"])
+    # schedule redis write (fast)
+    try:
+        await loop.run_in_executor(None, _write_redis)
+    except Exception:
+        # Redis might be down — continue, DB is fallback
+        pass
 
-    await loop.run_in_executor(None, _save)
+    # always persist to Postgres in background (we don't block scheduler)
+    try:
+        await loop.run_in_executor(None, _db_upsert_snapshot, payload)
+    except Exception:
+        # DB failure — log at caller; not raising here for resilience
+        LOGGER = logging.getLogger(__name__)
+        LOGGER.exception("Failed to persist snapshot to Postgres for %s", snapshot.get("url"))
 
 
 # Alternatives helper (returns list of {site, price})
