@@ -31,7 +31,7 @@ FAILURE_BACKOFF_BASE = 60        # seconds base for exponential backoff
 NOTIFY_ON_DELISTED = True      # send user notice on delist/OOS/pause
 # Channel auto-posting (optional feature)
 AUTO_POST_TO_CHANNEL = True  # Set to False to disable entirely
-CHANNEL_DEAL_CHAT_ID = os.getenv(CHANNEL)  # Your channel ID (make bot admin with post rights)
+CHANNEL_DEAL_CHAT_ID = = [int(x.strip()) for x in os.getenv("CHANNEL", "").split(",") if x.strip()] # Your channel ID (make bot admin with post rights)
 
 # Channel monitoring settings
 CHANNEL_MONITORED_URLS = [
