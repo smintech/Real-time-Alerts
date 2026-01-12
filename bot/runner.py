@@ -1,527 +1,754 @@
-import logging
-import asyncio
+import os
 import time
-from datetime import datetime, timedelta
-from typing import Dict, Any
-
-from telegram.ext import Application, ContextTypes
-
-from config import TELEGRAM_TOKEN, DB_URL
-from bot.commands import get_application_handlers, user_watches, user_settings, user_subscriptions
-from bot.settings import (
-    CHECK_INTERVAL_SECONDS,
-    TIMEZONE,
-    MAX_WATCH_FAILURES,
-    FAILURE_BACKOFF_BASE,
-    NOTIFY_ON_DELISTED,
-    CHANNEL_MONITORED_URLS,
-    AUTO_POST_TO_CHANNEL,
-    CHANNEL_DEAL_CHAT_ID,
-    MAX_CHANNEL_POSTS_PER_RUN,
-    MIN_DROP_PERCENT_FOR_CHANNEL,
-    MIN_SAVINGS_FOR_CHANNEL,
-    CATEGORIES,
-    MAX_WATCHES_FREE,
-    PAID_TIERS,
-)
-
+import logging
+import multiprocessing
+import threading
+import uvicorn
+import signal
+import sys
+import traceback
+import json
+from urllib.parse import quote_plus
+from datetime import datetime, timezone, timedelta
+import redis  # pip install redis
+import asyncio
+from fastapi import FastAPI, HTTPException, Body
+from bot.bot import run_bot  # blocking polling function
 from utils.utils import (
     scrape_product,
     compute_changes,
     calculate_deal_score,
     normalize_product_key,
-    scrape_site,   # used by channel checker (if implemented)
-    _get_domain_from_url,  # helper from utils (if present)
+    NoDataError,
+    ApifyError,
 )
-from bot.runner import (
-    load_last_snapshot,
-    save_snapshot,
-    load_channel_snapshot,
-    save_channel_snapshot,
-    ensure_channel_table_exists,
-    delete_expired_channel_snapshots,
+from psycopg2 import pool
+import psycopg2.extras
+from config import DB_URL
+from typing import Optional, Dict, Any
+
+# -----------------------
+# Logging configuration (early so handlers can use it)
+# -----------------------
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+logging.basicConfig(
+    level=LOG_LEVEL,
+    format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
+    handlers=[logging.StreamHandler(sys.stdout)]
 )
-from utils.format import format_telegram_alert
+logger = logging.getLogger("app")
 
-logging.basicConfig(level=logging.INFO)
-LOG = logging.getLogger(__name__)
+app = FastAPI()
 
-application: Application | None = None  # global if needed elsewhere
+# -----------------------
+# Basic endpoints
+# -----------------------
+@app.get("/")
+def home():
+    return {"status": "API Online"}
 
-# Channel caches (in-memory). Consider Redis/DB for persistence later.
-channel_price_cache: Dict[str, float] = {}
-channel_posted_today = set()
-last_cache_date = None
+@app.get("/health")
+def health():
+    """
+    Simple health endpoint:
+      - returns OK if process running,
+      - returns details otherwise
+    """
+    return {"status": "ok", "time": datetime.now(timezone.utc).isoformat()}
 
+# ---------- Redis client (sync) ----------
+REDIS_URL = os.getenv("REDIS_URL")
+_redis = None
+REDIS_TTL_SECONDS = 24 * 3600
+CHANNEL_REDIS_PREFIX = "channel:snap:"
 
-async def safe_send(bot, chat_id: int, text: str, **kwargs):
-    """Safe message sender — logs but never raises."""
+def get_redis():
+    global _redis
+    if _redis is None:
+        # Use redis-py sync client. We will call it inside run_in_executor for async safety.
+        _redis = redis.from_url(REDIS_URL, decode_responses=True)
+    return _redis
+
+_pg_pool = None
+def get_pg_pool():
+    global _pg_pool
+    if _pg_pool is None:
+        if not DB_URL:
+            raise RuntimeError("DB_URL not set for Postgres fallback")
+        # ThreadedConnectionPool from psycopg2
+        _pg_pool = pool.ThreadedConnectionPool(minconn=1, maxconn=10, dsn=DB_URL)
+    return _pg_pool
+
+def _db_ensure_table():
+    """Ensure product_snapshots table exists (safe to call on startup)."""
+    conn = None
     try:
-        await bot.send_message(chat_id=chat_id, text=text, **kwargs)
+        pool_conn = get_pg_pool()
+        conn = pool_conn.getconn()
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS product_snapshots (
+          url TEXT PRIMARY KEY,
+          site TEXT,
+          title TEXT,
+          current_price NUMERIC,
+          previous_price NUMERIC,
+          stock_status TEXT,
+          raw JSONB,
+          last_checked_at TIMESTAMPTZ DEFAULT NOW()
+        );
+        """)
+        cur.close()
+        logger.info("Ensured product_snapshots table exists")
+    finally:
+        if conn:
+            pool_conn.putconn(conn)
+
+def _db_get_snapshot(url: str) -> Optional[Dict[str, Any]]:
+    """Return latest snapshot row for url or None. Blocking."""
+    conn = None
+    try:
+        pool_conn = get_pg_pool()
+        conn = pool_conn.getconn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT url, site, title, current_price, previous_price, stock_status, raw,
+                   last_checked_at
+            FROM product_snapshots
+            WHERE url = %s
+            LIMIT 1
+        """, (url,))
+        row = cur.fetchone()
+        cur.close()
+        return dict(row) if row else None
+    finally:
+        if conn:
+            pool_conn.putconn(conn)
+
+def _db_upsert_snapshot(snapshot: Dict[str, Any]) -> None:
+    """Insert or update snapshot for url. Blocking."""
+    conn = None
+    try:
+        pool_conn = get_pg_pool()
+        conn = pool_conn.getconn()
+        cur = conn.cursor()
+        cur.execute("""
+            INSERT INTO product_snapshots
+              (url, site, title, current_price, previous_price, stock_status, raw, last_checked_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (url) DO UPDATE SET
+              site = EXCLUDED.site,
+              title = EXCLUDED.title,
+              current_price = EXCLUDED.current_price,
+              previous_price = EXCLUDED.previous_price,
+              stock_status = EXCLUDED.stock_status,
+              raw = EXCLUDED.raw,
+              last_checked_at = EXCLUDED.last_checked_at
+        """, (
+            snapshot.get("url"),
+            snapshot.get("site"),
+            snapshot.get("title"),
+            snapshot.get("current_price"),
+            snapshot.get("previous_price"),
+            snapshot.get("stock_status"),
+            json.dumps(snapshot.get("raw") or {}),
+            datetime.now(timezone.utc)
+        ))
+        conn.commit()
+        cur.close()
+    finally:
+        if conn:
+            pool_conn.putconn(conn)
+
+def _channel_key(ref: str) -> str:
+    return CHANNEL_REDIS_PREFIX + quote_plus(ref)
+
+def _url_key(url: str) -> str:
+    # key for storing last snapshot by URL
+    return "snapshot:url:" + quote_plus(url)
+
+def _product_site_key(product_key: str, site: str) -> str:
+    return f"product:{product_key}:site:{site}"
+
+def _product_sites_set_key(product_key: str) -> str:
+    return f"product:{product_key}:sites"
+
+# -------------------------
+# Channel table helpers (blocking)
+# -------------------------
+def _db_create_channel_table():
+    """Create channel_snapshots table if missing."""
+    conn = None
+    try:
+        pool_conn = get_pg_pool()
+        conn = pool_conn.getconn()
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("""
+        CREATE TABLE IF NOT EXISTS channel_snapshots (
+          ref TEXT PRIMARY KEY,
+          site TEXT,
+          title TEXT,
+          url TEXT,
+          current_price NUMERIC,
+          raw JSONB,
+          last_seen TIMESTAMPTZ DEFAULT NOW(),
+          expires_at TIMESTAMPTZ,
+          last_posted_at TIMESTAMPTZ
+        );
+        """)
+        cur.close()
+        logger.info("Ensured channel_snapshots table exists")
+    finally:
+        if conn:
+            pool_conn.putconn(conn)
+
+def _migrate_channel_table():
+    """Add missing columns (safe migration)."""
+    conn = None
+    try:
+        pool_conn = get_pg_pool()
+        conn = pool_conn.getconn()
+        conn.autocommit = True
+        cur = conn.cursor()
+        cur.execute("""
+        ALTER TABLE channel_snapshots
+        ADD COLUMN IF NOT EXISTS last_posted_at TIMESTAMPTZ;
+        """)
+        logger.info("Migrated channel_snapshots: added last_posted_at if missing")
     except Exception as exc:
-        LOG.exception("Failed sending to %s: %s", chat_id, exc)
+        logger.exception("Channel table migration failed: %s", exc)
+    finally:
+        if conn:
+            pool_conn.putconn(conn)
 
+def _db_upsert_channel_snapshot(ref: str, snapshot: dict, expires_hours: int = 48):
+    """Blocking DB upsert for a single channel snapshot."""
+    conn = None
+    try:
+        pool_conn = get_pg_pool()
+        conn = pool_conn.getconn()
+        cur = conn.cursor()
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=expires_hours)
+        last_posted_at = snapshot.get("last_posted_at")
+        cur.execute("""
+            INSERT INTO channel_snapshots
+              (ref, site, title, url, current_price, raw, last_seen, expires_at, last_posted_at)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (ref) DO UPDATE SET
+              site = EXCLUDED.site,
+              title = EXCLUDED.title,
+              url = EXCLUDED.url,
+              current_price = EXCLUDED.current_price,
+              raw = EXCLUDED.raw,
+              last_seen = EXCLUDED.last_seen,
+              expires_at = EXCLUDED.expires_at,
+              last_posted_at = EXCLUDED.last_posted_at
+        """, (
+            ref,
+            snapshot.get("site"),
+            snapshot.get("title"),
+            snapshot.get("url"),
+            snapshot.get("current_price"),
+            json.dumps(snapshot.get("raw") or {}),
+            datetime.now(timezone.utc),
+            expires_at,
+            last_posted_at
+        ))
+        conn.commit()
+        cur.close()
+    finally:
+        if conn:
+            pool_conn.putconn(conn)
 
-async def handle_watch_failure(context: ContextTypes.DEFAULT_TYPE, user_id: int, watch: dict, exc=None, reason=None):
-    """Centralized failure handling with backoff + pause."""
-    watch.setdefault("fail_count", 0)
-    watch["fail_count"] += 1
+def _db_get_channel_snapshot(ref: str) -> Optional[Dict[str, Any]]:
+    """Blocking DB read for channel snapshot. Returns None if expired/missing."""
+    conn = None
+    try:
+        pool_conn = get_pg_pool()
+        conn = pool_conn.getconn()
+        cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
+        cur.execute("""
+            SELECT ref, site, title, url, current_price, raw, last_seen, expires_at, last_posted_at
+            FROM channel_snapshots
+            WHERE ref = %s
+            LIMIT 1
+        """, (ref,))
+        row = cur.fetchone()
+        cur.close()
+        if not row:
+            return None
+        # expire check
+        exp = row.get("expires_at")
+        if exp and exp <= datetime.now(timezone.utc):
+            return None
+        return dict(row)
+    finally:
+        if conn:
+            pool_conn.putconn(conn)
 
-    backoff_seconds = FAILURE_BACKOFF_BASE * (2 ** (watch["fail_count"] - 1))
-    watch["next_check"] = datetime.now(TIMEZONE) + timedelta(seconds=backoff_seconds)
+def _db_delete_expired_channel_snapshots():
+    """Blocking cleanup: remove DB rows where expires_at <= now()."""
+    conn = None
+    try:
+        pool_conn = get_pg_pool()
+        conn = pool_conn.getconn()
+        cur = conn.cursor()
+        cur.execute("DELETE FROM channel_snapshots WHERE expires_at <= NOW()")
+        deleted = cur.rowcount
+        conn.commit()
+        cur.close()
+        return deleted
+    finally:
+        if conn:
+            pool_conn.putconn(conn)
 
-    LOG.warning(
-        "Watch failure user=%s url=%s count=%d backoff=%ds reason=%s",
-        user_id, watch.get("url"), watch["fail_count"], backoff_seconds, reason or str(exc)[:100]
-    )
-
-    if watch["fail_count"] >= MAX_WATCH_FAILURES:
-        watch["status"] = "paused"
-        msg = (
-            f"⚠️ Watch for *{watch.get('title', 'product')}* paused after repeated failures.\n\n"
-            "Possible causes: product removed, site changes, or temporary issues.\n"
-            "We'll resume automatically if it recovers, or you can re-add it."
-        )
-        try:
-            await safe_send(context.bot, user_id, msg, parse_mode="Markdown")
-        except Exception:
-            LOG.exception("Failed to notify user about paused watch")
-        LOG.info("Paused watch user=%s url=%s after %d failures", user_id, watch.get("url"), watch["fail_count"])
-
-
-async def check_all_watches(context: ContextTypes.DEFAULT_TYPE):
-    """Job: check all active watches → alert on changes."""
-    if not user_watches:
-        return
-
-    # Each user separately to respect per-user settings
-    for user_id, watches in list(user_watches.items()):
-        try:
-            # user settings with defaults
-            user_settings_for_id = user_settings.get(user_id, {})
-            enabled_cats = user_settings_for_id.get("enabled_categories", CATEGORIES.copy())
-
-            for watch in list(watches):
-                try:
-                    # skip non-active
-                    if watch.get("status") != "active":
-                        continue
-
-                    # category check
-                    watch_category = watch.get("category")
-                    if watch_category and watch_category not in enabled_cats:
-                        continue
-
-                    now = datetime.now(TIMEZONE)
-
-                    # next_check backoff check
-                    next_check = watch.get("next_check")
-                    if next_check and now < next_check:
-                        continue
-
-                    # run scrape in executor so blocking IO doesn't block the loop
-                    try:
-                        new_data = await asyncio.get_event_loop().run_in_executor(None, scrape_product, watch["url"])
-                    except Exception as exc:
-                        await handle_watch_failure(context, user_id, watch, exc=exc, reason="scrape_error")
-                        continue
-
-                    # if no usable price -> consider delisted/OOS
-                    if not new_data or new_data.get("current_price") is None:
-                        if NOTIFY_ON_DELISTED:
-                            await safe_send(
-                                context.bot,
-                                user_id,
-                                f"⚠️ *{watch.get('title', 'Product')}* delisted or out of stock — pausing watch.\n{watch['url']}",
-                                parse_mode="Markdown"
-                            )
-                        watch["status"] = "paused"
-                        continue
-
-                    # success: reset failure counters
-                    watch["fail_count"] = 0
-                    watch.pop("next_check", None)
-
-                    # --- LOAD previous snapshot (redis 1st, db fallback) ---
-                    try:
-                        prev_snapshot = await load_last_snapshot(watch["url"])
-                    except Exception:
-                        LOG.exception("Failed loading last snapshot for %s", watch.get("url"))
-                        prev_snapshot = None
-
-                    old_price = None
-                    old_stock = watch.get("last_stock", "available")
-                    last_checked_iso = None
-
-                    if prev_snapshot:
-                        old_price = prev_snapshot.get("current_price")
-                        old_stock = prev_snapshot.get("stock_status", old_stock)
-                        last_checked_iso = prev_snapshot.get("last_checked_at")
-
-                    # mark last_checked logic (avoid duplicate immediate runs)
-                    if last_checked_iso:
-                        try:
-                            last_dt = datetime.fromisoformat(last_checked_iso)
-                            if (now - last_dt).total_seconds() < (CHECK_INTERVAL_SECONDS * 0.33):
-                                # skip if we checked recently (self-heal)
-                                continue
-                        except Exception:
-                            # if parsing fails, ignore and proceed
-                            pass
-
-                    current_price = new_data["current_price"]
-
-                    # If no previous stored price, seed snapshot then continue (no alert first time)
-                    if old_price is None:
-                        try:
-                            await save_snapshot({
-                                "url": watch["url"],
-                                "site": new_data.get("site"),
-                                "title": new_data.get("title"),
-                                "current_price": current_price,
-                                "previous_price": new_data.get("previous_price"),
-                                "stock_status": new_data.get("stock_status"),
-                                "raw": new_data.get("raw"),
-                            })
-                        except Exception:
-                            LOG.exception("Failed saving initial snapshot for %s", watch.get("url"))
-
-                        # update in-memory watch for immediate scheduling
-                        watch["last_price"] = current_price
-                        watch["last_stock"] = new_data.get("stock_status")
-                        watch["last_checked_at"] = datetime.now(TIMEZONE).isoformat()
-                        continue
-
-                    # compute changes
-                    changes = compute_changes(
-                        {"current_price": old_price, "stock_status": old_stock},
-                        {"current_price": current_price, "stock_status": new_data.get("stock_status", "available")}
-                    )
-
-                    if not changes.get("significant_change"):
-                        # update last seen and persist snapshot (update last_checked_at)
-                        watch["last_price"] = current_price
-                        watch["last_stock"] = new_data.get("stock_status", "available")
-                        watch["last_checked_at"] = datetime.now(TIMEZONE).isoformat()
-                        try:
-                            await save_snapshot({
-                                "url": watch["url"],
-                                "site": new_data.get("site"),
-                                "title": new_data.get("title"),
-                                "current_price": current_price,
-                                "previous_price": old_price,
-                                "stock_status": new_data.get("stock_status"),
-                                "raw": new_data.get("raw"),
-                            })
-                        except Exception:
-                            LOG.exception("Failed saving snapshot (no-significant-change) for %s", watch.get("url"))
-                        continue
-
-                    price_diff_percent = changes.get("price_diff_percent", 0.0)  # positive => drop
-                    direction = watch.get("direction", "low")
-                    deal_score = calculate_deal_score(price_diff_percent)
-
-                    # Trigger logic based on direction or target_price
-                    trigger = False
-                    if direction == "low" and price_diff_percent > 0:
-                        trigger = True
-                    elif direction == "high" and price_diff_percent < 0:
-                        trigger = True
-                    elif direction == "both":
-                        trigger = True
-
-                    # Target price override
-                    target_price = watch.get("target_price")
-                    target_hit = False
-                    try:
-                        if target_price is not None and current_price <= target_price:
-                            target_hit = True
-                            trigger = True
-                    except Exception:
-                        pass
-
-                    if not trigger:
-                        watch["last_price"] = current_price
-                        watch["last_stock"] = new_data.get("stock_status", "available")
-                        # persist snapshot update
-                        try:
-                            await save_snapshot({
-                                "url": watch["url"],
-                                "site": new_data.get("site"),
-                                "title": new_data.get("title"),
-                                "current_price": current_price,
-                                "previous_price": old_price,
-                                "stock_status": new_data.get("stock_status"),
-                                "raw": new_data.get("raw"),
-                            })
-                        except Exception:
-                            LOG.exception("Failed saving snapshot (post-no-trigger) for %s", watch.get("url"))
-                        continue
-
-                    # Build enriched alert data and send
-                    enriched = {
-                        "title": new_data.get("title", watch.get("title", "Product")),
-                        "current_price": current_price,
-                        "previous_price": old_price,
-                        "price_diff_percent": abs(price_diff_percent),
-                        "deal_score": deal_score,
-                        "suggested_action": (
-                            f"Hit target ≤ ₦{int(target_price):,}" if target_hit
-                            else "Price dropped!" if price_diff_percent > 0
-                            else "Price increased!"
-                        ),
-                        "product_url": watch["url"],
-                        "changed": True,
-                        "what_changed": changes.get("what_changed", []),
-                    }
-
-                    msg = format_telegram_alert(enriched)
-
-                    await safe_send(
-                        context.bot,
-                        user_id,
-                        msg,
-                        parse_mode="Markdown",
-                        disable_web_page_preview=True
-                    )
-
-                    # update watch snapshot (persist current state)
-                    watch["last_price"] = current_price
-                    watch["last_stock"] = new_data.get("stock_status", "available")
-                    watch["last_checked_at"] = datetime.now(TIMEZONE).isoformat()
-                    try:
-                        await save_snapshot({
-                            "url": watch["url"],
-                            "site": new_data.get("site"),
-                            "title": new_data.get("title"),
-                            "current_price": current_price,
-                            "previous_price": old_price,
-                            "stock_status": new_data.get("stock_status"),
-                            "raw": new_data.get("raw"),
-                        })
-                    except Exception:
-                        LOG.exception("Failed saving snapshot after alert for %s", watch.get("url"))
-
-                except Exception as exc_inner:
-                    LOG.exception("Unexpected scheduler error user=%s watch=%s", user_id, watch.get("url"))
-                    await handle_watch_failure(context, user_id, watch, exc=exc_inner, reason="unexpected")
-
-        except Exception as exc_user:
-            LOG.exception("Unexpected error processing watches for user=%s", user_id)
-            # can't continue for this user — move to next
-
-
-async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
+# ---------- Async-friendly persistence API helpers (non-blocking) ----------
+async def load_last_snapshot(url: str) -> Optional[Dict[str, Any]]:
     """
-    Unified channel posting:
-      - Scrapes every ref in CHANNEL_MONITORED_URLS (via scrape_site/scrape_product)
-      - Groups by normalize_product_key()
-      - Posts one unified comparison per product group if drop/savings thresholds met.
+    Try Redis first (fast). If missing, fallback to Postgres and return that.
+    Returns snapshot dict or None.
     """
-    global channel_posted_today, last_cache_date, channel_price_cache
-
-    if not AUTO_POST_TO_CHANNEL or not CHANNEL_DEAL_CHAT_ID or not CHANNEL_MONITORED_URLS:
-        return
-
-    # daily reset
-    today = datetime.now(TIMEZONE).date()
-    if last_cache_date != today:
-        channel_posted_today.clear()
-        last_cache_date = today
-
     loop = asyncio.get_event_loop()
-    grouped = {}
+    key = _url_key(url)
 
-    # 1) fetch (run blocking scrapes in executor)
-    for ref in CHANNEL_MONITORED_URLS:
-        try:
-            # prefer scrape_site if available; fallback to scrape_product
-            scrape_fn = scrape_site if "scrape_site" in globals() else scrape_product
-            data = await loop.run_in_executor(None, scrape_fn, ref)
-        except Exception as e:
-            LOG.warning("Channel scrape failed for %s: %s", ref, e)
-            continue
+    def _read_redis():
+        r = get_redis()
+        v = r.get(key)
+        return v
 
-            # normalize numeric price
+    try:
+        val = await loop.run_in_executor(None, _read_redis)
+        if val:
             try:
-                cur = float(data.get("current_price")) if data.get("current_price") is not None else None
+                return json.loads(val)
             except Exception:
-                cur = None
-            if cur is None:
-                # skip delisted / no price
-                continue
+                logger.exception("Corrupt redis snapshot for %s", url)
+    except Exception:
+        logger.exception("Redis read failed for %s", url)
 
-            data["current_price"] = cur
-            data["url"] = data.get("url") or ref
-            data["site"] = data.get("site") or (_get_domain_from_url(data["url"]) if "_get_domain_from_url" in globals() else data["url"])
+    # fallback to DB
+    try:
+        db_row = await loop.run_in_executor(None, _db_get_snapshot, url)
+        return db_row
+    except Exception:
+        logger.exception("DB read failed for %s", url)
+        return None
 
-            # build group key
+async def save_snapshot(snapshot: Dict[str, Any], redis_ttl: int = REDIS_TTL_SECONDS) -> None:
+    """
+    Save snapshot to Redis (with TTL) and persist to Postgres (background).
+    Also updates product-site index for alternatives.
+    """
+    loop = asyncio.get_event_loop()
+    key = _url_key(snapshot.get("url"))
+
+    now_iso = datetime.now(timezone.utc).isoformat()
+    payload = {
+        "url": snapshot.get("url"),
+        "site": snapshot.get("site"),
+        "title": snapshot.get("title"),
+        "current_price": snapshot.get("current_price"),
+        "previous_price": snapshot.get("previous_price"),
+        "stock_status": snapshot.get("stock_status"),
+        "raw": snapshot.get("raw") or {},
+        "last_checked_at": now_iso
+    }
+
+    def _write_redis():
+        r = get_redis()
+        r.set(key, json.dumps(payload), ex=redis_ttl)
+
+    try:
+        await loop.run_in_executor(None, _write_redis)
+    except Exception:
+        logger.exception("Failed writing snapshot to Redis for %s", snapshot.get("url"))
+
+    try:
+        await loop.run_in_executor(None, _db_upsert_snapshot, payload)
+    except Exception:
+        logger.exception("Failed to persist snapshot to Postgres for %s", snapshot.get("url"))
+
+    # Update product-site index for alternatives (best-effort)
+    try:
+        product_key = normalize_product_key(snapshot)
+        site = snapshot.get("site")
+        if product_key and site:
+            def _update_index():
+                r = get_redis()
+                site_key = _product_site_key(product_key, site)
+                site_data = {
+                    "current_price": snapshot.get("current_price"),
+                    "url": snapshot.get("url")
+                }
+                r.set(site_key, json.dumps(site_data), ex=redis_ttl)
+                r.sadd(_product_sites_set_key(product_key), site)
+            await loop.run_in_executor(None, _update_index)
+    except Exception:
+        logger.exception("Failed updating product-site index for %s", snapshot.get("url"))
+
+# ---------- Channel snapshot async wrappers ----------
+async def save_channel_snapshot(ref: str, snapshot: dict, ttl_seconds: int = 48 * 3600):
+    """
+    Save channel snapshot to Redis (ttl) and persist to Postgres as fallback.
+    Includes optional last_posted_at for deduplication.
+    """
+    loop = asyncio.get_event_loop()
+    key = _channel_key(ref)
+
+    def _write_redis():
+        try:
+            r = get_redis()
+            r.set(key, json.dumps({
+                "ref": ref,
+                "site": snapshot.get("site"),
+                "title": snapshot.get("title"),
+                "url": snapshot.get("url"),
+                "current_price": snapshot.get("current_price"),
+                "raw": snapshot.get("raw") or {},
+                "last_seen": datetime.now(timezone.utc).isoformat(),
+                "last_posted_at": snapshot.get("last_posted_at")
+            }), ex=ttl_seconds)
+        except Exception:
+            logger.exception("Redis write failed for channel snapshot %s", ref)
+
+    try:
+        await loop.run_in_executor(None, _write_redis)
+    except Exception:
+        logger.exception("Redis executor error while saving channel snapshot %s", ref)
+
+    try:
+        await loop.run_in_executor(None, _db_upsert_channel_snapshot, ref, snapshot)
+    except Exception:
+        logger.exception("DB upsert failed for channel snapshot %s", ref)
+
+async def load_channel_snapshot(ref: str) -> Optional[Dict[str, Any]]:
+    """Load channel snapshot from Redis first, fallback to DB. Returns None if expired/missing."""
+    loop = asyncio.get_event_loop()
+    key = _channel_key(ref)
+
+    def _read_redis():
+        try:
+            r = get_redis()
+            v = r.get(key)
+            return v
+        except Exception:
+            return None
+
+    try:
+        val = await loop.run_in_executor(None, _read_redis)
+        if val:
             try:
-                key = normalize_product_key(data)
+                return json.loads(val)
             except Exception:
-                key = f"UNK::{data['site']}::{int(cur)}"
+                logger.exception("Corrupt Redis channel snapshot %s", ref)
+    except Exception:
+        logger.exception("Redis read executor error for channel snapshot %s", ref)
 
-            grouped.setdefault(key, []).append({"ref": ref, "data": data, "price": cur})
+    try:
+        row = await loop.run_in_executor(None, _db_get_channel_snapshot, ref)
+        return row
+    except Exception:
+        logger.exception("DB fallback read error for channel snapshot %s", ref)
+        return None
 
-    # 2) evaluate groups and post at most MAX_CHANNEL_POSTS_PER_RUN
-    posted_count = 0
-    for product_key, entries in grouped.items():
-        if posted_count >= (MAX_CHANNEL_POSTS_PER_RUN or 10):
-            break
+async def delete_expired_channel_snapshots() -> int:
+    """Run DB cleanup to delete expired channel snapshots. Returns number deleted."""
+    loop = asyncio.get_event_loop()
+    try:
+        deleted = await loop.run_in_executor(None, _db_delete_expired_channel_snapshots)
+        return deleted or 0
+    except Exception:
+        logger.exception("Failed deleting expired channel snapshots")
+        return 0
+
+# Alternatives helper (returns list of {site, price, url})
+async def fetch_alternatives(product_key: str, exclude_site: str = None) -> list:
+    """
+    Return other site snapshots for same product_key (quick, from Redis).
+    """
+    loop = asyncio.get_event_loop()
+
+    def _fetch():
+        r = get_redis()
+        set_key = _product_sites_set_key(product_key)
+        sites = r.smembers(set_key) or []
+        results = []
+        for s in sites:
+            if s == exclude_site:
+                continue
+            v = r.get(_product_site_key(product_key, s))
+            if not v:
+                continue
+            try:
+                j = json.loads(v)
+                results.append({"site": s, "price": j.get("current_price"), "url": j.get("url")})
+            except Exception:
+                continue
+        return results
+
+    return await loop.run_in_executor(None, _fetch)
+
+# -----------------------
+# The /v1/track endpoint
+# -----------------------
+@app.post("/v1/track")
+async def track_product(payload: dict = Body(...)):
+    url = payload.get("url") or payload.get("product_url")
+    if not url:
+        raise HTTPException(status_code=400, detail="url is required")
+
+    # 1) Scrape product (run blocking scrape in executor)
+    loop = asyncio.get_event_loop()
+    try:
+        product = await loop.run_in_executor(None, scrape_product, url)
+    except NoDataError as e:
+        raise HTTPException(status_code=404, detail=str(e))
+    except NotImplementedError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except Exception as e:
+        logger.exception("Scrape failed for %s", url)
+        raise HTTPException(status_code=500, detail=f"scrape error: {e}")
+
+    # 2) load previous snapshot
+    old = await load_last_snapshot(url)
+
+    old_minimal = None
+    if old:
+        old_minimal = {"current_price": old.get("current_price"), "stock_status": old.get("stock_status")}
+
+    # 3) compute changes
+    try:
+        changes = compute_changes(old_minimal, product)
+    except Exception:
+        changes = {"changed": True, "what_changed": [], "price_diff_percent": 0.0}
+
+    # 4) deal scoring
+    price_diff = changes.get("price_diff_percent", 0.0)
+    try:
+        deal_score = calculate_deal_score(price_diff)
+    except Exception:
+        deal_score = "none"
+
+    severity = deal_score if deal_score in ("high", "medium") else "low"
+
+    # 5) persist snapshot
+    try:
+        await save_snapshot(product)
+    except Exception:
+        logger.exception("Failed saving snapshot for %s", url)
+
+    # 6) gather alternatives
+    try:
+        product_key = normalize_product_key(product)
+        alternatives = await fetch_alternatives(product_key, exclude_site=product.get("site"))
+    except Exception:
+        alternatives = []
+
+    # 7) build response
+    response = {
+        "product_url": product.get("url") or url,
+        "title": product.get("title"),
+        "current_price": product.get("current_price"),
+        "previous_price": old.get("current_price") if old else product.get("previous_price"),
+        "changed": bool(changes.get("changed")),
+        "what_changed": changes.get("what_changed", []),
+        "stock_status": product.get("stock_status", "unknown"),
+        "deal_score": deal_score,
+        "severity": severity,
+        "suggested_action": (
+            "Buy now! Strong price drop" if deal_score == "high"
+            else "Worth monitoring" if deal_score == "medium"
+            else "No action needed"
+        ),
+        "alternatives": alternatives,
+        "timestamp": datetime.now(timezone.utc).isoformat()
+    }
+
+    return response
+
+# -----------------------
+# Bot process manager
+# -----------------------
+class BotManager:
+    def __init__(self, target_callable, max_restarts=6, restart_window_seconds=300):
+        self.target = target_callable
+        self.proc = None
+        self._lock = threading.Lock()
+        self.should_stop = threading.Event()
+        self.max_restarts = max_restarts
+        self.restart_window = restart_window_seconds
+        self.restart_timestamps = []
+
+    def start(self):
+        with self._lock:
+            if self.proc and self.proc.is_alive():
+                logger.info("Bot process already running (pid=%s)", getattr(self.proc, "pid", None))
+                return
+
+            logger.info("Starting bot process...")
+            self.proc = multiprocessing.Process(target=self._run_target_wrapper)
+            self.proc.start()
+            logger.info("Started bot process (pid=%s)", self.proc.pid)
+
+    def _run_target_wrapper(self):
         try:
-            # find best (lowest) price across entries and site-specific minima
-            site_prices = {}
-            for e in entries:
-                site = e["data"]["site"]
-                site_prices[site] = min(site_prices.get(site, float("inf")), e["price"])
-
-            best_site, best_price = min(site_prices.items(), key=lambda kv: kv[1])
-
-            # compute highest historical price among these refs (to measure drop)
-            highest_old = 0
-            for e in entries:
-                old = channel_price_cache.get(e["ref"]) or 0
-                highest_old = max(highest_old, old)
-
-            if highest_old <= 0:
-                # seed cache and skip first-time notifications
-                for e in entries:
-                    channel_price_cache[e["ref"]] = e["price"]
-                continue
-
-            drop_pct = round(((highest_old - best_price) / highest_old) * 100, 1)
-            savings = highest_old - best_price
-
-            if drop_pct < (MIN_DROP_PERCENT_FOR_CHANNEL or 5.0) or savings < (MIN_SAVINGS_FOR_CHANNEL or 15000):
-                # update cache and skip
-                for e in entries:
-                    channel_price_cache[e["ref"]] = e["price"]
-                continue
-
-            # score with existing helper
-            score = calculate_deal_score(drop_pct)
-            if score not in ("high", "medium"):
-                for e in entries:
-                    channel_price_cache[e["ref"]] = e["price"]
-                continue
-
-            # dedupe: if any of the refs were posted today, skip (avoid duplication)
-            if any(e["ref"] in channel_posted_today for e in entries):
-                for e in entries:
-                    channel_price_cache[e["ref"]] = e["price"]
-                continue
-
-            # Build message: unified comparison
-            prod_title = entries[0]["data"].get("title") or product_key
-            lines = []
-            lines.append(f"🔥 *{prod_title}* — BEST PRICE: ₦{int(best_price):,} on *{best_site}*")
-            lines.append(f"📉 Drop: *{drop_pct}%* • Saved: *₦{int(savings):,}*")
-            lines.append("")
-            lines.append("💱 Prices across monitored sites:")
-            for site, price in sorted(site_prices.items(), key=lambda kv: kv[1]):
-                lines.append(f"- *{site}*: ₦{int(price):,}")
-
-            # prefer the first entry that matches best_site to provide a link
-            best_entry = next((e for e in entries if e["data"]["site"] == best_site), entries[0])
-            lines.append("")
-            lines.append(f"🛒 Buy: {best_entry['data'].get('url')}")
-            lines.append("")
-            lines.append("⏰ Spotted now — prices move fast. Personal alerts → @YourBotUsername")
-
-            msg = "\n".join(lines)
-
-            await safe_send(context.bot, CHANNEL_DEAL_CHAT_ID, msg,
-                            parse_mode="Markdown", disable_web_page_preview=True)
-
-            # update caches and posted set
-            for e in entries:
-                channel_price_cache[e["ref"]] = e["price"]
-                channel_posted_today.add(e["ref"])
-            posted_count += 1
-
+            self.target()
         except Exception:
-            LOG.exception("Failed evaluating channel product %s", product_key)
-            continue
+            traceback.print_exc()
+            os._exit(1)
+        os._exit(0)
 
+    def stop(self, timeout=5):
+        with self._lock:
+            if not self.proc or not self.proc.is_alive():
+                return
 
-async def check_trials(context: ContextTypes.DEFAULT_TYPE):
-    """Validate trials and downgrade users whose trial expired."""
-    bot = context.bot
-    now = time.time()
+            logger.info("Terminating bot process (pid=%s)...", self.proc.pid)
+            try:
+                self.proc.terminate()
+                self.proc.join(timeout)
+                if self.proc.is_alive():
+                    logger.warning("Bot did not exit gracefully; killing...")
+                    self.proc.kill()
+                    self.proc.join(1)
+            except Exception as e:
+                logger.exception("Error terminating bot process: %s", e)
+            finally:
+                logger.info("Bot process stopped.")
+                self.proc = None
 
-    for user_id, sub in list(user_subscriptions.items()):
+    def monitor_and_restart(self, poll_interval=2):
+        logger.info("Bot monitor thread started")
+        while not self.should_stop.is_set():
+            with self._lock:
+                proc = self.proc
+
+            if proc is None:
+                try:
+                    self.start()
+                except Exception:
+                    logger.exception("Failed to start bot process")
+                time.sleep(poll_interval)
+                continue
+
+            if not proc.is_alive():
+                exitcode = proc.exitcode
+                logger.error("Bot process exited (pid=%s, code=%s)", getattr(proc, "pid", None), exitcode)
+
+                now_ts = time.time()
+                self.restart_timestamps = [t for t in self.restart_timestamps if now_ts - t <= self.restart_window]
+
+                if len(self.restart_timestamps) >= self.max_restarts:
+                    logger.critical(
+                        "Bot has restarted %s times within %s seconds — halting further restarts.",
+                        len(self.restart_timestamps), self.restart_window
+                    )
+                    self.should_stop.set()
+                    break
+
+                self.restart_timestamps.append(now_ts)
+                backoff = min(2 ** len(self.restart_timestamps), 30)
+                logger.info("Restarting bot in %s seconds (attempt #%s)...", backoff, len(self.restart_timestamps))
+                time.sleep(backoff)
+
+                try:
+                    self.start()
+                except Exception:
+                    logger.exception("Failed to restart bot process")
+            else:
+                time.sleep(poll_interval)
+
+        logger.info("Bot monitor thread exiting")
+
+    def request_stop(self):
+        logger.info("BotManager.request_stop called")
+        self.should_stop.set()
         try:
-            if not sub:
-                continue
-            if "trial_start" in sub and not sub.get("paid", False):
-                days_since = (now - sub["trial_start"]) / 86400
-                tier = sub["tier"]
-                trial_days = PAID_TIERS.get(tier, {"trial_days": 0})["trial_days"]
-
-                if days_since > trial_days:
-                    sub["tier"] = "free"
-                    sub.pop("trial_start", None)
-
-                    # Notify
-                    msg = f"⚠️ Your {tier.capitalize()} trial expired. Downgraded to free tier."
-                    try:
-                        await safe_send(bot, user_id, msg)
-                    except Exception:
-                        LOG.exception("Failed to notify user about trial expiry")
-
-                    # Enforce watch limit
-                    watches = user_watches.get(user_id, [])
-                    if len(watches) > MAX_WATCHES_FREE:
-                        extra = len(watches) - MAX_WATCHES_FREE
-                        msg2 = f"\nPlease remove {extra} watches to comply with the free tier limit."
-                        try:
-                            await safe_send(bot, user_id, msg2)
-                        except Exception:
-                            LOG.exception("Failed to notify user about watches limit after downgrade")
+            self.stop()
         except Exception:
-            LOG.exception("Error while checking trials for user %s", user_id)
-            continue
+            logger.exception("Error while stopping bot on request")
 
+# Global manager instance
+bot_manager = BotManager(target_callable=run_bot, max_restarts=6, restart_window_seconds=300)
 
-async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    LOG.exception("Unhandled handler error: %s", context.error)
+# Signal handling
+def _on_terminate(signum, frame):
+    logger.info("Received termination signal (%s). Shutting down...", signum)
+    bot_manager.request_stop()
 
+signal.signal(signal.SIGINT, _on_terminate)
+signal.signal(signal.SIGTERM, _on_terminate)
 
-def run_bot():
-    """Start the Telegram bot application and scheduler jobs."""
-    global application
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+# Background cleanup task
+_cleanup_task = None
+async def _channel_cleanup_loop():
+    while True:
+        try:
+            deleted = await delete_expired_channel_snapshots()
+            if deleted:
+                logger.info("Deleted %d expired channel snapshots", deleted)
+        except Exception:
+            logger.exception("Channel cleanup loop error")
+        await asyncio.sleep(24 * 3600)
 
-    # register handlers
-    for handler in get_application_handlers():
-        application.add_handler(handler)
+# Startup / Shutdown events
+@app.on_event("startup")
+def on_startup():
+    try:
+        _db_ensure_table()
+    except Exception:
+        logger.exception("Failed ensuring product_snapshots table")
 
-    application.add_error_handler(global_error_handler)
+    try:
+        _db_create_channel_table()
+        _migrate_channel_table()
+    except Exception:
+        logger.exception("Failed ensuring/migrating channel_snapshots table")
 
-    # schedule jobs
-    application.job_queue.run_repeating(
-        callback=check_all_watches,
-        interval=CHECK_INTERVAL_SECONDS,
-        first=30,
-        name="price_checker"
-    )
+    # Start cleanup task
+    global _cleanup_task
+    try:
+        loop = asyncio.get_event_loop()
+        _cleanup_task = asyncio.ensure_future(_channel_cleanup_loop())
+    except Exception:
+        logger.exception("Failed to start channel cleanup task")
 
-    application.job_queue.run_repeating(
-        callback=check_and_post_channel_deals,
-        interval=CHECK_INTERVAL_SECONDS,
-        first=90,
-        name="channel_deals"
-    )
+    # Start bot + monitor
+    try:
+        logger.info("Application startup: starting bot process & monitor")
+        bot_manager.start()
+        monitor_thread = threading.Thread(target=bot_manager.monitor_and_restart, name="BotMonitor", daemon=True)
+        monitor_thread.start()
+        bot_manager._monitor_thread = monitor_thread
+    except Exception:
+        logger.exception("Error during startup sequence")
 
-    application.job_queue.run_repeating(
-        callback=check_trials,
-        interval=86400,  # daily
-        first=3600,
-        name="trial_checker"
-    )
+@app.on_event("shutdown")
+def _on_shutdown():
+    logger.info("App shutdown: stopping bot manager and cleanup task")
+    try:
+        bot_manager.request_stop()
+    except Exception:
+        logger.exception("Error while stopping bot manager")
 
-    LOG.info("Bot + scheduler started")
-    application.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=["message", "callback_query"]  # limit to what you handle
-    )
+    try:
+        if _cleanup_task and not _cleanup_task.done():
+            _cleanup_task.cancel()
+    except Exception:
+        logger.exception("Error cancelling cleanup task")
+
+# Main runner
+if __name__ == "__main__":
+    port = int(os.getenv("PORT", "8000"))
+    logger.info("Starting FastAPI + bot runner (uvicorn will block). PID=%s", os.getpid())
+    try:
+        uvicorn.run(app, host="0.0.0.0", port=port, log_level=LOG_LEVEL.lower())
+    except Exception as e:
+        logger.exception("Uvicorn runtime crashed: %s", e)
+    finally:
+        logger.info("Main process exiting; stopping bot manager")
+        bot_manager.request_stop()
+        time.sleep(0.5)
+        logger.info("Exiting main process")
