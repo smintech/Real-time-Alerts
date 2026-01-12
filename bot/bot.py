@@ -6,7 +6,7 @@ from typing import Dict, Any
 
 from telegram.ext import Application, ContextTypes
 
-from config import TELEGRAM_TOKEN, DB_URL
+from utils.config import TELEGRAM_TOKEN, DB_URL
 from bot.commands import get_application_handlers, user_watches, user_settings, user_subscriptions
 from bot.settings import (
     CHECK_INTERVAL_SECONDS,
