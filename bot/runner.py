@@ -14,7 +14,7 @@ import redis  # pip install redis
 import asyncio
 from fastapi import FastAPI, HTTPException, Body
 from bot.bot import run_bot  # blocking polling function
-from utils.utils import (
+from Utils.utils import (
     scrape_product,
     compute_changes,
     calculate_deal_score,
@@ -24,7 +24,7 @@ from utils.utils import (
 )
 from psycopg2 import pool
 import psycopg2.extras
-from utils.config import DB_URL
+from Utils.config import DB_URL
 from typing import Optional, Dict, Any
 
 # -----------------------
