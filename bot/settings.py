@@ -20,7 +20,7 @@ MIN_CHANGE_TO_ALERT = 0.5       # % price change minimum to trigger alert (avoid
 CATEGORIES = ['phones', 'gadgets', 'laptops', 'accessories']
 
 # Supported sites (for validation & future expansion)
-SUPPORTED_SITES = ['jumia.ng', 'konga.com','binance.com']
+SUPPORTED_SITES = ['jumia.com.ng', 'konga.com','binance.com']
 #spam protection
 ALLOWED_DIRECTIONS = ["low", "high", "both"]
 ADD_COOLDOWN_SECONDS = 10
