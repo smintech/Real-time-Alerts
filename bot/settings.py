@@ -36,35 +36,12 @@ CHANNEL_DEAL_CHAT_ID = [int(x.strip()) for x in os.getenv("CHANNEL", "").split("
 # Channel monitoring settings
 CHANNEL_MONITORED_URLS = [
     # Flagship Phones
-    "https://www.jumia.com.ng/mlp-iphone-15-pro-max/",
-    "https://www.jumia.com.ng/mlp-samsung-galaxy-s24-ultra/",
-    "https://www.jumia.com.ng/mlp-samsung-galaxy-z-fold-7/",
-
-    # Popular Mid-Range
-    "https://www.jumia.com.ng/mlp-infinix-note-50-pro/",
-    "https://www.jumia.com.ng/mlp-infinix-hot-50/",
-    "https://www.jumia.com.ng/mlp-tecno-spark-20-pro/",
-    "https://www.jumia.com.ng/mlp-tecno-camon-20/",
-    "https://www.jumia.com.ng/mlp-xiaomi-redmi-note-13-pro/",
-    "https://www.jumia.com.ng/mlp-samsung-galaxy-a16/",
-
-    # Budget Hits
-    "https://www.jumia.com.ng/mlp-itel-a100/",
-    "https://www.jumia.com.ng/mlp-infinix-smart-10/",
-    "https://www.jumia.com.ng/mlp-tecno-pop-8/",
-    "https://www.jumia.com.ng/mlp-xiaomi-redmi-a3-pro/",
-
-    # Laptops (high demand)
-    "https://www.jumia.com.ng/catalog/?q=hp+elitebook+840+g6",
-    "https://www.jumia.com.ng/catalog/?q=dell+latitude+7490",
-    "https://www.jumia.com.ng/catalog/?q=macbook+pro+a1278",
-    "https://www.jumia.com.ng/catalog/?q=hp+stream+11",
-
-    # TVs & Gadgets
-    "https://www.jumia.com.ng/catalog/?q=tcl+55+inches+uhd",
-    "https://www.jumia.com.ng/catalog/?q=hisense+65+uhd",
-    "https://www.jumia.com.ng/catalog/?q=oraimo+powerbank",
-    "https://www.jumia.com.ng/catalog/?q=zealot+s67+speaker",
+    "https://www.jumia.com.ng/hp-elitebook-840-g6-intel-core-i5-16gb-ram512gb-ssdbacklit-keyboardfp-reader-wins-11-pro-laptopbag-393059791.html",
+    "https://www.jumia.com.ng/hp-elitebook-840-g6-intel-core-i5-8gb-ram512gb-ssdbacklit-keyboardfp-reader-wins-11-laptop-bag-332628501.html",
+    "https://www.jumia.com.ng/hp-elitebook-840-g6-touchscreen-intel-core-i5-16gb-ram512gb-ssd-backlit-keyboardwindows11-probag-202178413.html",
+    # Add 10–20 more specific product URLs (not catalogs)
+    # iPhone examples:
+    "https://www.jumia.com.ng/apple-iphone-15-pro-max-256gb-apple-mpg.html",
 ]
 
 MIN_DROP_PERCENT_FOR_CHANNEL = 5.0   # % price drop
