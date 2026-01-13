@@ -498,18 +498,26 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
 
 
 async def run_bot():
+    """
+    PTB v20+/v21-compatible run_bot intended to be launched as a background task
+    (e.g. asyncio.create_task(run_bot()) from FastAPI startup).
+    """
     global application
-    
-    # 1. Build the application
+
+    # sanity
+    if not TELEGRAM_TOKEN:
+        LOG.error("TELEGRAM_TOKEN is empty — bot will not start.")
+        return
+
+    LOG.info("Building Telegram Application...")
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # 2. Add handlers
+    # Add handlers and error handler
     for handler in get_application_handlers():
         application.add_handler(handler)
     application.add_error_handler(global_error_handler)
 
-    # 3. Register jobs BEFORE starting
-    # In v21.0, the JobQueue is accessible as soon as the app is built
+    # Register jobs BEFORE starting so job_queue is present when app starts
     if application.job_queue:
         application.job_queue.run_repeating(
             callback=check_all_watches,
@@ -530,16 +538,49 @@ async def run_bot():
             name="trial_checker"
         )
 
-    # 4. Use the context manager for a clean lifecycle
-    # This handles initialize(), start(), and shutdown() automatically
-    async with application:
-        await application.updater.start_polling(drop_pending_updates=True)
-        LOG.info("Bot is now polling...")
-        
-        # Keep the task alive
+    # Optional quick test job to confirm job queue is running (uncomment while debugging)
+    # async def _test_job(ctx):
+    #     LOG.info("TEST JOB tick: %s", datetime.now(timezone.utc).isoformat())
+    # application.job_queue.run_repeating(_test_job, interval=10, first=5, name="test_job")
+
+    # Attempt to remove webhook (polling is ignored if webhook is set)
+    try:
+        # application.bot may not be ready until initialize() but in practice builder sets it
+        if application.bot:
+            try:
+                await application.bot.delete_webhook()
+                LOG.info("Deleted existing Telegram webhook (if any).")
+            except Exception as e:
+                LOG.debug("delete_webhook() returned: %s", e)
+    except Exception:
+        LOG.debug("Could not check/delete webhook (not fatal).", exc_info=True)
+
+    # Run polling (this will run until stopped); because run_bot() is started as a task,
+    # awaiting run_polling() keeps the background task alive.
+    try:
+        LOG.info("Starting Application.run_polling() (PTB v20+/v21)...")
+        # run_polling handles init/start/stop lifecycle internally
+        await application.run_polling(drop_pending_updates=True)
+        LOG.info("Application.run_polling() finished (bot stopped).")
+    except asyncio.CancelledError:
+        LOG.info("run_bot task cancelled — stopping application.")
+        # ensure graceful stop
         try:
-            while True:
-                await asyncio.sleep(3600)
-        except asyncio.CancelledError:
-            LOG.info("Bot task cancelled, shutting down...")
-            await application.updater.stop()  # Run forever
+            await application.stop()
+        except Exception:
+            LOG.exception("Error while stopping application after cancellation.")
+    except Exception as exc:
+        LOG.exception("Unexpected exception in run_polling(): %s", exc)
+        # Try graceful shutdown
+        try:
+            await application.stop()
+        except Exception:
+            LOG.exception("application.stop() failed after run_polling error.")
+    finally:
+        # Ensure resources cleaned
+        try:
+            await application.shutdown()
+        except Exception:
+            LOG.debug("application.shutdown() error (ignored).", exc_info=True)
+
+    LOG.info("run_bot() exit complete.")  # Run forever
