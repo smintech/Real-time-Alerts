@@ -27,7 +27,7 @@ from bot.persistence import (
     _db_ensure_table,
     _db_create_channel_table,
 )
-from utils.utils import (
+from Utils.utils import (
     scrape_product,
     compute_changes,
     calculate_deal_score,
