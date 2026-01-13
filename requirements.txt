@@ -10,3 +10,4 @@ redis
 python-dotenv
 pytz
 python-telegram-bot[webhooks,job-queue]
+nest-asyncio
