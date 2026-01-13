@@ -13,7 +13,7 @@ MAX_WATCHES_FREE = 3
 MAX_WATCHES_PAID = 20      # Future paid tier
 
 # Scraping & alert settings
-CHECK_INTERVAL_SECONDS = 600 #3600    # 1 hour between checks (global scheduler)
+CHECK_INTERVAL_SECONDS = 120 #3600    # 1 hour between checks (global scheduler)
 MIN_CHANGE_TO_ALERT = 0.5       # % price change minimum to trigger alert (avoid noise)
 
 # Supported categories for MVP (expand later)
