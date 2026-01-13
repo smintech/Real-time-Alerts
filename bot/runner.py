@@ -142,7 +142,7 @@ async def on_startup():
         logger.exception("DB setup failed: %s", e)
 
     # Launch bot in background (same process, async)
-    asyncio.create_task(run_bot_async())
+    asyncio.create_task(run_bot())
     logger.info("Bot launched as background async task (no multiprocessing)")
 
 @app.on_event("shutdown")
