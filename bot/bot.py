@@ -516,7 +516,8 @@ def run_bot():
         callback=check_and_post_channel_deals,
         interval=CHECK_INTERVAL_SECONDS,
         first=90,
-        name="channel_deals"
+        name="channel_deals",
+        max_instances=2
     )
 
     application.job_queue.run_repeating(
