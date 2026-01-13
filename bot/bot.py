@@ -311,6 +311,8 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
     - Price history persists across restarts.
     - Daily deduplication persists across restarts (via last_posted_at in Redis payload).
     """
+    start_time = time.time()
+    LOG.info("channel_deals job STARTED at %s", datetime.now())
     if not AUTO_POST_TO_CHANNEL or not CHANNEL_DEAL_CHAT_ID or not CHANNEL_MONITORED_URLS:
         return
 
@@ -448,7 +450,9 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             await save_channel_snapshot(e["ref"], posted_data)
 
         posted_count += 1
-
+        end_time = time.time()
+        duration = end_time - start_time
+        LOG.info("channel_deals job FINISHED in %.1f seconds (%.1f min)", duration, duration/60)
 
 async def check_trials(context: ContextTypes.DEFAULT_TYPE):
     """Validate trials and downgrade users whose trial expired."""
