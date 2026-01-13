@@ -3,7 +3,7 @@ import asyncio
 import time
 from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
-
+import nest_asyncio
 from telegram.ext import Application, ContextTypes
 
 from Utils.config import TELEGRAM_TOKEN, DB_URL
@@ -46,7 +46,7 @@ logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger(__name__)
 
 application: Application | None = None  # global if needed elsewhere
-
+nest_asyncio.apply()
 
 async def safe_send(bot, chat_id: int, text: str, **kwargs):
     """Safe message sender — logs but never raises."""
@@ -497,23 +497,22 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
     LOG.exception("Unhandled handler error: %s", context.error)
 
 
-def run_bot():
-    """Start the Telegram bot application and scheduler jobs."""
+async def run_bot():
     global application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # register handlers
     for handler in get_application_handlers():
         application.add_handler(handler)
 
     application.add_error_handler(global_error_handler)
 
-    # schedule jobs
+    # Jobs with max_instances now works!
     application.job_queue.run_repeating(
         callback=check_all_watches,
         interval=CHECK_INTERVAL_SECONDS,
         first=30,
-        name="price_checker"
+        name="price_checker",
+        max_instances=2
     )
 
     application.job_queue.run_repeating(
@@ -521,17 +520,19 @@ def run_bot():
         interval=CHECK_INTERVAL_SECONDS,
         first=90,
         name="channel_deals",
+        max_instances=2  # ← Now safe
     )
 
     application.job_queue.run_repeating(
         callback=check_trials,
-        interval=86400,  # daily
+        interval=86400,
         first=3600,
         name="trial_checker"
     )
 
-    LOG.info("Bot + scheduler started")
-    application.run_polling(
-        drop_pending_updates=True,
-        allowed_updates=["message", "callback_query"]  # limit to what you handle
-    )
+    LOG.info("Async bot starting...")
+    await application.initialize()
+    await application.start()
+    await application.updater.start_polling(drop_pending_updates=True)
+    LOG.info("Bot polling running — keeping alive")
+    await asyncio.Event().wait()  # Run forever
