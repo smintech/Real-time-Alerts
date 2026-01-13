@@ -10,7 +10,7 @@ from apify_client import ApifyClient
 from urllib.parse import urlparse
 import re
 from bs4 import BeautifulSoup
-from apify_client import ApifyApiError
+from apify_client.errors import ApifyApiError
 from Utils.config import SITE_ACTOR_MAP
 # Settings / thresholds (imported from your project)
 from bot.settings import (
