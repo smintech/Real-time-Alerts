@@ -9,4 +9,4 @@ celery
 redis
 python-dotenv
 pytz
-python-telegram-bot==21.0[webhooks,job-queue]
+python-telegram-bot[webhooks,job-queue]==21.0
