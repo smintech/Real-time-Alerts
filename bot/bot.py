@@ -499,42 +499,47 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
 
 async def run_bot():
     global application
+    
+    # 1. Build the application
     application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    # add handlers first
+    # 2. Add handlers
     for handler in get_application_handlers():
         application.add_handler(handler)
     application.add_error_handler(global_error_handler)
 
-    # Important: initialize before registering job_queue tasks so jobqueue can weakref the app
-    await application.initialize()
+    # 3. Register jobs BEFORE starting
+    # In v21.0, the JobQueue is accessible as soon as the app is built
+    if application.job_queue:
+        application.job_queue.run_repeating(
+            callback=check_all_watches,
+            interval=CHECK_INTERVAL_SECONDS,
+            first=30,
+            name="price_checker"
+        )
+        application.job_queue.run_repeating(
+            callback=check_and_post_channel_deals,
+            interval=CHECK_INTERVAL_SECONDS,
+            first=90,
+            name="channel_deals"
+        )
+        application.job_queue.run_repeating(
+            callback=check_trials,
+            interval=86400,
+            first=3600,
+            name="trial_checker"
+        )
 
-    # Now it's safe to register repeating jobs (max_instances works)
-    application.job_queue.run_repeating(
-        callback=check_all_watches,
-        interval=CHECK_INTERVAL_SECONDS,
-        first=30,
-        name="price_checker",
-        max_instances=2
-    )
-    application.job_queue.run_repeating(
-        callback=check_and_post_channel_deals,
-        interval=CHECK_INTERVAL_SECONDS,
-        first=90,
-        name="channel_deals",
-        max_instances=2
-    )
-    application.job_queue.run_repeating(
-        callback=check_trials,
-        interval=86400,
-        first=3600,
-        name="trial_checker"
-    )
-
-    # start the app and polling
-    await application.start()
-    await application.updater.start_polling(drop_pending_updates=True)
-
-    LOG.info("Bot polling running — keeping alive")
-    # keep running forever
-    await asyncio.Event().wait()  # Run forever
+    # 4. Use the context manager for a clean lifecycle
+    # This handles initialize(), start(), and shutdown() automatically
+    async with application:
+        await application.updater.start_polling(drop_pending_updates=True)
+        LOG.info("Bot is now polling...")
+        
+        # Keep the task alive
+        try:
+            while True:
+                await asyncio.sleep(3600)
+        except asyncio.CancelledError:
+            LOG.info("Bot task cancelled, shutting down...")
+            await application.updater.stop()  # Run forever
