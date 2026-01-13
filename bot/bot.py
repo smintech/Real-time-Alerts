@@ -32,7 +32,7 @@ from Utils.utils import (
     normalize_product_key,
     _get_domain_from_url,  # helper from utils (if present)
 )
-from bot.runner import (
+from bot.persistence import (
     load_last_snapshot,
     save_snapshot,
     load_channel_snapshot,
