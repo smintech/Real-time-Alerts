@@ -9,6 +9,8 @@ import asyncio
 from apify_client import ApifyClient
 from urllib.parse import urlparse
 import re
+from bs4 import BeautifulSoup
+from apify_client import ApifyApiError
 from Utils.config import SITE_ACTOR_MAP
 # Settings / thresholds (imported from your project)
 from bot.settings import (
@@ -80,12 +82,13 @@ def retry(max_attempts: int = 3, backoff: float = 1.5, allowed_exceptions: Tuple
 # ---------------------------
 # Core scraping function (Apify helper already present)
 # ---------------------------
+
 @retry(max_attempts=3, backoff=2, allowed_exceptions=(ApifyError, ConnectionError, TimeoutError, OSError))
 def _call_apify_actor_and_get_items(actor_id: str, run_input: Dict[str, Any]) -> list:
     """
-    Internal helper — runs an Apify actor and returns list of dataset items.
-    Retries on transient errors (network/Apify temporary errors).
-    Raises ApifyError on non-recoverable problems.
+    Run Apify actor and return dataset items.
+    - If actor not found -> raise ApifyError(..., retryable=False)
+    - Other Apify errors remain retryable
     """
     if client is None:
         raise ApifyError("Apify client not initialized (APIFY_TOKEN missing)", retryable=False)
@@ -94,14 +97,19 @@ def _call_apify_actor_and_get_items(actor_id: str, run_input: Dict[str, Any]) ->
         logger.info("Starting Apify actor %s with input keys: %s", actor_id, list(run_input.keys()))
         run = client.actor(actor_id).call(run_input=run_input)
     except Exception as e:
-        # Apify client throws generic exceptions for many issues; consider these transient
-        logger.exception("Apify actor call failed")
-        raise ApifyError(f"Apify actor call failed: {e}", retryable=True)
+        # Detect Apify "actor not found" and avoid retries for that case
+        err_msg = str(e)
+        logger.exception("Apify actor call failed for %s: %s", actor_id, err_msg)
+        # common Apify message: "Actor with this name was not found"
+        if "Actor with this name was not found" in err_msg or "Actor with id" in err_msg or "Not Found" in err_msg:
+            # do not retry: configuration error (actor name wrong/removed)
+            raise ApifyError(f"Apify actor not found: {actor_id}", retryable=False)
+        # otherwise treat as transient
+        raise ApifyError(f"Apify actor call failed: {err_msg}", retryable=True)
 
     # Validate run result
     dataset_id = run.get("defaultDatasetId") or run.get("defaultDataset", {}).get("id")
     if not dataset_id:
-        # Some actors may return dataset id under different keys — defensive
         logger.error("Apify actor returned no dataset id in run result: %s", run)
         raise ApifyError("Apify actor run did not provide a dataset id", retryable=False)
 
@@ -114,7 +122,6 @@ def _call_apify_actor_and_get_items(actor_id: str, run_input: Dict[str, Any]) ->
 
     items = dataset_items.get("items") if isinstance(dataset_items, dict) else getattr(dataset_items, "items", None)
     if items is None:
-        # Some Apify client versions return a list directly
         if isinstance(dataset_items, list):
             items = dataset_items
         else:
@@ -181,19 +188,113 @@ def normalize_product_key(scrape_result: Dict[str, Any]) -> str:
 # ---------------------------
 # Adapters
 # ---------------------------
+def scrape_ordinary_website(url: str, timeout: int = 12) -> Dict[str, Any]:
+    """
+    Best-effort fallback scraper for ordinary websites (Shopify, WooCommerce, static HTML).
+    Returns normalized dict in the same structure as Apify adapters — fields may be None.
+    """
+    try:
+        resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 (compatible)"})
+        if resp.status_code != 200:
+            raise NoDataError(f"HTTP {resp.status_code} for {url}")
+        html = resp.text
+    except Exception as e:
+        logger.exception("Ordinary site fetch failed for %s: %s", url, e)
+        raise NoDataError(f"Failed to fetch {url}: {e}")
+
+    try:
+        soup = BeautifulSoup(html, "lxml")
+    except Exception:
+        soup = BeautifulSoup(html, "html.parser")
+
+    # Title heuristics
+    title = None
+    h1 = soup.find("h1")
+    if h1 and h1.get_text(strip=True):
+        title = h1.get_text(strip=True)
+    if not title:
+        og = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "twitter:title"})
+        if og and og.get("content"):
+            title = og.get("content").strip()
+    if not title and soup.title:
+        title = soup.title.get_text(strip=True)
+
+    # Price heuristics: search for currency symbols and numeric patterns nearby
+    text = soup.get_text(" ")
+    price_candidates = []
+    # look for ₦, NGN, $ and numeric groups
+    for match in re.finditer(r"(?:₦|NGN|NGN\s|NGN\.|₦\s?)\s*[\d,]+(?:\.\d+)?|[$]\s*[\d,]+(?:\.\d+)?", text):
+        price_str = match.group(0)
+        price_candidates.append(price_str)
+
+    # fallback: look for common price selectors
+    if not price_candidates:
+        selectors = [
+            "[class*=price]", "[id*=price]", "[class*=amount]", "[id*=amount]",
+            ".product-price", ".price", ".selling-price"
+        ]
+        for sel in selectors:
+            el = soup.select_one(sel)
+            if el and el.get_text(strip=True):
+                price_candidates.append(el.get_text(" ", strip=True))
+
+    def _parse_price(s: str) -> Optional[float]:
+        if not s:
+            return None
+        # Remove currency tokens, non-digit except dot and comma
+        s = s.replace("NGN", "").replace("₦", "").replace("$", "")
+        s = re.sub(r"[^\d\.,]", "", s)
+        s = s.replace(",", "")
+        try:
+            return float(s)
+        except Exception:
+            return None
+
+    price_val = None
+    for pc in price_candidates:
+        parsed = _parse_price(pc)
+        if parsed is not None:
+            price_val = parsed
+            break
+
+    # stock heuristics
+    page_text = text.lower()
+    if "out of stock" in page_text or "sold out" in page_text:
+        stock = "out_of_stock"
+    elif "limited" in page_text or "only" in page_text and "left" in page_text:
+        stock = "limited"
+    else:
+        stock = "available"
+
+    return {
+        "title": title,
+        "current_price": price_val,
+        "previous_price": None,
+        "discount_percent": None,
+        "stock_status": stock,
+        "url": url,
+        "site": _get_domain_from_url(url),
+        "currency": "NGN",
+        "raw": {"html_snippet": (title or "")[:300]},
+    }
+
 def _apify_product_scrape_for_domain(domain: str, url: str) -> Dict[str, Any]:
     """
-    Use SITE_ACTOR_MAP to call appropriate Apify actor for domain.
+    Use SITE_ACTOR_MAP to call an Apify actor, but gracefully fallback
+    to scrape_ordinary_website if actor is missing or Apify returns a non-retryable error.
     """
     actor_id = SITE_ACTOR_MAP.get(domain)
     if not actor_id:
-        # try to find an actor by partial match
+        # try partial match
         for k, v in SITE_ACTOR_MAP.items():
             if k in domain and v:
                 actor_id = v
                 break
+
     if not actor_id:
-        raise NotImplementedError(f"No Apify actor configured for domain '{domain}'")
+        # No actor configured — fallback to ordinary scraper
+        logger.warning("No Apify actor mapped for %s — falling back to ordinary HTML scraper", domain)
+        return scrape_ordinary_website(url)
 
     run_input = {
         "scrape_type": "product",
@@ -202,7 +303,16 @@ def _apify_product_scrape_for_domain(domain: str, url: str) -> Dict[str, Any]:
         "image_resolution": "low",
     }
 
-    items = _call_apify_actor_and_get_items(actor_id, run_input)
+    try:
+        items = _call_apify_actor_and_get_items(actor_id, run_input)
+    except ApifyError as ae:
+        # If actor not found (retryable==False) or persistent Apify error -> fallback
+        logger.warning("ApifyError for actor %s: %s (retryable=%s) — using HTML fallback", actor_id, ae, getattr(ae, "retryable", None))
+        return scrape_ordinary_website(url)
+    except Exception as e:
+        logger.exception("Unexpected error when calling apify actor %s — falling back to HTML scraper", actor_id)
+        return scrape_ordinary_website(url)
+
     if not items:
         raise NoDataError(f"No data extracted for {url} (actor {actor_id})")
 
