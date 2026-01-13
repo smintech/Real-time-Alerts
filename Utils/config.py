@@ -9,5 +9,5 @@ DB_URL = os.getenv('DB_URL')
 REDIS_URL = os.getenv('REDIS_URL')
 ADMIN_IDS = [int(x.strip()) for x in os.getenv("ADMIN_IDS", "").split(",") if x.strip()]
 SITE_ACTOR_MAP = {
-    'jumia.com.ng': 'reverent_greeting/jumia-scraper-2-5-1k-all-in-one-task'
+    'jumia.com.ng': 'fatihtahta/jumia-scraper'
 }
