@@ -298,7 +298,7 @@ def _apify_product_scrape_for_domain(domain: str, url: str) -> Dict[str, Any]:
 
     run_input = {
         "scrape_type": "product",
-        "product_urls": [url],
+        "startUrls": [{"url": url} for url in product_urls],
         "get_reviews": False,
         "image_resolution": "low",
     }
