@@ -517,7 +517,6 @@ def run_bot():
         interval=CHECK_INTERVAL_SECONDS,
         first=90,
         name="channel_deals",
-        max_instances=2
     )
 
     application.job_queue.run_repeating(
