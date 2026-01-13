@@ -236,15 +236,31 @@ def _compute_user_stats() -> Dict[str, Any]:
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     
+    # Admin check - skip everything, straight to main menu
+    if user_id in ADMIN_IDS:
+        await update.message.reply_text(
+            "👋 Welcome back, Admin!\n\nFull access granted.",
+            reply_markup=build_main_menu(user_id)  # Admin button will be visible
+        )
+        # Optional: auto-assign highest tier or trial if not set
+        if user_id not in user_subscriptions:
+            user_subscriptions[user_id] = {
+                "tier": "business",  # or whatever max tier you want for admins
+                "paid": True,        # or False if you want trial
+                "trial_start": time.time()
+            }
+        return
+
+    # Normal user flow (onboarding) - unchanged
     if user_id in user_subscriptions:
         # Existing user → show main menu
         await update.message.reply_text(
-            "👋 Welcome back to Naija Price Alerts!\n\nWhat would you like to do?",
+            "👋 Welcome back!\n\nWhat would you like to do?",
             reply_markup=build_main_menu(user_id)
         )
         return
 
-    # New user → onboarding
+    # New non-admin user → show onboarding
     keyboard = [
         [InlineKeyboardButton("🛍️ Personal (myself/family)", callback_data="onboard_personal")],
         [InlineKeyboardButton("🏪 Merchant/Reseller", callback_data="onboard_merchant")],
@@ -252,7 +268,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ]
 
     await update.message.reply_text(
-        "👋 **Welcome to Naija Price Alerts!**\n\n"
+        "👋 **Welcome to Real Time Alerts!**\n\n"
         "To get started, please tell us who you are (this helps us give you the right limits and features):\n\n"
         "• **Personal** – track a few items for shopping\n"
         "• **Merchant** – monitor competitors & market prices\n"
