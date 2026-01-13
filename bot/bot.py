@@ -37,7 +37,7 @@ from bot.persistence import (
     save_snapshot,
     load_channel_snapshot,
     save_channel_snapshot,
-    ensure_channel_table_exists,
+    _db_ensure_table,
     delete_expired_channel_snapshots,
 )
 from Utils.format import format_telegram_alert, _safe_currency
