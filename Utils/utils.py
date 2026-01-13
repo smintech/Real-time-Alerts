@@ -296,9 +296,10 @@ def _apify_product_scrape_for_domain(domain: str, url: str) -> Dict[str, Any]:
         logger.warning("No Apify actor mapped for %s — falling back to ordinary HTML scraper", domain)
         return scrape_ordinary_website(url)
 
+    # FIXED: Use single URL (no undefined 'product_urls')
     run_input = {
         "scrape_type": "product",
-        "startUrls": [{"url": url} for url in product_urls],
+        "startUrls": [{"url": url}],  # ← Correct: single URL in expected format
         "get_reviews": False,
         "image_resolution": "low",
     }
