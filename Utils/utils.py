@@ -297,46 +297,43 @@ def _apify_product_scrape_for_domain(domain: str, url: str) -> Dict[str, Any]:
         return scrape_ordinary_website(url)
 
     # FIXED: Use single URL (no undefined 'product_urls')
-    run_input = {
-        "scrape_type": "product",
-        "startUrls": [{"url": url}],  # ← Correct: single URL in expected format
-        "get_reviews": False,
-        "image_resolution": "low",
+run_input = {
+        "startUrls": [url],  # The actor expects a list of strings
+        "proxyConfiguration": {"useApifyProxy": True},
+        "limit": 1
     }
 
     try:
         items = _call_apify_actor_and_get_items(actor_id, run_input)
-    except ApifyError as ae:
-        # If actor not found (retryable==False) or persistent Apify error -> fallback
-        logger.warning("ApifyError for actor %s: %s (retryable=%s) — using HTML fallback", actor_id, ae, getattr(ae, "retryable", None))
-        return scrape_ordinary_website(url)
     except Exception as e:
-        logger.exception("Unexpected error when calling apify actor %s — falling back to HTML scraper", actor_id)
+        logger.error(f"Apify failed, falling back to HTML: {e}")
         return scrape_ordinary_website(url)
 
     if not items:
-        raise NoDataError(f"No data extracted for {url} (actor {actor_id})")
+        raise NoDataError(f"No data extracted for {url}")
 
+    # The actor returns a list. We take the first item.
     raw = items[0]
-    if not isinstance(raw, dict):
-        raise NoDataError(f"Dataset item for {url} is not a dict")
 
-    price_info = raw.get("price") or {}
-    current_price = price_info.get("price_ngn") or price_info.get("price") or raw.get("price") or None
-    previous_price = price_info.get("old_price_ngn") or price_info.get("old_price") or None
-
-    stock_status = "available" if current_price is not None else "out_of_stock"
-    title = raw.get("name") or raw.get("title") or raw.get("product_name") or None
-
+    # --- MAPPING BASED ON YOUR PROVIDED JSON ---
+    # Note: priceNumeric is 2980, priceText is "N 2,980"
+    current_price = raw.get("priceNumeric")
+    previous_price = raw.get("oldPriceNumeric")
+    
+    # Discount in your log is "85%" (represented as "858" in your text, likely a copy-paste quirk)
+    discount = raw.get("discountText")
+    
+    title = raw.get("title")
+    
     return {
         "title": title,
         "current_price": current_price,
         "previous_price": previous_price,
-        "discount_percent": price_info.get("discount"),
-        "stock_status": stock_status,
+        "discount_percent": discount,
+        "stock_status": "available", # If it appears in search results, it's usually in stock
         "url": url,
         "site": domain,
-        "currency": price_info.get("currency") or "NGN",
+        "currency": "NGN",
         "raw": raw,
     }
 
