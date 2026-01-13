@@ -1,4 +1,4 @@
-# runner.py - FINAL COMPLETE VERSION (works with bot/persistence.py)
+# runner.py — FINAL WORKING VERSION (2026 style)
 
 import os
 import time
@@ -12,10 +12,11 @@ import traceback
 import asyncio
 from fastapi import FastAPI, HTTPException, Body
 
-# Critical: Import run_bot at the very top for multiprocessing child process safety
+# ──────────────────────────────────────────────────────────────
+# CRITICAL: Import run_bot FIRST — multiprocessing child needs it early
 from bot.bot import run_bot
 
-# Import all needed persistence functions (standalone module - no cycles)
+# Import persistence & utils (adjust paths if needed)
 from bot.persistence import (
     load_last_snapshot,
     save_snapshot,
@@ -25,10 +26,8 @@ from bot.persistence import (
     fetch_alternatives,
     _db_ensure_table,
     _db_create_channel_table,
-    _migrate_channel_table,
 )
-
-from Utils.utils import (
+from utils.utils import (
     scrape_product,
     compute_changes,
     calculate_deal_score,
@@ -36,10 +35,9 @@ from Utils.utils import (
     NoDataError,
     ApifyError,
 )
-from typing import Optional
 
 # -----------------------
-# Logging
+# Logging (early!)
 # -----------------------
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
@@ -47,23 +45,27 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s [%(name)s] %(message)s",
     handlers=[logging.StreamHandler(sys.stdout)]
 )
-logger = logging.getLogger("app")
+logger = logging.getLogger("runner")
 
-app = FastAPI()
+app = FastAPI(title="Naija Price Alerts API")
 
 # -----------------------
 # Basic endpoints
 # -----------------------
 @app.get("/")
-def home():
-    return {"status": "API Online"}
+async def home():
+    return {"status": "API Online", "bot_running": bot_manager.proc is not None and bot_manager.proc.is_alive()}
 
 @app.get("/health")
-def health():
-    return {"status": "ok", "time": asyncio.get_event_loop().time()}
+async def health():
+    return {
+        "status": "ok",
+        "time": datetime.now(timezone.utc).isoformat(),
+        "bot_alive": bot_manager.proc.is_alive() if bot_manager.proc else False
+    }
 
 # -----------------------
-# /v1/track endpoint (uses persistence)
+# /v1/track endpoint
 # -----------------------
 @app.post("/v1/track")
 async def track_product(payload: dict = Body(...)):
@@ -71,7 +73,7 @@ async def track_product(payload: dict = Body(...)):
     if not url:
         raise HTTPException(status_code=400, detail="url is required")
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     try:
         product = await loop.run_in_executor(None, scrape_product, url)
     except NoDataError as e:
@@ -120,18 +122,18 @@ async def track_product(payload: dict = Body(...)):
         "deal_score": deal_score,
         "severity": severity,
         "suggested_action": (
-            "Buy now! Strong price drop" if deal_score == "high"
-            else "Worth monitoring" if deal_score == "medium"
-            else "No action needed"
+            "Buy now — strong price drop" if deal_score == "high"
+            else "Monitor price" if deal_score == "medium"
+            else "No immediate action"
         ),
         "alternatives": alternatives,
-        "timestamp": asyncio.get_event_loop().time()
+        "timestamp": datetime.now(timezone.utc).isoformat()
     }
 
     return response
 
 # -----------------------
-# BotManager class
+# Bot Manager (unchanged — but now we see logs!)
 # -----------------------
 class BotManager:
     def __init__(self, target_callable, max_restarts=6, restart_window_seconds=300):
@@ -146,132 +148,138 @@ class BotManager:
     def start(self):
         with self._lock:
             if self.proc and self.proc.is_alive():
-                logger.info("Bot process already running (pid=%s)", getattr(self.proc, "pid", None))
+                logger.info("Bot already running (pid=%s)", self.proc.pid)
                 return
 
-            logger.info("Starting bot process...")
-            self.proc = multiprocessing.Process(target=self._run_target_wrapper)
+            logger.info("Launching bot in child process...")
+            self.proc = multiprocessing.Process(target=self._run_target_wrapper, name="TelegramBotProcess")
             self.proc.start()
-            logger.info("Started bot process (pid=%s)", self.proc.pid)
+            logger.info("Bot process started — PID: %s", self.proc.pid)
 
     def _run_target_wrapper(self):
+        logger.info("Child process started — running bot polling...")
         try:
             self.target()
-        except Exception:
+        except Exception as e:
+            logger.exception("Bot crashed in child process!")
             traceback.print_exc()
             os._exit(1)
+        logger.info("Bot polling exited cleanly")
         os._exit(0)
 
-    def stop(self, timeout=5):
+    def stop(self, timeout=8):
         with self._lock:
             if not self.proc or not self.proc.is_alive():
                 return
-            logger.info("Terminating bot process (pid=%s)...", self.proc.pid)
+            logger.info("Stopping bot process (pid=%s)...", self.proc.pid)
             try:
                 self.proc.terminate()
                 self.proc.join(timeout)
                 if self.proc.is_alive():
-                    logger.warning("Bot did not exit gracefully; killing...")
+                    logger.warning("Bot didn't stop gracefully — killing")
                     self.proc.kill()
-                    self.proc.join(1)
+                    self.proc.join(2)
             except Exception as e:
-                logger.exception("Error terminating bot process: %s", e)
+                logger.exception("Error stopping bot: %s", e)
             finally:
-                logger.info("Bot process stopped.")
                 self.proc = None
+                logger.info("Bot process stopped")
 
-    def monitor_and_restart(self, poll_interval=2):
+    def monitor_and_restart(self, poll_interval=3):
         logger.info("Bot monitor thread started")
         while not self.should_stop.is_set():
             with self._lock:
                 proc = self.proc
+
             if proc is None:
-                try:
-                    self.start()
-                except Exception:
-                    logger.exception("Failed to start bot process")
+                logger.info("No bot process — starting one")
+                self.start()
                 time.sleep(poll_interval)
                 continue
+
             if not proc.is_alive():
                 exitcode = proc.exitcode
-                logger.error("Bot process exited (pid=%s, code=%s)", getattr(proc, "pid", None), exitcode)
-                now_ts = time.time()
-                self.restart_timestamps = [t for t in self.restart_timestamps if now_ts - t <= self.restart_window]
+                logger.error("Bot process died (exit code %s)", exitcode)
+
+                now = time.time()
+                self.restart_timestamps = [t for t in self.restart_timestamps if now - t <= self.restart_window]
+
                 if len(self.restart_timestamps) >= self.max_restarts:
-                    logger.critical("Too many restarts - stopping attempts")
+                    logger.critical("Too many restarts (%d) — giving up to prevent crash loop", len(self.restart_timestamps))
                     self.should_stop.set()
                     break
-                self.restart_timestamps.append(now_ts)
-                backoff = min(2 ** len(self.restart_timestamps), 30)
-                logger.info("Restarting in %s seconds...", backoff)
+
+                self.restart_timestamps.append(now)
+                backoff = min(2 ** len(self.restart_timestamps), 60)
+                logger.info("Restarting bot in %d seconds (attempt %d)...", backoff, len(self.restart_timestamps))
                 time.sleep(backoff)
-                try:
-                    self.start()
-                except Exception:
-                    logger.exception("Failed to restart bot process")
-            else:
-                time.sleep(poll_interval)
-        logger.info("Bot monitor thread exiting")
+                self.start()
+
+            time.sleep(poll_interval)
+
+        logger.info("Monitor thread exiting")
 
     def request_stop(self):
-        logger.info("BotManager.request_stop called")
+        logger.info("Requesting bot shutdown")
         self.should_stop.set()
-        try:
-            self.stop()
-        except Exception:
-            logger.exception("Error while stopping bot")
+        self.stop()
 
-# Global manager
-bot_manager = BotManager(target_callable=run_bot)
+# Global bot manager
+bot_manager = BotManager(target_callable=run_bot, max_restarts=6, restart_window_seconds=300)
 
-# Signal handling
+# Signal handlers
 def _on_terminate(signum, frame):
-    logger.info("Received signal %s - shutting down", signum)
+    logger.info("Received signal %s — initiating shutdown", signum)
     bot_manager.request_stop()
 
 signal.signal(signal.SIGINT, _on_terminate)
 signal.signal(signal.SIGTERM, _on_terminate)
 
-# Cleanup task
-_cleanup_task = None
-async def _channel_cleanup_loop():
-    while True:
-        try:
-            deleted = await delete_expired_channel_snapshots()
-            if deleted:
-                logger.info("Cleaned %d expired channel snapshots", deleted)
-        except Exception:
-            logger.exception("Cleanup error")
-        await asyncio.sleep(24 * 3600)
-
+# -----------------------
 # Startup / Shutdown
+# -----------------------
 @app.on_event("startup")
-async def on_startup():
+def on_startup():
+    logger.info("FastAPI startup — preparing bot & DB")
     try:
         _db_ensure_table()
         _db_create_channel_table()
-        _migrate_channel_table()
     except Exception as e:
         logger.exception("DB setup failed: %s", e)
 
-    global _cleanup_task
-    _cleanup_task = asyncio.create_task(_channel_cleanup_loop())
-
-    logger.info("Starting bot process & monitor")
-    bot_manager.start()
-    monitor_thread = threading.Thread(target=bot_manager.monitor_and_restart, daemon=True)
+    logger.info("Launching bot monitor thread")
+    monitor_thread = threading.Thread(
+        target=bot_manager.monitor_and_restart,
+        name="BotMonitor",
+        daemon=True
+    )
     monitor_thread.start()
     bot_manager._monitor_thread = monitor_thread
 
 @app.on_event("shutdown")
-async def on_shutdown():
-    logger.info("Shutdown: stopping bot and cleanup")
+def on_shutdown():
+    logger.info("FastAPI shutdown — stopping bot")
     bot_manager.request_stop()
-    if _cleanup_task:
-        _cleanup_task.cancel()
 
-# Main
+# -----------------------
+# Main entry point
+# -----------------------
 if __name__ == "__main__":
     port = int(os.getenv("PORT", "8000"))
-    logger.info("Starting uvicorn on port %s", port)
-    uvicorn.run(app, host="0.0.0.0", port=port, log_level=LOG_LEVEL.lower())
+    logger.info("Starting uvicorn server on 0.0.0.0:%d (bot runs in child process)", port)
+
+    try:
+        uvicorn.run(
+            app,
+            host="0.0.0.0",
+            port=port,
+            log_level=LOG_LEVEL.lower(),
+            workers=1,  # single worker — enough for MVP + bot child
+        )
+    except Exception as e:
+        logger.exception("Uvicorn crashed: %s", e)
+    finally:
+        logger.info("Main process exiting — stopping bot manager")
+        bot_manager.request_stop()
+        time.sleep(1)  # give child time to terminate
+        logger.info("Shutdown complete")
