@@ -320,124 +320,154 @@ async def check_all_watches(context: ContextTypes.DEFAULT_TYPE):
             LOG.exception("Unexpected error processing watches for user=%s", user_id)
             # can't continue for this user — move to next
 
-
-async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE, force: bool = False):
+async def check_and_post_channel_deals(context, force: bool = False):
     """
-    Channel posting job with professional message formatting and deal scoring.
+    Monitors monitored URLs, groups them by product, and posts significant deals.
+    Features:
+    - Crypto vs E-commerce logic separation.
+    - 24h/4h Cooldowns with 'Significant Drop' overrides.
+    - Professional visual formatting.
     """
     start_time = time.time()
     LOG.info("--- CHANNEL DEALS JOB STARTED ---")
 
-    # 1. Configuration & Force Mode Check
+    # 1. Initialization & Force Mode Check
     env_force = os.getenv("FORCE_CHANNEL_POSTS", "").lower() in ("1", "true", "yes")
     force_mode = force or env_force
     
-    if not AUTO_POST_TO_CHANNEL or not CHANNEL_DEAL_CHAT_ID or not CHANNEL_MONITORED_URLS:
+    if not AUTO_POST_TO_CHANNEL or not CHANNEL_DEAL_CHAT_ID:
         LOG.info("Channel posting disabled or missing config. Skipping.")
         return
 
-    if force_mode:
-        LOG.warning("⚠️ FORCE MODE ENABLED: Bypassing deduplication and price-drop thresholds.")
-
-    loop = asyncio.get_event_loop()
+    # 2. Scrape & Group (Consolidate multiple links for the same product)
     grouped: Dict[str, list] = {}
-
-    # 2. Scrape and Group Products
-    for ref in CHANNEL_MONITORED_URLS:
+    for url in CHANNEL_MONITORED_URLS:
         try:
-            data = await loop.run_in_executor(None, scrape_product, ref)
-            cur_price = float(data.get("current_price", 0))
-            if not cur_price: continue
-
-            data["current_price"] = cur_price
-            data["url"] = data.get("url") or ref
-            data["site"] = data.get("site") or "Store"
+            # Note: scrape_product handles Jumia, Konga, and Binance
+            data = scrape_product(url) 
+            if not data or data.get("current_price") is None:
+                continue
             
             key = normalize_product_key(data)
-            grouped.setdefault(key, []).append({"ref": ref, "data": data, "price": cur_price})
-            
+            grouped.setdefault(key, []).append({"url": url, "data": data})
         except Exception as e:
-            LOG.error(f"Failed to scrape {ref}: {e}")
-            continue
+            LOG.warning(f"Scrape failed for {url}: {e}")
 
-    # 3. Process Groups and Post
+    # 3. Process Product Groups
     posted_count = 0
-    today_str = datetime.now(timezone.utc).date().isoformat()
+    now = datetime.now(timezone.utc)
 
     for product_key, entries in grouped.items():
-        if posted_count >= (MAX_CHANNEL_POSTS_PER_RUN or 10): break
+        if posted_count >= (MAX_CHANNEL_POSTS_PER_RUN or 10):
+            break
 
-        # Calculate Price Analytics
-        best_entry = min(entries, key=lambda e: e["price"])
-        best_price = best_entry["price"]
+        # A. Determine Best Price in Group
+        best_entry = min(entries, key=lambda x: x["data"]["current_price"])
+        best_price = best_entry["data"]["current_price"]
         best_site = best_entry["data"]["site"]
+        is_crypto = "binance" in best_site.lower()
         
-        # Consolidate prices for comparison
-        site_prices = {e["data"]["site"]: e["price"] for e in entries}
-
-        # Load Snapshots for Comparison
+        # B. Load Snapshots & History
         old_prices = []
-        already_posted_today = False
+        last_posted_at = None
+        
         for e in entries:
-            snap = await load_channel_snapshot(e["ref"])
+            snap = await load_channel_snapshot(e["url"])
             if snap:
-                if snap.get("current_price"): old_prices.append(snap["current_price"])
-                if (snap.get("last_posted_at") or "").startswith(today_str):
-                    already_posted_today = True
+                if snap.get("current_price"):
+                    old_prices.append(snap["current_price"])
+                if snap.get("last_posted_at"):
+                    posted_dt = datetime.fromisoformat(snap["last_posted_at"])
+                    if not last_posted_at or posted_dt > last_posted_at:
+                        last_posted_at = posted_dt
 
         highest_old = max(old_prices or [0.0])
-        drop_pct = round(((highest_old - best_price) / highest_old) * 100, 1) if highest_old > 0 else 0.0
-        savings = highest_old - best_price
         is_new = highest_old <= 0
-
-        # 4. Gating Logic
-        if not force_mode:
-            if is_new:
-                pass # Always allow new products
-            elif already_posted_today or drop_pct < (MIN_DROP_PERCENT_FOR_CHANNEL or 3.0) or savings < (MIN_SAVINGS_FOR_CHANNEL or 5000):
-                # Save snapshots anyway to track current price
-                for e in entries: await save_channel_snapshot(e["ref"], e["data"])
-                continue
-
-        # 5. Build Professional Message
-        title = (best_entry['data'].get('title') or 'Discounted Product').strip().upper()
         
-        if is_new:
-            header = "🆕 *NEW DEAL DISCOVERED*"
-            sub_header = f"💰 *Initial Price:* {_safe_currency(best_price)}"
-        else:
-            header = f"🔥 *PRICE DROP ALERT ({drop_pct}% OFF)*"
-            sub_header = f"✅ *Now:* {_safe_currency(best_price)}  (Saved {_safe_currency(savings)})"
+        # Calculate changes relative to history
+        drop_pct = round(((highest_old - best_price) / highest_old) * 100, 2) if not is_new else 0.0
+        savings = highest_old - best_price
 
-        # Constructing the cross-site comparison table
-        price_table = ""
-        for site, price in sorted(site_prices.items(), key=lambda x: x[1]):
-            check = "✅" if price == best_price else "🔹"
-            price_table += f"{check} *{site}:* {_safe_currency(price)}\n"
+        # C. Bulletproof Gating Logic
+        if not force_mode:
+            # 1. Cooldown Calculation
+            cooldown_period = timedelta(hours=4 if is_crypto else 24)
+            # Use 99 days for new items to ensure they always pass the cooldown check
+            time_since_last_post = (now - last_posted_at) if last_posted_at else timedelta(days=99)
+            in_cooldown = time_since_last_post < cooldown_period
+
+            if is_crypto:
+                # CRYPTO: Alert on significant volatility (Up or Down)
+                CRYPTO_THRESHOLD = 5.0 
+                if abs(drop_pct) < CRYPTO_THRESHOLD and not is_new:
+                    continue
+                # Crypto usually skips cooldown if the change is significant
+            
+            elif in_cooldown:
+                # E-COMMERCE COOLDOWN OVERRIDE: 
+                # Only post during cooldown if price dropped ANOTHER 5% beyond last post
+                EXTRA_DROP_THRESHOLD = 5.0 
+                if drop_pct >= EXTRA_DROP_THRESHOLD:
+                    LOG.info(f"🔥 OVERRIDE: {product_key} hit an extra {drop_pct}% drop.")
+                else:
+                    continue # Still in cooldown, change not big enough
+            
+            else:
+                # STANDARD E-COMMERCE GATING
+                if not is_new:
+                    if drop_pct < (MIN_DROP_PERCENT_FOR_CHANNEL or 3.0): continue
+                    if savings < (MIN_SAVINGS_FOR_CHANNEL or 5000): continue
+                if drop_pct <= 0 and not is_new: # Ignore price hikes
+                    continue
+
+        # D. Construct Professional Message
+        title = best_entry["data"].get("title", "Product").strip().upper()
+        
+        if is_crypto:
+            direction = "🚀 PUMPING" if drop_pct < 0 else "📉 DUMPING"
+            header = f"📊 **CRYPTO ALERT: {direction}**"
+            price_line = f"💰 **Price:** `{_safe_currency(best_price)}`"
+            stat_line = f"📈 **Change:** `{abs(drop_pct)}%`"
+        else:
+            header = "🆕 **NEW DEAL SPOTTED**" if is_new else f"🔥 **PRICE DROP: {drop_pct}% OFF**"
+            price_line = f"💰 **Now:** `{_safe_currency(best_price)}`"
+            stat_line = f"📉 **Saved:** `{_safe_currency(savings)}`" if not is_new else "✨ *First time on radar*"
+
+        # Comparison Table (Only for multi-link E-commerce)
+        comparison = ""
+        if not is_crypto and len(entries) > 1:
+            comparison = "\n🏪 **Price Comparison:**\n"
+            for e in sorted(entries, key=lambda x: x["data"]["current_price"]):
+                check = "✅" if e["data"]["current_price"] == best_price else "🔹"
+                comparison += f"{check} {e['data']['site']}: {_safe_currency(e['data']['current_price'])}\n"
 
         msg = (
             f"{header}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"📦 **{title}**\n\n"
-            f"{sub_header}\n\n"
-            f"🏪 **Compare Prices:**\n"
-            f"{price_table}\n"
-            f"🔗 **Direct Link:** [Click here to buy]({best_entry['data']['url']})\n"
+            f"{price_line}\n"
+            f"{stat_line}\n"
+            f"{comparison}"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"⏱ _Prices monitored live. Don't miss out!_\n"
-            f"📢 _Get custom alerts:_ @YourBotUsername"
+            f"🔗 [View on {best_site}]({best_entry['url']})\n"
+            f"📢 *Personal Alerts:* @YourBotUsername"
         )
 
-        # 6. Send and Update Snapshots
-        success = await safe_send(context.bot, CHANNEL_DEAL_CHAT_ID, msg, parse_mode="Markdown", disable_web_page_preview=False)
+        # E. Execution & Snapshot Update
+        # Handle list of channel IDs (supports multiple channels)
+        targets = CHANNEL_DEAL_CHAT_ID if isinstance(CHANNEL_DEAL_CHAT_ID, list) else [CHANNEL_DEAL_CHAT_ID]
         
-        if success:
-            now_iso = datetime.now(timezone.utc).isoformat()
+        send_results = await safe_send(context.bot, targets, msg, parse_mode="Markdown", disable_web_page_preview=False)
+        
+        # If successfully sent to at least one target, update the database
+        if any(res[1] for res in send_results):
+            now_iso = now.isoformat()
             for e in entries:
-                await save_channel_snapshot(e["ref"], {**e["data"], "last_posted_at": now_iso})
+                # Update snapshot with current price and new 'last posted' timestamp
+                await save_channel_snapshot(e["url"], {**e["data"], "last_posted_at": now_iso})
             posted_count += 1
 
-    LOG.info(f"--- JOB FINISHED: Posted {posted_count} deals in {time.time() - start_time:.1f}s ---")
+    LOG.info(f"--- JOB FINISHED: {posted_count} deals posted in {time.time()-start_time:.1f}s ---")
 
 async def check_trials(context: ContextTypes.DEFAULT_TYPE):
     """Validate trials and downgrade users whose trial expired."""
