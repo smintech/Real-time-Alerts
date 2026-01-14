@@ -52,16 +52,24 @@ async def safe_send(bot, chat_id: int | list[int], text: str, **kwargs):
     """
     Enhanced Safe message sender.
     If chat_id is a list, it iterates through and sends to all.
+    Logs full exception info and returns per-target send result.
     """
-    # Convert single int to list for uniform processing
-    targets = chat_id if isinstance(chat_id, list) else [chat_id]
-    
+    results = []
+    targets = chat_id if isinstance(chat_id, (list, tuple)) else [chat_id]
+
     for target in targets:
         try:
             await bot.send_message(chat_id=target, text=text, **kwargs)
-            LOG.info("Successfully sent message to %s", target)
+            LOG.info("safe_send: message sent to %s", target)
+            results.append((target, True, None))
         except Exception as exc:
-            LOG.error("Failed sending to %s: %s", target, exc)
+            # Log details — Telegram exceptions often contain .message or .response
+            try:
+                LOG.exception("safe_send: failed sending to %s: %s", target, exc)
+            except Exception:
+                LOG.error("safe_send: failed to log exception for %s", target)
+            results.append((target, False, str(exc)))
+    return results
 
 
 async def handle_watch_failure(context: ContextTypes.DEFAULT_TYPE, user_id: int, watch: dict, exc=None, reason=None):
