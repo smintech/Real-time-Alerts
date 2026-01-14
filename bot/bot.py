@@ -5,7 +5,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Dict, Any
 import nest_asyncio
 from telegram.ext import Application, ContextTypes
-
+import os
 from Utils.config import TELEGRAM_TOKEN, DB_URL
 from bot.commands import get_application_handlers, user_watches, user_settings, user_subscriptions
 from bot.settings import (
@@ -321,16 +321,20 @@ async def check_all_watches(context: ContextTypes.DEFAULT_TYPE):
             # can't continue for this user — move to next
 
 
-async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
+async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE, force: bool = False):
     """
-    Fixed version:
-    - ALWAYS use the best_entry (cheapest) for BOTH title and buy URL → no more mismatches
-    - Improved logging for product_key, titles, and URLs during grouping/posting
-    - New products now consistently show the cheapest variant's title + direct link
-    - Normal drops also fixed to use best_entry title
+    Channel posting job with optional force mode.
+    - If `force` is True OR env FORCE_CHANNEL_POSTS is truthy, dedupe & threshold checks are bypassed.
+    - Intended for temporary testing; remove force or unset env after testing.
     """
     start_time = time.time()
     LOG.info("channel_deals job STARTED at %s", datetime.now())
+
+    # Global force switch from env
+    env_force = os.getenv("FORCE_CHANNEL_POSTS", "").lower() in ("1", "true", "yes")
+    force_mode = force or env_force
+    if force_mode:
+        LOG.warning("channel_deals: FORCE MODE ENABLED — will post regardless of dedupe/threshold checks")
 
     if not AUTO_POST_TO_CHANNEL or not CHANNEL_DEAL_CHAT_ID or not CHANNEL_MONITORED_URLS:
         LOG.info("Channel posting disabled or no URLs configured — skipping job")
@@ -355,6 +359,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
         try:
             cur = float(cur)
         except Exception:
+            LOG.warning("Invalid price for %s — skipping", ref)
             continue
 
         data["current_price"] = cur
@@ -368,8 +373,6 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             key = f"UNK::{data['site']}::{int(cur)}"
 
         grouped.setdefault(key, []).append({"ref": ref, "data": data, "price": cur})
-
-        # Debug log per scrape
         LOG.info("Scraped key=%s title='%s' price=₦%.0f url=%s", key, data.get("title", "Unknown"), cur, data["url"])
 
     # 2) Process groups
@@ -454,41 +457,47 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             continue
 
         # === CASE 2: EXISTING PRODUCT – drop detection ===
-        drop_pct = round(((highest_old - best_price) / highest_old) * 100, 1)
+        drop_pct = round(((highest_old - best_price) / highest_old) * 100, 1) if highest_old > 0 else 0.0
         savings = highest_old - best_price
 
-        if drop_pct <= 0:
-            for e in entries:
-                await save_channel_snapshot(e["ref"], e["data"])
-            continue
+        # If force mode enabled, bypass the checks below
+        if not force_mode:
+            if drop_pct <= 0:
+                for e in entries:
+                    await save_channel_snapshot(e["ref"], e["data"])
+                continue
 
-        if drop_pct < (MIN_DROP_PERCENT_FOR_CHANNEL or 3.0):
-            for e in entries:
-                await save_channel_snapshot(e["ref"], e["data"])
-            continue
+            if drop_pct < (MIN_DROP_PERCENT_FOR_CHANNEL or 3.0):
+                for e in entries:
+                    await save_channel_snapshot(e["ref"], e["data"])
+                continue
 
-        if savings < (MIN_SAVINGS_FOR_CHANNEL or 5000):
-            for e in entries:
-                await save_channel_snapshot(e["ref"], e["data"])
-            continue
+            if savings < (MIN_SAVINGS_FOR_CHANNEL or 5000):
+                for e in entries:
+                    await save_channel_snapshot(e["ref"], e["data"])
+                continue
 
-        score = calculate_deal_score(drop_pct)
-        if score not in ("high", "medium", "low"):
-            for e in entries:
-                await save_channel_snapshot(e["ref"], e["data"])
-            continue
+            score = calculate_deal_score(drop_pct)
+            if score not in ("high", "medium", "low"):
+                for e in entries:
+                    await save_channel_snapshot(e["ref"], e["data"])
+                continue
 
-        if any_posted_today:
-            for e in entries:
-                await save_channel_snapshot(e["ref"], e["data"])
-            continue
+            if any_posted_today:
+                LOG.info("Already posted today for product_key=%s — skipping", product_key)
+                for e in entries:
+                    await save_channel_snapshot(e["ref"], e["data"])
+                continue
+        else:
+            # force mode: compute score for logging only (not gating)
+            score = calculate_deal_score(drop_pct)
 
-        LOG.info("PRICE DROP group key=%s — posting with title='%s' url=%s price=₦%.0f drop=%.1f%%",
-                 product_key, best_entry["data"].get("title"), best_entry["data"]["url"], best_price, drop_pct)
+        LOG.info("POSTING (force_mode=%s) group key=%s — title='%s' url=%s price=₦%.0f drop=%.1f%% score=%s",
+                 force_mode, product_key, best_entry["data"].get("title"), best_entry["data"].get("url"), best_price, drop_pct, score)
 
         lines = [
             f"🔥 *{(best_entry['data'].get('title') or 'Great Deal').strip()}* — BEST PRICE: {_safe_currency(best_price)} on *{best_site}*",
-            f"📉 Drop: *{drop_pct}%* • Saved: *{_safe_currency(savings)}* ({score.upper()} deal)",
+            f"📉 Drop: *{drop_pct}%* • Saved: *{_safe_currency(savings)}* ({(score or 'N/A').upper()} deal)",
             "",
             "💱 Prices across sites:",
         ]
@@ -522,7 +531,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
 
     end_time = time.time()
     duration = end_time - start_time
-    LOG.info("channel_deals job FINISHED — posted %d deals in %.1f seconds", posted_count, duration)
+    LOG.info("channel_deals job FINISHED in %.1f seconds (%.1f min)", duration, duration/60)
 
 async def check_trials(context: ContextTypes.DEFAULT_TYPE):
     """Validate trials and downgrade users whose trial expired."""
