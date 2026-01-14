@@ -35,13 +35,10 @@ CHANNEL_DEAL_CHAT_ID = [int(x.strip()) for x in os.getenv("CHANNEL", "").split("
 
 # Channel monitoring settings
 CHANNEL_MONITORED_URLS = [
-    # Flagship Phones
-    "https://www.jumia.com.ng/hp-elitebook-840-g6-intel-core-i5-16gb-ram512gb-ssdbacklit-keyboardfp-reader-wins-11-pro-laptopbag-393059791.html",
-    "https://www.jumia.com.ng/hp-elitebook-840-g6-intel-core-i5-8gb-ram512gb-ssdbacklit-keyboardfp-reader-wins-11-laptop-bag-332628501.html",
-    "https://www.jumia.com.ng/hp-elitebook-840-g6-touchscreen-intel-core-i5-16gb-ram512gb-ssd-backlit-keyboardwindows11-probag-202178413.html",
-    # Add 10–20 more specific product URLs (not catalogs)
-    # iPhone examples:
-    "https://www.jumia.com.ng/apple-iphone-15-pro-max-256gb-apple-mpg.html",
+    "https://www.jumia.com.ng/apple-iphone-15-pro-max-256gb-blue-apple-mpg-245790923.html",
+    "https://www.jumia.com.ng/apple-iphone-15-pro-128gb-silver-apple-mpg-245790901.html",
+    "https://www.jumia.com.ng/apple-iphone-14-pro-max-256gb-space-black-apple-mpg-234567890.html",
+    "https://www.jumia.com.ng/apple-iphone-14-pro-128gb-gold-apple-mpg-234567891.html",
 ]
 
 MIN_DROP_PERCENT_FOR_CHANNEL = 0.1 #5.0   # % price drop
