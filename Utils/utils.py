@@ -188,152 +188,201 @@ def normalize_product_key(scrape_result: Dict[str, Any]) -> str:
 # ---------------------------
 # Adapters
 # ---------------------------
-def scrape_ordinary_website(url: str, timeout: int = 12) -> Dict[str, Any]:
+def scrape_ordinary_website(url: str, timeout: int = 15) -> Dict[str, Any]:
     """
-    Best-effort fallback scraper for ordinary websites (Shopify, WooCommerce, static HTML).
-    Returns normalized dict in the same structure as Apify adapters — fields may be None.
+    Robust fallback scraper with specific support for Jumia HTML structure.
     """
+    domain = _get_domain_from_url(url)
+    
+    # 1. Use Real Browser Headers to avoid immediate 403 blocks
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://www.google.com/",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
+    }
+
     try:
-        resp = requests.get(url, timeout=timeout, headers={"User-Agent": "Mozilla/5.0 (compatible)"})
+        # Use a Session for better connection handling
+        session = requests.Session()
+        resp = session.get(url, headers=headers, timeout=timeout)
+        
+        # Check for non-200 or blocking
+        if resp.status_code in [403, 503]:
+            # This is the most common reason for failure on Render
+            raise NoDataError(f"Access Denied (Anti-Bot Block) HTTP {resp.status_code} for {url}")
+        
         if resp.status_code != 200:
             raise NoDataError(f"HTTP {resp.status_code} for {url}")
+            
         html = resp.text
+        
     except Exception as e:
-        logger.exception("Ordinary site fetch failed for %s: %s", url, e)
-        raise NoDataError(f"Failed to fetch {url}: {e}")
+        logger.error(f"Ordinary site fetch failed for {url}: {e}")
+        raise NoDataError(f"Connection failed: {e}")
 
+    # 2. Parse HTML
     try:
         soup = BeautifulSoup(html, "lxml")
     except Exception:
         soup = BeautifulSoup(html, "html.parser")
 
-    # Title heuristics
+    # --- BLOCK DETECTION ---
+    title_text = soup.title.get_text().lower() if soup.title else ""
+    if "just a moment" in title_text or "verify" in title_text or "challenge" in title_text:
+        raise NoDataError(f"Request was challenged by Cloudflare/Anti-Bot: {url}")
+
+    # --- TITLE EXTRACTION ---
     title = None
+    # Jumia specific: Title is often in h1.-fs20 or similar
     h1 = soup.find("h1")
-    if h1 and h1.get_text(strip=True):
+    if h1:
         title = h1.get_text(strip=True)
+    
     if not title:
-        og = soup.find("meta", property="og:title") or soup.find("meta", attrs={"name": "twitter:title"})
-        if og and og.get("content"):
-            title = og.get("content").strip()
-    if not title and soup.title:
-        title = soup.title.get_text(strip=True)
+        # Fallback to meta tags
+        og_title = soup.find("meta", property="og:title")
+        if og_title:
+            title = og_title.get("content")
 
-    # Price heuristics: search for currency symbols and numeric patterns nearby
-    text = soup.get_text(" ")
-    price_candidates = []
-    # look for ₦, NGN, $ and numeric groups
-    for match in re.finditer(r"(?:₦|NGN|NGN\s|NGN\.|₦\s?)\s*[\d,]+(?:\.\d+)?|[$]\s*[\d,]+(?:\.\d+)?", text):
-        price_str = match.group(0)
-        price_candidates.append(price_str)
+    # --- PRICE EXTRACTION (Jumia Focused) ---
+    current_price = None
+    
+    # STRATEGY A: Jumia Specific Classes (Look for bold text usually containing currency)
+    # Jumia often puts price in a span with class "-b" inside a div
+    # Example: <div class="df ..."><span class="-b -ltr -tal -fs24">₦ 2,980</span></div>
+    if "jumia" in domain:
+        # Try finding the specific price container class often used by Jumia
+        # Note: These class names like '-fs24' might change, but '-b' (bold) is sticky
+        price_spans = soup.select("span.-b") 
+        for span in price_spans:
+            text = span.get_text(strip=True)
+            if "₦" in text or "NGN" in text:
+                # Clean and parse
+                clean_text = re.sub(r"[^\d.]", "", text.replace(",", ""))
+                if clean_text:
+                    try:
+                        current_price = float(clean_text)
+                        break # Found it
+                    except ValueError:
+                        continue
+    
+    # STRATEGY B: Generic Regex Fallback (if Jumia strategy failed)
+    if current_price is None:
+        text_blob = soup.get_text(" ")
+        # Regex to find NGN 1,200 or ₦ 1,200
+        # Matches: "₦ 2,980", "₦2,980", "NGN 2980"
+        match = re.search(r"(?:₦|NGN)\s?([\d,]+(?:\.\d{2})?)", text_blob)
+        if match:
+            clean_text = match.group(1).replace(",", "")
+            try:
+                current_price = float(clean_text)
+            except ValueError:
+                pass
 
-    # fallback: look for common price selectors
-    if not price_candidates:
-        selectors = [
-            "[class*=price]", "[id*=price]", "[class*=amount]", "[id*=amount]",
-            ".product-price", ".price", ".selling-price"
-        ]
-        for sel in selectors:
-            el = soup.select_one(sel)
-            if el and el.get_text(strip=True):
-                price_candidates.append(el.get_text(" ", strip=True))
-
-    def _parse_price(s: str) -> Optional[float]:
-        if not s:
-            return None
-        # Remove currency tokens, non-digit except dot and comma
-        s = s.replace("NGN", "").replace("₦", "").replace("$", "")
-        s = re.sub(r"[^\d\.,]", "", s)
-        s = s.replace(",", "")
-        try:
-            return float(s)
-        except Exception:
-            return None
-
-    price_val = None
-    for pc in price_candidates:
-        parsed = _parse_price(pc)
-        if parsed is not None:
-            price_val = parsed
-            break
-
-    # stock heuristics
-    page_text = text.lower()
-    if "out of stock" in page_text or "sold out" in page_text:
+    # --- STOCK STATUS ---
+    # Jumia usually puts "Out of Stock" in a button or warning message
+    stock = "available"
+    page_text_lower = soup.get_text().lower()
+    if "out of stock" in page_text_lower or "sold out" in page_text_lower:
         stock = "out_of_stock"
-    elif "limited" in page_text or "only" in page_text and "left" in page_text:
-        stock = "limited"
-    else:
-        stock = "available"
+    elif "currently unavailable" in page_text_lower:
+        stock = "out_of_stock"
 
+    # Validate result
+    if current_price is None:
+        # If we have HTML but no price, dumping a small snippet to logs helps debug
+        logger.warning(f"HTML fetched but no price found for {url}. Title: {title}")
+        # Return what we have, even if price is None (bot can handle None)
+    
     return {
         "title": title,
-        "current_price": price_val,
+        "current_price": current_price,
         "previous_price": None,
         "discount_percent": None,
         "stock_status": stock,
         "url": url,
-        "site": _get_domain_from_url(url),
+        "site": domain,
         "currency": "NGN",
-        "raw": {"html_snippet": (title or "")[:300]},
+        "raw": {"snippet": title},
     }
 
 def _apify_product_scrape_for_domain(domain: str, url: str) -> Dict[str, Any]:
     """
-    Use SITE_ACTOR_MAP to call an Apify actor, but gracefully fallback
-    to scrape_ordinary_website if actor is missing or Apify returns a non-retryable error.
+    Robust handling for Jumia actor output:
+    - Accepts list of strings for startUrls (fixes "No start URLs" error)
+    - Handles multi-item results (search/listing pages) by selecting lowest price
+    - Normalizes fields from your actor output (priceNumeric, oldPriceNumeric, etc.)
+    - Graceful fallback to HTML scraper
     """
     actor_id = SITE_ACTOR_MAP.get(domain)
     if not actor_id:
-        # try partial match
         for k, v in SITE_ACTOR_MAP.items():
             if k in domain and v:
                 actor_id = v
                 break
 
     if not actor_id:
-        # No actor configured — fallback to ordinary scraper
-        logger.warning("No Apify actor mapped for %s — falling back to ordinary HTML scraper", domain)
+        logger.warning("No Apify actor mapped for %s — falling back to ordinary scraper", domain)
         return scrape_ordinary_website(url)
 
-    # FIXED: Use single URL (no undefined 'product_urls')
-run_input = {
-        "startUrls": [url],  # The actor expects a list of strings
-        "proxyConfiguration": {"useApifyProxy": True},
-        "limit": 1
+    # Correct input format for fatihtahta/jumia-scraper and similar
+    run_input = {
+        "startUrls": [url],          # ← List of strings – fixes the actor error
+        "maxListings": 50,           # Optional: limit results
+        "get_reviews": False,
+        "image_resolution": "low",
     }
 
     try:
         items = _call_apify_actor_and_get_items(actor_id, run_input)
+    except ApifyError as ae:
+        logger.warning("ApifyError for actor %s: %s — using HTML fallback", actor_id, ae)
+        return scrape_ordinary_website(url)
     except Exception as e:
-        logger.error(f"Apify failed, falling back to HTML: {e}")
+        logger.exception("Unexpected Apify call error for %s — fallback", url)
         return scrape_ordinary_website(url)
 
     if not items:
-        raise NoDataError(f"No data extracted for {url}")
+        raise NoDataError(f"No data extracted for {url} (actor {actor_id})")
 
-    # The actor returns a list. We take the first item.
-    raw = items[0]
+    logger.info("Actor returned %d items for %s", len(items), url)
 
-    # --- MAPPING BASED ON YOUR PROVIDED JSON ---
-    # Note: priceNumeric is 2980, priceText is "N 2,980"
-    current_price = raw.get("priceNumeric")
-    previous_price = raw.get("oldPriceNumeric")
-    
-    # Discount in your log is "85%" (represented as "858" in your text, likely a copy-paste quirk)
-    discount = raw.get("discountText")
-    
-    title = raw.get("title")
-    
+    # HANDLE MULTI-ITEM RESULTS (your actor output shows search page with many products)
+    valid_items = [
+        it for it in items
+        if it.get("priceNumeric") is not None or it.get("price_ngn") is not None
+    ]
+
+    if not valid_items:
+        raise NoDataError(f"No priced items found on {url}")
+
+    # Select the cheapest product (best deal for channel)
+    best_item = min(
+        valid_items,
+        key=lambda x: float(x.get("priceNumeric") or x.get("price_ngn") or float("inf"))
+    )
+
+    raw = best_item
+
+    # Normalize from your exact actor fields
+    current_price = raw.get("priceNumeric") or raw.get("price_ngn")
+    previous_price = raw.get("oldPriceNumeric") or raw.get("old_price_ngn")
+    discount = raw.get("discountText") or raw.get("discount")
+
+    title = raw.get("title") or raw.get("name") or "Product"
+
     return {
-        "title": title,
-        "current_price": current_price,
-        "previous_price": previous_price,
+        "title": title.strip(),
+        "current_price": float(current_price) if current_price is not None else None,
+        "previous_price": float(previous_price) if previous_price is not None else None,
         "discount_percent": discount,
-        "stock_status": "available", # If it appears in search results, it's usually in stock
-        "url": url,
+        "stock_status": "available",  # Actor doesn't flag OOS reliably
+        "url": url,  # Original search URL – or use raw.get("url") for specific product link if available
         "site": domain,
-        "currency": "NGN",
+        "currency": "NGN",  # Hardcode – actor sometimes mangles it ("时")
         "raw": raw,
     }
 
