@@ -279,7 +279,18 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
                             break
                         except:
                             pass
-
+# Add this below the Jumia block
+    if "konga" in domain and product["current_price"] is None:
+        # Konga often uses these classes for price
+        selectors = ["span._3e_22_199e7", "._3e_22_199e7", "h4._44738_3988u"]
+        for sel in selectors:
+            el = soup.select_one(sel)
+            if el:
+                text = el.get_text(strip=True)
+                clean = re.sub(r"[^\d]", "", text)
+                if clean:
+                    product["current_price"] = float(clean)
+                    break
     # 4. Generic regex fallback
     if product["current_price"] is None:
         page_text = soup.get_text(separator=" ")
