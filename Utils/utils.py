@@ -1,5 +1,6 @@
 # Utils/utils.py - Fully updated scraper (Apify completely removed, cloudscraper-based, bulletproof for JS-heavy sites)
-
+from telegram.error import TelegramError  # For safe_send
+from telegram import Bot  # Type hint for safe_send
 import os
 import time
 import logging
@@ -23,6 +24,30 @@ class ScrapeError(Exception):
 
 class NoDataError(ScrapeError):
     """Raised when page loaded but no usable product data found."""
+
+# ---------------------------
+# safe_send (brought back as requested)
+# ---------------------------
+async def safe_send(bot: Bot, targets: int | List[int], text: str, **kwargs) -> List[Tuple[int, bool, Optional[str]]]:
+    """
+    Sends a message to one or more chat_ids safely.
+    Returns a list of (target, success_bool, error_message).
+    """
+    if not isinstance(targets, list):
+        targets = [targets]
+    
+    results = []
+    for target in targets:
+        try:
+            await bot.send_message(chat_id=target, text=text, **kwargs)
+            results.append((target, True, None))
+        except TelegramError as e:
+            LOG.error(f"Failed to send to {target}: {e}")
+            results.append((target, False, str(e)))
+        except Exception as e:
+            LOG.exception(f"Unexpected error sending to {target}")
+            results.append((target, False, str(e)))
+    return results
 
 
 # ---------------------------
