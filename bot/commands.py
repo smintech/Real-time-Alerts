@@ -19,7 +19,7 @@ from bot.settings import (
     CHANNEL_DEAL_CHAT_ID,
 )
 from Utils.config import ADMIN_IDS
-from Utils.utils import scrape_product
+from Utils.utils import scrape_product,safe_send
 
 # -------------------------
 # In-memory stores (MVP – replace with DB soon)
