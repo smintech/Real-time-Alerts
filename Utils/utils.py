@@ -1,6 +1,8 @@
 import os
 import time
 import logging
+from telegram.error import TelegramError
+import logging
 from typing import Dict, Optional, Any, Tuple, Callable
 from functools import wraps
 import requests
@@ -22,6 +24,7 @@ from bot.settings import (
 )
 
 # Initialize logger
+LOG = logging.getLogger(__name__)
 logger = logging.getLogger("apify_scraper")
 logger.setLevel(logging.INFO)
 if not logger.handlers:
@@ -39,6 +42,28 @@ client = ApifyClient(APIFY_TOKEN) if APIFY_TOKEN else None
 # ---------------------------
 # Custom Exceptions
 # ---------------------------
+
+async def safe_send(bot, targets, text, **kwargs):
+    """
+    Sends a message to one or more chat_ids.
+    Returns a list of (target, success_bool, error_message).
+    """
+    if not isinstance(targets, list):
+        targets = [targets]
+    
+    results = []
+    for target in targets:
+        try:
+            await bot.send_message(chat_id=target, text=text, **kwargs)
+            results.append((target, True, None))
+        except TelegramError as e:
+            LOG.error(f"Failed to send to {target}: {e}")
+            results.append((target, False, str(e)))
+        except Exception as e:
+            LOG.exception(f"Unexpected error sending to {target}")
+            results.append((target, False, str(e)))
+    return results
+
 class ScrapeError(Exception):
     """Generic scraping failure (non-retryable)."""
 
