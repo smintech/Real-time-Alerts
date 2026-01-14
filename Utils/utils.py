@@ -331,7 +331,7 @@ def _apify_product_scrape_for_domain(domain: str, url: str) -> Dict[str, Any]:
     # Correct input format for fatihtahta/jumia-scraper and similar
     run_input = {
         "startUrls": [url],          # ← List of strings – fixes the actor error
-        "maxListings": 50,           # Optional: limit results
+        "maxListings": 10,           # Optional: limit results
         "get_reviews": False,
         "image_resolution": "low",
     }
