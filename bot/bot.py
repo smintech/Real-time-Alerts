@@ -323,11 +323,11 @@ async def check_all_watches(context: ContextTypes.DEFAULT_TYPE):
 
 async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
     """
-    Unified channel posting – now uses persistent channel snapshots (Redis + DB fallback).
-    - Price history persists across restarts.
-    - Daily deduplication persists across restarts (via last_posted_at in Redis payload).
-    - NEW: First-time seen products are posted as "new deals" (crucial for channel visibility).
-    - Reduced complexity in threshold logic for easier testing/debugging.
+    Fixed version:
+    - ALWAYS use the best_entry (cheapest) for BOTH title and buy URL → no more mismatches
+    - Improved logging for product_key, titles, and URLs during grouping/posting
+    - New products now consistently show the cheapest variant's title + direct link
+    - Normal drops also fixed to use best_entry title
     """
     start_time = time.time()
     LOG.info("channel_deals job STARTED at %s", datetime.now())
@@ -369,11 +369,16 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
 
         grouped.setdefault(key, []).append({"ref": ref, "data": data, "price": cur})
 
+        # Debug log per scrape
+        LOG.info("Scraped key=%s title='%s' price=₦%.0f url=%s", key, data.get("title", "Unknown"), cur, data["url"])
+
     # 2) Process groups
     posted_count = 0
-    today_str = datetime.now(timezone.utc).date().isoformat()  # 'YYYY-MM-DD'
+    today_str = datetime.now(timezone.utc).date().isoformat()
 
     for product_key, entries in grouped.items():
+        LOG.info("Processing group key=%s with %d entries", product_key, len(entries))
+
         if posted_count >= (MAX_CHANNEL_POSTS_PER_RUN or 10):
             LOG.info("Reached max posts per run (%d) — stopping", posted_count)
             break
@@ -387,7 +392,10 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
         best_price = min(site_prices.values())
         best_site = min(site_prices, key=site_prices.get)
 
-        # Load previous snapshots to get old prices + check if posted today
+        # Find the actual best entry (cheapest overall)
+        best_entry = min(entries, key=lambda e: e["price"])
+
+        # Load previous snapshots
         old_prices = []
         any_posted_today = False
 
@@ -404,14 +412,14 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
 
         highest_old = max(old_prices or [0.0])
 
-        # === CASE 1: NEW PRODUCT (first time seen) ===
+        # === CASE 1: NEW PRODUCT ===
         if highest_old <= 0:
-            LOG.info("NEW PRODUCT detected (%s) — posting introductory deal", product_key)
+            LOG.info("NEW PRODUCT group key=%s — posting with title='%s' url=%s price=₦%.0f",
+                     product_key, best_entry["data"].get("title"), best_entry["data"]["url"], best_price)
 
-            prod_title = entries[0]["data"].get("title") or "Amazing Deal"
             lines = [
                 f"🆕 *NEW DEAL SPOTTED!*",
-                f"* {prod_title} *",
+                f"*{(best_entry['data'].get('title') or 'Amazing Product').strip()}*",
                 f"💰 Best price: {_safe_currency(best_price)} on *{best_site}*",
                 "",
                 "💱 Prices across sites:",
@@ -419,7 +427,6 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             for site, price in sorted(site_prices.items(), key=lambda kv: kv[1]):
                 lines.append(f"- *{site}*: {_safe_currency(price)}")
 
-            best_entry = next((e for e in entries if e["data"]["site"] == best_site), entries[0])
             lines += [
                 "",
                 f"🛒 Buy now: {best_entry['data'].get('url')}",
@@ -438,38 +445,35 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True
             )
 
-            # Save snapshots with last_posted_at to prevent repost today
             now_iso = datetime.now(timezone.utc).isoformat()
             for e in entries:
                 posted_data = {**e["data"], "last_posted_at": now_iso}
                 await save_channel_snapshot(e["ref"], posted_data)
 
             posted_count += 1
-            continue  # skip normal drop logic
+            continue
 
-        # === CASE 2: EXISTING PRODUCT – normal drop detection ===
+        # === CASE 2: EXISTING PRODUCT – drop detection ===
         drop_pct = round(((highest_old - best_price) / highest_old) * 100, 1)
         savings = highest_old - best_price
 
         if drop_pct <= 0:
-            # No drop — just update snapshots
             for e in entries:
                 await save_channel_snapshot(e["ref"], e["data"])
             continue
 
-        # Simplified threshold for testing (easier to trigger posts)
-        if drop_pct < (MIN_DROP_PERCENT_FOR_CHANNEL or 3.0):  # lowered from 5.0 for testing
+        if drop_pct < (MIN_DROP_PERCENT_FOR_CHANNEL or 3.0):
             for e in entries:
                 await save_channel_snapshot(e["ref"], e["data"])
             continue
 
-        if savings < (MIN_SAVINGS_FOR_CHANNEL or 5000):  # lowered for testing
+        if savings < (MIN_SAVINGS_FOR_CHANNEL or 5000):
             for e in entries:
                 await save_channel_snapshot(e["ref"], e["data"])
             continue
 
         score = calculate_deal_score(drop_pct)
-        if score not in ("high", "medium", "low"):  # allow "low" for testing
+        if score not in ("high", "medium", "low"):
             for e in entries:
                 await save_channel_snapshot(e["ref"], e["data"])
             continue
@@ -479,18 +483,18 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                 await save_channel_snapshot(e["ref"], e["data"])
             continue
 
-        # === POST NORMAL DEAL ===
-        prod_title = entries[0]["data"].get("title") or product_key
+        LOG.info("PRICE DROP group key=%s — posting with title='%s' url=%s price=₦%.0f drop=%.1f%%",
+                 product_key, best_entry["data"].get("title"), best_entry["data"]["url"], best_price, drop_pct)
+
         lines = [
-            f"🔥 *{prod_title}* — BEST PRICE: {_safe_currency(best_price)} on *{best_site}*",
+            f"🔥 *{(best_entry['data'].get('title') or 'Great Deal').strip()}* — BEST PRICE: {_safe_currency(best_price)} on *{best_site}*",
             f"📉 Drop: *{drop_pct}%* • Saved: *{_safe_currency(savings)}* ({score.upper()} deal)",
             "",
-            "💱 Prices across monitored sites:",
+            "💱 Prices across sites:",
         ]
         for site, price in sorted(site_prices.items(), key=lambda kv: kv[1]):
             lines.append(f"- *{site}*: {_safe_currency(price)}")
 
-        best_entry = next((e for e in entries if e["data"]["site"] == best_site), entries[0])
         lines += [
             "",
             f"🛒 Buy: {best_entry['data'].get('url')}",
@@ -509,7 +513,6 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             disable_web_page_preview=True
         )
 
-        # Save with last_posted_at
         now_iso = datetime.now(timezone.utc).isoformat()
         for e in entries:
             posted_data = {**e["data"], "last_posted_at": now_iso}
@@ -517,7 +520,6 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
 
         posted_count += 1
 
-    # Log job completion (moved outside loop)
     end_time = time.time()
     duration = end_time - start_time
     LOG.info("channel_deals job FINISHED — posted %d deals in %.1f seconds", posted_count, duration)
