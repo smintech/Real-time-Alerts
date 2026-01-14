@@ -16,6 +16,7 @@ from bot.settings import (
     CATEGORIES,
     PAID_TIERS,
     MIN_CHANGE_TO_ALERT,
+    CHANNEL_DEAL_CHAT_ID,
 )
 from Utils.config import ADMIN_IDS
 from Utils.utils import scrape_product
@@ -92,6 +93,45 @@ def parse_add_args(args: List[str]) -> tuple[str, Optional[int], str]:
             direction = last_arg
 
     return url, target_price, direction
+
+async def test_channel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+
+    if not CHANNEL_DEAL_CHAT_ID:
+        await context.bot.send_message(
+            chat_id=user_id,
+            text="❌ CHANNEL_DEAL_CHAT_ID is empty. Check your CHANNEL env variable."
+        )
+        return
+
+    # Build test message
+    msg = (
+        "🧪 *Channel Test Message*\n\n"
+        "If you see this in the channel, posting works.\n"
+        f"Timestamp: `{context.job_queue.scheduler.timezone}`"
+    )
+
+    results = await safe_send(
+        context.bot,
+        CHANNEL_DEAL_CHAT_ID,
+        msg,
+        parse_mode="Markdown",
+        disable_web_page_preview=True
+    )
+
+    # Report back to user
+    lines = ["📡 *Channel Test Results:*"]
+    for target, ok, err in results:
+        if ok:
+            lines.append(f"✅ Sent successfully to `{target}`")
+        else:
+            lines.append(f"❌ Failed to send to `{target}`\nReason: `{err}`")
+
+    await context.bot.send_message(
+        chat_id=user_id,
+        text="\n".join(lines),
+        parse_mode="Markdown"
+    )
 
 
 def get_user_max_watches(user_id: int) -> int:
@@ -798,6 +838,7 @@ async def process_add_url(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 def get_application_handlers():
     return [
+        CommandHandler("testchannel", test_channel),
         CommandHandler("start", start),
         CommandHandler("add", add_watch),
         CommandHandler("list", list_watches),
