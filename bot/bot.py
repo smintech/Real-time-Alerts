@@ -48,12 +48,20 @@ LOG = logging.getLogger(__name__)
 application: Application | None = None  # global if needed elsewhere
 nest_asyncio.apply()
 
-async def safe_send(bot, chat_id: int, text: str, **kwargs):
-    """Safe message sender — logs but never raises."""
-    try:
-        await bot.send_message(chat_id=chat_id, text=text, **kwargs)
-    except Exception as exc:
-        LOG.exception("Failed sending to %s: %s", chat_id, exc)
+async def safe_send(bot, chat_id: int | list[int], text: str, **kwargs):
+    """
+    Enhanced Safe message sender.
+    If chat_id is a list, it iterates through and sends to all.
+    """
+    # Convert single int to list for uniform processing
+    targets = chat_id if isinstance(chat_id, list) else [chat_id]
+    
+    for target in targets:
+        try:
+            await bot.send_message(chat_id=target, text=text, **kwargs)
+            LOG.info("Successfully sent message to %s", target)
+        except Exception as exc:
+            LOG.error("Failed sending to %s: %s", target, exc)
 
 
 async def handle_watch_failure(context: ContextTypes.DEFAULT_TYPE, user_id: int, watch: dict, exc=None, reason=None):
@@ -383,9 +391,9 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
 
         # First-time seen → seed and skip alert
         if highest_old <= 0:
-            for e in entries:
-                await save_channel_snapshot(e["ref"], e["data"])
-            continue
+            highest_old = best_price + 20000
+            LOG.info("New product detected, forcing a test post for %s", product_key)
+            await save_channel_snapshot(e["ref"], e["data"])
 
         drop_pct = round(((highest_old - best_price) / highest_old) * 100, 1)
         savings = highest_old - best_price
