@@ -11,3 +11,4 @@ python-dotenv
 pytz
 python-telegram-bot[webhooks,job-queue]==21.0
 nest-asyncio
+cloudscraper
