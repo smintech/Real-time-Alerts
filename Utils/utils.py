@@ -13,9 +13,15 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 import cloudscraper
 from requests.exceptions import RequestException
-
+from typing import Dict, Optional, Any, Tuple, Callable, List
 # Settings / thresholds
-from bot.settings import SUPPORTED_SITES, MIN_CHANGE_TO_ALERT
+from bot.settings import (
+    SUPPORTED_SITES,
+    MIN_CHANGE_TO_ALERT,
+    HIGH_DEAL_THRESHOLD,
+    MEDIUM_DEAL_THRESHOLD,
+    LOW_DEAL_THRESHOLD,
+)
 
 LOG = logging.getLogger(__name__)
 
