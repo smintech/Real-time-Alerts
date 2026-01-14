@@ -320,21 +320,39 @@ async def check_all_watches(context: ContextTypes.DEFAULT_TYPE):
             LOG.exception("Unexpected error processing watches for user=%s", user_id)
             # can't continue for this user — move to next
 
-async def check_and_post_channel_deals(context, force: bool = False):
+async def check_and_post_channel_deals(context, force: bool = False, send_delay_seconds: int | None = None):
     """
     Monitors monitored URLs, groups them by product, and posts significant deals.
-    Features:
-    - Crypto vs E-commerce logic separation.
-    - 24h/4h Cooldowns with 'Significant Drop' overrides.
-    - Professional visual formatting.
+    Added: async sleep between posted messages (non-blocking), configurable via param or env.
+    - force: bypasses gating logic (as before)
+    - send_delay_seconds: seconds to wait AFTER each posted message (default: env CHANNEL_SEND_DELAY_SECONDS or 60)
     """
     start_time = time.time()
     LOG.info("--- CHANNEL DEALS JOB STARTED ---")
 
+    # 0. Resolve delay setting (param > env > default 60s)
+    env_delay = os.getenv("CHANNEL_SEND_DELAY_SECONDS")
+    if send_delay_seconds is None:
+        try:
+            send_delay_seconds = int(env_delay) if env_delay is not None and env_delay != "" else 60
+        except Exception:
+            send_delay_seconds = 60
+
+    # Ensure non-negative integer
+    try:
+        send_delay_seconds = max(0, int(send_delay_seconds))
+    except Exception:
+        send_delay_seconds = 60
+
+    LOG.info("Channel send delay set to %ds", send_delay_seconds)
+
     # 1. Initialization & Force Mode Check
     env_force = os.getenv("FORCE_CHANNEL_POSTS", "").lower() in ("1", "true", "yes")
     force_mode = force or env_force
-    
+
+    if force_mode:
+        LOG.warning("channel_deals: FORCE MODE ENABLED — posting regardless of dedupe/threshold checks")
+
     if not AUTO_POST_TO_CHANNEL or not CHANNEL_DEAL_CHAT_ID:
         LOG.info("Channel posting disabled or missing config. Skipping.")
         return
@@ -343,15 +361,17 @@ async def check_and_post_channel_deals(context, force: bool = False):
     grouped: Dict[str, list] = {}
     for url in CHANNEL_MONITORED_URLS:
         try:
-            # Note: scrape_product handles Jumia, Konga, and Binance
-            data = scrape_product(url) 
+            # Use executor to avoid blocking if scrape_product is blocking
+            loop = asyncio.get_event_loop()
+            data = await loop.run_in_executor(None, scrape_product, url)
             if not data or data.get("current_price") is None:
+                LOG.debug("No data/price for %s — skipping", url)
                 continue
-            
+
             key = normalize_product_key(data)
             grouped.setdefault(key, []).append({"url": url, "data": data})
         except Exception as e:
-            LOG.warning(f"Scrape failed for {url}: {e}")
+            LOG.warning("Scrape failed for %s: %s", url, e)
 
     # 3. Process Product Groups
     posted_count = 0
@@ -359,113 +379,131 @@ async def check_and_post_channel_deals(context, force: bool = False):
 
     for product_key, entries in grouped.items():
         if posted_count >= (MAX_CHANNEL_POSTS_PER_RUN or 10):
+            LOG.info("Reached max posts per run (%d) — stopping", posted_count)
             break
 
         # A. Determine Best Price in Group
-        best_entry = min(entries, key=lambda x: x["data"]["current_price"])
-        best_price = best_entry["data"]["current_price"]
-        best_site = best_entry["data"]["site"]
-        is_crypto = "binance" in best_site.lower()
-        
+        # Normalize prices defensively
+        try:
+            best_entry = min(entries, key=lambda x: float(x["data"].get("current_price") or float("inf")))
+        except Exception:
+            LOG.warning("Could not determine best entry for %s — skipping", product_key)
+            continue
+
+        best_price = float(best_entry["data"]["current_price"] or 0.0)
+        best_site = best_entry["data"].get("site", "unknown")
+        is_crypto = "binance" in (best_site or "").lower()
+
         # B. Load Snapshots & History
         old_prices = []
         last_posted_at = None
-        
+
         for e in entries:
             snap = await load_channel_snapshot(e["url"])
             if snap:
                 if snap.get("current_price"):
-                    old_prices.append(snap["current_price"])
+                    try:
+                        old_prices.append(float(snap["current_price"]))
+                    except Exception:
+                        pass
                 if snap.get("last_posted_at"):
-                    posted_dt = datetime.fromisoformat(snap["last_posted_at"])
-                    if not last_posted_at or posted_dt > last_posted_at:
-                        last_posted_at = posted_dt
+                    try:
+                        posted_dt = datetime.fromisoformat(snap["last_posted_at"])
+                        if not last_posted_at or posted_dt > last_posted_at:
+                            last_posted_at = posted_dt
+                    except Exception:
+                        pass
 
         highest_old = max(old_prices or [0.0])
         is_new = highest_old <= 0
-        
+
         # Calculate changes relative to history
-        drop_pct = round(((highest_old - best_price) / highest_old) * 100, 2) if not is_new else 0.0
+        drop_pct = round(((highest_old - best_price) / highest_old) * 100, 2) if not is_new and highest_old > 0 else 0.0
         savings = highest_old - best_price
 
-        # C. Bulletproof Gating Logic
+        # C. Bulletproof Gating Logic (honoring force_mode)
         if not force_mode:
-            # 1. Cooldown Calculation
             cooldown_period = timedelta(hours=4 if is_crypto else 24)
-            # Use 99 days for new items to ensure they always pass the cooldown check
             time_since_last_post = (now - last_posted_at) if last_posted_at else timedelta(days=99)
             in_cooldown = time_since_last_post < cooldown_period
 
             if is_crypto:
-                # CRYPTO: Alert on significant volatility (Up or Down)
-                CRYPTO_THRESHOLD = 5.0 
+                CRYPTO_THRESHOLD = 5.0
                 if abs(drop_pct) < CRYPTO_THRESHOLD and not is_new:
+                    LOG.debug("Crypto %s change %s%% below threshold %s%% — skipping", product_key, drop_pct, CRYPTO_THRESHOLD)
                     continue
-                # Crypto usually skips cooldown if the change is significant
-            
             elif in_cooldown:
-                # E-COMMERCE COOLDOWN OVERRIDE: 
-                # Only post during cooldown if price dropped ANOTHER 5% beyond last post
-                EXTRA_DROP_THRESHOLD = 5.0 
+                EXTRA_DROP_THRESHOLD = 5.0
                 if drop_pct >= EXTRA_DROP_THRESHOLD:
-                    LOG.info(f"🔥 OVERRIDE: {product_key} hit an extra {drop_pct}% drop.")
+                    LOG.info("OVERRIDE: %s hit extra drop %s%% inside cooldown — allowing post", product_key, drop_pct)
                 else:
-                    continue # Still in cooldown, change not big enough
-            
+                    LOG.debug("In cooldown for %s and no extra drop — skipping", product_key)
+                    continue
             else:
-                # STANDARD E-COMMERCE GATING
                 if not is_new:
-                    if drop_pct < (MIN_DROP_PERCENT_FOR_CHANNEL or 3.0): continue
-                    if savings < (MIN_SAVINGS_FOR_CHANNEL or 5000): continue
-                if drop_pct <= 0 and not is_new: # Ignore price hikes
+                    if drop_pct < (MIN_DROP_PERCENT_FOR_CHANNEL or 3.0):
+                        LOG.debug("%s drop %s%% below MIN_DROP_PERCENT_FOR_CHANNEL — skipping", product_key, drop_pct)
+                        continue
+                    if savings < (MIN_SAVINGS_FOR_CHANNEL or 5000):
+                        LOG.debug("%s savings %s below MIN_SAVINGS_FOR_CHANNEL — skipping", product_key, savings)
+                        continue
+                if drop_pct <= 0 and not is_new:
+                    LOG.debug("%s price increased or no drop — skipping", product_key)
                     continue
 
         # D. Construct Professional Message
-        title = best_entry["data"].get("title", "Product").strip().upper()
-        
+        title = (best_entry["data"].get("title") or "Product").strip()
+        title_display = title.upper() if not is_crypto else title
+
         if is_crypto:
             direction = "🚀 PUMPING" if drop_pct < 0 else "📉 DUMPING"
-            header = f"📊 **CRYPTO ALERT: {direction}**"
-            price_line = f"💰 **Price:** `{_safe_currency(best_price)}`"
-            stat_line = f"📈 **Change:** `{abs(drop_pct)}%`"
+            header = f"📊 CRYPTO ALERT: {direction}"
+            price_line = f"💰 Price: {_safe_currency(best_price)}"
+            stat_line = f"Change: {abs(drop_pct)}%"
         else:
-            header = "🆕 **NEW DEAL SPOTTED**" if is_new else f"🔥 **PRICE DROP: {drop_pct}% OFF**"
-            price_line = f"💰 **Now:** `{_safe_currency(best_price)}`"
-            stat_line = f"📉 **Saved:** `{_safe_currency(savings)}`" if not is_new else "✨ *First time on radar*"
+            header = "🆕 NEW DEAL SPOTTED" if is_new else f"🔥 PRICE DROP: {drop_pct}% OFF"
+            price_line = f"Now: {_safe_currency(best_price)}"
+            stat_line = f"Saved: {_safe_currency(savings)}" if not is_new else "First time on radar"
 
-        # Comparison Table (Only for multi-link E-commerce)
         comparison = ""
         if not is_crypto and len(entries) > 1:
-            comparison = "\n🏪 **Price Comparison:**\n"
-            for e in sorted(entries, key=lambda x: x["data"]["current_price"]):
-                check = "✅" if e["data"]["current_price"] == best_price else "🔹"
-                comparison += f"{check} {e['data']['site']}: {_safe_currency(e['data']['current_price'])}\n"
+            comparison = "\n🏪 Price Comparison:\n"
+            for e in sorted(entries, key=lambda x: float(x["data"].get("current_price") or float("inf"))):
+                check = "✅" if float(e["data"].get("current_price") or 0) == best_price else "🔹"
+                comparison += f"{check} {e['data'].get('site')}: {_safe_currency(e['data'].get('current_price'))}\n"
 
         msg = (
             f"{header}\n"
             f"━━━━━━━━━━━━━━━━━━\n"
-            f"📦 **{title}**\n\n"
+            f"📦 {title_display}\n\n"
             f"{price_line}\n"
             f"{stat_line}\n"
             f"{comparison}"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"🔗 [View on {best_site}]({best_entry['url']})\n"
-            f"📢 *Personal Alerts:* @YourBotUsername"
+            f"📢 Personal Alerts: @YourBotUsername"
         )
 
         # E. Execution & Snapshot Update
-        # Handle list of channel IDs (supports multiple channels)
         targets = CHANNEL_DEAL_CHAT_ID if isinstance(CHANNEL_DEAL_CHAT_ID, list) else [CHANNEL_DEAL_CHAT_ID]
-        
-        send_results = await safe_send(context.bot, targets, msg, parse_mode="Markdown", disable_web_page_preview=False)
-        
-        # If successfully sent to at least one target, update the database
+
+        try:
+            send_results = await safe_send(context.bot, targets, msg, parse_mode="Markdown", disable_web_page_preview=False)
+        except Exception as e:
+            LOG.exception("Failed to send message for %s: %s", product_key, e)
+            send_results = [(t, False, str(e)) for t in targets]
+
+        # If successfully sent to at least one target, update snapshots
         if any(res[1] for res in send_results):
             now_iso = now.isoformat()
             for e in entries:
-                # Update snapshot with current price and new 'last posted' timestamp
                 await save_channel_snapshot(e["url"], {**e["data"], "last_posted_at": now_iso})
             posted_count += 1
+
+            # If delay is configured, sleep AFTER a successful post
+            if send_delay_seconds and send_delay_seconds > 0:
+                LOG.info("Posted product_key=%s — sleeping %ds before next post (to avoid rate limits)", product_key, send_delay_seconds)
+                await asyncio.sleep(send_delay_seconds)
 
     LOG.info(f"--- JOB FINISHED: {posted_count} deals posted in {time.time()-start_time:.1f}s ---")
 
