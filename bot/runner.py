@@ -26,7 +26,6 @@ from Utils.utils import (
     calculate_deal_score,
     normalize_product_key,
     NoDataError,
-    ApifyError,
 )
 
 # -----------------------
