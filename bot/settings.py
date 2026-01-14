@@ -35,10 +35,8 @@ CHANNEL_DEAL_CHAT_ID = [int(x.strip()) for x in os.getenv("CHANNEL", "").split("
 
 # Channel monitoring settings
 CHANNEL_MONITORED_URLS = [
-    "https://www.jumia.com.ng/apple-iphone-15-pro-max-256gb-blue-apple-mpg-245790923.html",
-    "https://www.jumia.com.ng/apple-iphone-15-pro-128gb-silver-apple-mpg-245790901.html",
-    "https://www.jumia.com.ng/apple-iphone-14-pro-max-256gb-space-black-apple-mpg-234567890.html",
-    "https://www.jumia.com.ng/apple-iphone-14-pro-128gb-gold-apple-mpg-234567891.html",
+    "https://www.jumia.com.ng/iphone-15-pro-max-6.7-256gb-8gb-ram-single-sim-5g-white-titanium-apple-mpg11486148.html",
+    "https://www.jumia.com.ng/apple-iphone-15-pro-6.1-128gb-rom-8gb-ram-nano-sim-white-389800758.html",
 ]
 
 MIN_DROP_PERCENT_FOR_CHANNEL = 0.1 #5.0   # % price drop
