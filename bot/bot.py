@@ -326,6 +326,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
     - Detects 'Significant Change' by comparing current price to the last price posted.
     - Respects MAX_CHANNEL_POSTS_PER_RUN by prioritizing the longest-waiting deals.
     - Loops through CHANNEL_DEAL_CHAT_ID list to post to multiple targets.
+    - Adds per-site comparison (✅ BEST, ⚠️ May consider) and quotes the product description.
     """
     start_time = time.time()
     LOG.info("--- CHANNEL DEALS JOB STARTED ---")
@@ -355,13 +356,18 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             continue
 
         # --- PHASE 2: EVALUATE ELIGIBILITY & SIGNIFICANT CHANGE ---
-        best_entry = min(entries, key=lambda e: float(e["data"]["current_price"]))
+        try:
+            best_entry = min(entries, key=lambda e: float(e["data"]["current_price"]))
+        except Exception:
+            LOG.warning("Could not determine best price for group %s — skipping", group_key)
+            continue
+
         current_price = float(best_entry["data"]["current_price"])
-        
+
         # We need the last price we ACTUALLY POSTED to calculate "Significant Change"
         last_posted_price = None
         last_posted_at_dt = datetime.min.replace(tzinfo=timezone.utc)
-        
+
         for e in entries:
             snap = await load_channel_snapshot(e["url"])
             if snap and snap.get("last_posted_at"):
@@ -371,22 +377,23 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                         last_posted_at_dt = dt
                         # Extract the price we had when we last made a post
                         last_posted_price = float(snap.get("current_price") or current_price)
-                except: pass
+                except Exception:
+                    pass
 
         is_new = last_posted_price is None
         is_crypto = any("binance" in (e["data"].get("site", "").lower()) or "SYMBOL:" in e["url"] for e in entries)
-        
+
         # Logic for "Significant Change"
         # If item is new, it's significant. If not, check if price dropped by 3% vs last post.
         ref_price = last_posted_price if last_posted_price else current_price
         drop_pct = round(((ref_price - current_price) / ref_price) * 100, 1) if ref_price > current_price else 0.0
-        
+
         should_post = False
         if is_new:
             should_post = True
         elif is_crypto and abs(drop_pct) >= 1.0:
             should_post = True
-        elif drop_pct >= 3.0: # Significant 3% drop
+        elif drop_pct >= 3.0:  # Significant 3% drop
             should_post = True
             LOG.info("Significant drop for %s: %.1f%% lower than last post", group_key, drop_pct)
 
@@ -395,14 +402,14 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                 "group_key": group_key,
                 "best_entry": best_entry,
                 "entries": entries,
-                "last_posted_at": last_posted_at_dt, # For sorting
+                "last_posted_at": last_posted_at_dt,  # For sorting
                 "stats": {"drop_pct": drop_pct, "is_new": is_new, "is_crypto": is_crypto, "savings": ref_price - current_price}
             })
 
     # --- PHASE 3: SORT & LIMIT ---
     # Sort by last_posted_at (ascending) to get the longest-waiting/never-posted deals first
     eligible_candidates.sort(key=lambda x: x["last_posted_at"])
-    
+
     to_post = eligible_candidates[:max_posts]
     posted_count = 0
 
@@ -411,12 +418,47 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
         group_key = item["group_key"]
         best_entry = item["best_entry"]
         stats = item["stats"]
-        
+
         price = float(best_entry["data"]["current_price"])
         site = best_entry["data"].get("site", "unknown").upper()
         image = best_entry["data"].get("image")
         description = best_entry["data"].get("description", "").strip()
         title = (best_entry["data"].get("title") or group_key.replace("-", " ").title()).strip()
+
+        # --- Build per-site comparison lines (sorted by price)
+        comparison_lines = []
+        try:
+            sorted_entries = sorted(item["entries"], key=lambda e: float(e["data"].get("current_price") or float("inf")))
+            best_price_val = float(sorted_entries[0]["data"]["current_price"])
+        except Exception:
+            sorted_entries = item["entries"]
+            try:
+                best_price_val = float(best_entry["data"]["current_price"])
+            except Exception:
+                best_price_val = price
+
+        for e in sorted_entries:
+            try:
+                p = float(e["data"].get("current_price") or 0.0)
+            except Exception:
+                p = 0.0
+            site_label = _get_domain_from_url(e["url"]).upper()
+            # percent relative to best
+            rel_pct = round(((p - best_price_val) / best_price_val) * 100, 1) if best_price_val and best_price_val > 0 else 0.0
+            if p == best_price_val:
+                mark = "✅ BEST"
+            elif rel_pct <= 5.0:
+                mark = "⚠️ May consider"
+            else:
+                mark = "•"
+            # price string
+            try:
+                price_str = _safe_currency(p)
+            except Exception:
+                price_str = str(p)
+            comparison_lines.append(f"{mark} {site_label}: {price_str} — [On {site_label}]({e['url']})")
+
+        comparison_text = "🏪 Comparison:\n" + "\n".join(comparison_lines) if comparison_lines else ""
 
         # Build Caption
         if stats["is_crypto"]:
@@ -424,7 +466,8 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             caption = (
                 f"*{header}*\n━━━━━━━━━━━━━━━━━━\n"
                 f"💰 Current: {_safe_currency(price)}\n"
-                f"📊 Change: {stats['drop_pct']}%\n━━━━━━━━━━━━━━━━━━\n"
+                f"📊 Change: {stats['drop_pct']}%\n"
+                f"{comparison_text}\n━━━━━━━━━━━━━━━━━━\n"
                 f"🔗 Trade: {best_entry['url']}"
             )
         else:
@@ -433,20 +476,32 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                 f"*{header}*\n━━━━━━━━━━━━━━━━━━\n"
                 f"📦 {title}\n"
                 f"💰 Now: {_safe_currency(price)}\n"
-                f"📉 Saved: {_safe_currency(stats['savings'])}\n━━━━━━━━━━━━━━━━━━\n"
+                f"📉 Saved: {_safe_currency(stats['savings'])}\n"
+                f"{comparison_text}\n━━━━━━━━━━━━━━━━━━\n"
                 f"🛒 [Shop on {site}]({best_entry['url']})"
             )
 
         caption += "\n\n🔔"
+
+        # Quote description (blockquote style). Keep caption length constraints in mind.
         if description:
-            remaining = 1024 - len(caption) - 60
-            truncated = description[:max(remaining, 300)]
-            if len(description) > len(truncated): truncated += "..."
-            caption += f"\n\n📄 *Product Details:*\n{truncated}"
+            # truncate description to fit Telegram caption (~1024 chars). Reserve space for caption already built.
+            max_caption_len = 1024
+            # compute remaining characters after current caption and a small buffer for the quote markers
+            remaining = max_caption_len - len(caption) - len("\n\n📄 *Product Details:*\n") - 6
+            if remaining < 0:
+                remaining = 0
+            truncated = description[:remaining].rstrip()
+            if len(description) > len(truncated):
+                truncated += "..."
+            # quote each line
+            quoted_lines = "\n".join([f"> {ln}" for ln in truncated.splitlines()])
+            caption += f"\n\n📄 *Product Details:*\n{quoted_lines}"
 
         # Send to EACH target ID in the CHANNEL_DEAL_CHAT_ID list
         sent_successfully = False
-        for chat_id in CHANNEL_DEAL_CHAT_ID:
+        targets = CHANNEL_DEAL_CHAT_ID if isinstance(CHANNEL_DEAL_CHAT_ID, list) else [CHANNEL_DEAL_CHAT_ID]
+        for chat_id in targets:
             try:
                 if image:
                     await context.bot.send_photo(
@@ -472,7 +527,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             now_iso = now.isoformat()
             for e in item["entries"]:
                 await save_channel_snapshot(e["url"], {**e["data"], "last_posted_at": now_iso})
-            
+
             posted_count += 1
             if posted_count < len(to_post):
                 await asyncio.sleep(send_delay)
