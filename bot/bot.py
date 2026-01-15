@@ -456,10 +456,14 @@ async def check_and_post_channel_deals(context, force: bool = False, send_delay_
         title_display = title.upper() if not is_crypto else title
 
         if is_crypto:
-            direction = "🚀 PUMPING" if drop_pct < 0 else "📉 DUMPING"
-            header = f"📊 CRYPTO ALERT: {direction}"
-            price_line = f"💰 Price: {_safe_currency(best_price)}"
-            stat_line = f"Change: {abs(drop_pct)}%"
+            if is_new:
+                header = "🪙 **NEW CRYPTO ASSET TRACKED**"
+                direction = "STABLE"
+            else:
+                direction = "🚀 PUMPING" if drop_pct < 0 else "📉 DUMPING"
+                header = f"📊 CRYPTO ALERT: {direction}"
+                price_line = f"💰 Price: {_safe_currency(best_price)}"
+                stat_line = f"Change: {abs(drop_pct)}%"
         else:
             header = "🆕 NEW DEAL SPOTTED" if is_new else f"🔥 PRICE DROP: {drop_pct}% OFF"
             price_line = f"Now: {_safe_currency(best_price)}"
