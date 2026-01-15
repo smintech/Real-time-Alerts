@@ -451,12 +451,18 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE, force
             loser_price = float(loser["data"]["current_price"])
             price_diff = loser_price - best_price
             
+            # Extract site names for cleaner display
+            winner_site = winner['data'].get('site', 'Unknown').upper()
+            loser_site = loser['data'].get('site', 'Unknown').upper()
+            
             caption = (
                 f"⚔️ **PRICE WARS: {product_key}**\n"
                 f"━━━━━━━━━━━━━━━━\n"
-                f"🏆 **WINNER:** {winner['data'].get('site', 'Unknown').upper()}\n"
+                # Winner Name is now a clickable link
+                f"🏆 **WINNER:** [{winner_site}]({winner['url']})\n"
                 f"✅ Price: `{curr_str}`\n\n"
-                f"❌ **LOSER:** {loser['data'].get('site', 'Unknown').upper()}\n"
+                # Loser Name is now a clickable link
+                f"❌ **LOSER:** [{loser_site}]({loser['url']})\n"
                 f"💀 Price: ~{_safe_currency(loser_price)}~\n\n"
                 f"📉 **You Save:** `{_safe_currency(price_diff)}`\n"
                 f"━━━━━━━━━━━━━━━━\n"
@@ -479,7 +485,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE, force
             )
 
         # Add generic footer
-        caption += f"\n\n🔔 *Join @YourChannel for more!*"
+        caption += f"\n\n🔔"
 
         # --- 4. SENDING LOGIC (Photo Priority) ---
         targets = CHANNEL_DEAL_CHAT_ID if isinstance(CHANNEL_DEAL_CHAT_ID, list) else [CHANNEL_DEAL_CHAT_ID]
