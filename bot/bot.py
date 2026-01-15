@@ -438,7 +438,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                 f"🛒 [Shop on {best_site}]({best_entry['url']})"
             )
 
-        caption += "\n\n🔔 Personal alerts → @YourBotUsername"
+        caption += "\n\n🔔"
 
         # === APPEND PRODUCT DETAILS (quoted under caption) ===
         if description:
