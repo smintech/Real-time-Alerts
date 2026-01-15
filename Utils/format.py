@@ -15,36 +15,53 @@ if not logger.handlers:
     # Basic logging config if the host app hasn't configured logging.
     logging.basicConfig(level=logging.INFO)
 
-LIVE_USD_NGN_RATE = 1450.0
+LIVE_USD_NGN_RATE = 1650.0  # Updated initial fallback to a more realistic 2026 value (parallel market rates have been rising)
 
 async def update_exchange_rate():
     global LIVE_USD_NGN_RATE
     try:
-        # We fetch USDTNGN because it represents the actual street value of the Dollar in Naira
+        # We fetch USDTNGN because it represents the actual street/parallel market value of USD in Naira
         url = "https://api.binance.com/api/v3/ticker/price?symbol=USDTNGN"
         response = requests.get(url, timeout=10)
         data = response.json()
         
         new_rate = float(data['price'])
-        if new_rate > 500:  # Simple safety check
+        
+        # --- SAFEGUARD: Reasonable range check ---
+        # Prevents bad API data, network glitches, or future API changes from setting an unrealistic rate
+        # Range 1000–10000 allows for continued naira devaluation into 2026+ while blocking obvious errors
+        if 1000 < new_rate < 10000:
             LIVE_USD_NGN_RATE = new_rate
             print(f"✅ Exchange Rate Updated: ₦{LIVE_USD_NGN_RATE:,.2f}")
+        else:
+            print(f"⚠️ Received unusual rate ₦{new_rate:,.2f} — keeping previous rate ₦{LIVE_USD_NGN_RATE:,.2f}")
     except Exception as e:
-        print(f"⚠️ Failed to update rate: {e}")
+        print(f"⚠️ Failed to update exchange rate: {e} — keeping previous rate ₦{LIVE_USD_NGN_RATE:,.2f}")
 
 def _safe_currency(value: Any, site: str = "jumia") -> str:
     try:
         num = float(value)
         
-        # Check if the product is from Binance/Crypto
-        if "binance" in site.lower() or "crypto" in site.lower():
-            naira_equivalent = num * LIVE_USD_NGN_RATE
-            # Returns both: "$3,300 (₦4,785,000)"
-            return f"${num:,.2f} (₦{naira_equivalent:,.0f})"
+        # Basic safeguard: invalid/zero prices
+        if num <= 0:
+            return "Price Unknown"
+
+        # Detect crypto/Binance products (assumes these prices are in USD/USDT)
+        is_crypto_site = "binance" in site.lower() or "crypto" in site.lower()
+        
+        if is_crypto_site:
+            # Additional safeguard: only apply conversion if we have a plausible rate
+            if LIVE_USD_NGN_RATE < 1000:  # Rate never updated or reset to unsafe value
+                return f"${num:,.2f} (NGN conversion unavailable)"
             
-        # Default for Jumia/Konga
+            naira_equivalent = num * LIVE_USD_NGN_RATE
+            # Show both USD and approximate NGN value
+            return f"${num:,.2f} (≈ ₦{naira_equivalent:,.0f})"
+            
+        # Default for Nigerian e-commerce sites (Jumia, Konga, etc.) — prices already in NGN
         return f"₦{int(num):,}"
-    except:
+        
+    except Exception:
         return "Price Unknown"
 
 def _safe_percent(value: Any) -> float:
