@@ -351,6 +351,15 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                 # Always scrape to ensure the general DB has the latest prices
                 data = await asyncio.get_event_loop().run_in_executor(None, scrape_product, url)
                 if data and data.get("current_price") is not None:
+                    # FIX: Load existing channel snapshot to preserve last_posted_at, then save/refresh with new data
+                    # This extends expires_at and updates last_seen/current_price without touching last_posted_at
+                    existing_snap = await load_channel_snapshot(url)
+                    last_posted_at = existing_snap.get("last_posted_at") if existing_snap else None
+                    await save_channel_snapshot(
+                        url, 
+                        {**data, "last_posted_at": last_posted_at},
+                        expires_hours=168  # Example: Bump to 7 days (168 hours) for less-frequent jobs; adjust as needed
+                    )
                     entries.append({"url": url, "data": data})
             except Exception as e:
                 LOG.warning("Scrape failed for %s in group %s: %s", url, group_key, e)
@@ -402,7 +411,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
         if should_post and not is_new:
             if current_price >= ref_price:
                 should_post = False
-                LOG.info("Skipped repost: price not lower (current ₦%.0f >= ref ₦%.0f for %s)",current_price, ref_price, group_key)
+                LOG.info("Skipped repost: price not lower (current ₦%.0f >= ref ₦%.0f for %s)", current_price, ref_price, group_key)
 
         if should_post:
             eligible_candidates.append({
@@ -525,8 +534,13 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
         if sent_successfully:
             now_iso = now.isoformat()
             for e in item["entries"]:
-                await save_channel_snapshot(e["url"], {**e["data"], "last_posted_at": now_iso})
-                LOG.info("Updating snapshot for group %s with price ₦%.0f at %s",group_key, price, now_iso)
+                # When posting, update with new last_posted_at (overrides the preserved one from scrape)
+                await save_channel_snapshot(
+                    e["url"], 
+                    {**e["data"], "last_posted_at": now_iso},
+                    expires_hours=168  # Consistent with scrape update
+                )
+                LOG.info("Updating snapshot for group %s with price ₦%.0f at %s", group_key, price, now_iso)
                 
             posted_count += 1
             if posted_count < len(to_post):
