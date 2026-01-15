@@ -35,7 +35,7 @@ CHANNEL_DEAL_CHAT_ID = [int(x.strip()) for x in os.getenv("CHANNEL", "").split("
 
 # Channel monitoring settings
 # Use a unique Key for each product to force comparison
-MONITORED_GROUPS = {
+CHANNEL_MONITORED_URLS = {
     "iphone-15-pro-max-256": [
         "https://www.jumia.com.ng/apple-iphone-15-pro-max-6.7-256gb-nano-sim-esim-5g-natural-381382767.html",
         "https://www.konga.com/product/apple-iphone-15-pro-max-6-7-256gb-rom-8gb-ram-1-sim-esim-5g-4441mah-blue-6612850"
