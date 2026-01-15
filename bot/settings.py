@@ -36,42 +36,42 @@ CHANNEL_DEAL_CHAT_ID = [int(x.strip()) for x in os.getenv("CHANNEL", "").split("
 # Channel monitoring settings
 CHANNEL_MONITORED_URLS = [
     # === PHONES ===
-    # Apple iPhone 16 Pro Max
-    "https://www.jumia.com.ng/iphone-16-pro-max-256gb-black-titanium-apple-12345678.html",
-    "https://www.konga.com/product/apple-iphone-16-pro-max-256gb-black-titanium-5930123",
-    
-    # Samsung Galaxy S25 Ultra
-    "https://www.jumia.com.ng/samsung-galaxy-s25-ultra-5g-512gb-titanium-gray-87654321.html",
-    "https://www.konga.com/product/samsung-galaxy-s25-ultra-12gb-ram-512gb-rom-6012345",
+    # Apple iPhone 15 Pro Max (256GB) — Jumia + Konga
+    "https://www.jumia.com.ng/apple-iphone-15-pro-max-6.7-256gb-nano-sim-esim-5g-natural-381382767.html",
+    "https://www.konga.com/product/apple-iphone-15-pro-max-6-7-256gb-rom-8gb-ram-1-sim-esim-5g-4441mah-blue-6612850",
+
+    # Apple iPhone 15 Pro (128GB) — Jumia + Konga
+    "https://www.jumia.com.ng/apple-iphone-15-pro-6.1-128gb-rom-8gb-ram-nano-sim-white-389800758.html",
+    "https://www.konga.com/product/apple-iphone-15-pro-6-1-128gb-rom-8gb-ram-nano-sim-5g-6826852",
 
     # === GADGETS ===
-    # PlayStation 5 (Slim)
-    "https://www.jumia.com.ng/sony-playstation-5-console-slim-edition-white-44332211.html",
-    "https://www.konga.com/product/sony-playstation-5-ps5-slim-console-5829104",
-    
-    # Apple Watch Series 10
-    "https://www.jumia.com.ng/apple-watch-series-10-gps-46mm-jet-black-99887766.html",
-    "https://www.konga.com/product/apple-watch-series-10-gps-46-mm-jet-black-5712390",
+    # PlayStation 5 Slim — Jumia + Konga
+    "https://www.jumia.com.ng/sony-playstation-5-slim-ps5-slim-console-1tb-410637026.html",
+    "https://www.konga.com/product/sony-playstation-5-slim-ps5-slim-console-1tb-6834464",
+
+    # Apple Watch (Series 10 / Series 9 pages exist) — Jumia + Konga
+    "https://www.jumia.com.ng/slp/apple-watch-series-10-cost-sale",   # Jumia listing / product collection (Series 10)
+    "https://www.konga.com/product/apple-watch-series-10-with-sport-band-gps-42mm-black-6598000",
 
     # === LAPTOPS ===
-    # HP Pavilion 15 (Core i5, 16GB RAM)
-    "https://www.jumia.com.ng/hp-pavilion-15-laptop-intel-core-i5-16gb-ram-512gb-ssd-55667788.html",
-    "https://www.konga.com/product/hp-pavilion-15-intel-core-i5-16gb-ram-512gb-ssd-5421098",
+    # HP Pavilion 15 (i5, 16GB, 512GB) — Jumia + Konga
+    "https://www.jumia.com.ng/pavilion-15-11th-gen-intel-core-i5-512gb-ssd-16gb-ram-touchscreenbacklit-keyboard-hp-mpg2159579.html",
+    "https://www.konga.com/product/hp-pavilion-15-12th-gen-intel-core-i5-16gb-ram-512gb-ssd-backlit-keyboard-15-6-touch-wins11-6069271",
 
-    # MacBook Air M3 (13-inch)
-    "https://www.jumia.com.ng/apple-macbook-air-13.6-m3-chip-8gb-256gb-ssd-midnight-11223344.html",
-    "https://www.konga.com/product/apple-macbook-air-m3-chip-13-inch-8gb-ram-256gb-ssd-5309812",
+    # MacBook Air (M3) — Jumia + Konga
+    "https://www.jumia.com.ng/apple-macbook-air-13-m3-chip-8gb-256gb-space-gray-389242856.html",
+    "https://www.konga.com/product/apple-macbook-air-m3-chip-with-8-core-cpu-and-8-core-gpu-256gb-ssd-silver-13-inch-6656405",
 
     # === ACCESSORIES ===
-    # Oraimo FreePods 4
-    "https://www.jumia.com.ng/oraimo-freepods-4-anc-true-wireless-earbuds-black-22334455.html",
-    "https://www.konga.com/product/oraimo-freepods-4-active-noise-cancelling-earbuds-5210987",
+    # Oraimo FreePods 4 — Jumia + Konga
+    "https://www.jumia.com.ng/oraimo-freepods-4-anc-wireless-stereo-earbuds-413570378.html",
+    "https://www.konga.com/product/oraimo-freepods-4-active-noise-cancellation-wireless-earbuds-6295340",
 
-    # Anker 737 Power Bank (PowerCore 24K)
-    "https://www.jumia.com.ng/anker-737-power-bank-powercore-24k-140w-output-33445566.html",
-    "https://www.konga.com/product/anker-737-power-bank-gen-2-140w-output-5109876",
-    
-    # === CRYPTO (Special Handling) ===
+    # Anker 737 / PowerCore (140W) — Jumia (search listing) + Konga product
+    "https://www.jumia.com.ng/slp/anker-portable-charger-for-travel",  # Anker product listing/search page
+    "https://www.konga.com/product/anker-737-ganprime-24000-power-bank-pd-140w-black-6861844",
+
+    # === CRYPTO (special handling) ===
     "SYMBOL:ETHUSDT",
 ]
 
