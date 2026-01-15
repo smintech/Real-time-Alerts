@@ -40,7 +40,7 @@ from bot.persistence import (
     _db_ensure_table,
     delete_expired_channel_snapshots,
 )
-from Utils.format import format_telegram_alert, _safe_currency
+from Utils.format import format_telegram_alert, _safe_currency, update_exchange_rate
 
 logging.basicConfig(level=logging.INFO)
 LOG = logging.getLogger(__name__)
@@ -331,6 +331,8 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
     """
     start_time = time.time()
     LOG.info("--- CHANNEL DEALS JOB STARTED ---")
+    
+    await update_exchange_rate()
 
     if not AUTO_POST_TO_CHANNEL or not CHANNEL_DEAL_CHAT_ID:
         LOG.info("Channel posting disabled or missing config — skipping")
