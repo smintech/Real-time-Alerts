@@ -75,10 +75,10 @@ CHANNEL_MONITORED_URLS = [
     "SYMBOL:ETHUSDT",
 ]
 
-MIN_DROP_PERCENT_FOR_CHANNEL = 0.1 #5.0   # % price drop
-MIN_SAVINGS_FOR_CHANNEL = 1 #10000      # ₦15,000 minimum savings
+MIN_DROP_PERCENT_FOR_CHANNEL = 5.0   # % price drop
+MIN_SAVINGS_FOR_CHANNEL = 10000      # ₦15,000 minimum savings
 MIN_DEAL_SCORE_FOR_CHANNEL = "medium"  # only medium/high
-MAX_CHANNEL_POSTS_PER_RUN = 10       # safety cap per hour
+MAX_CHANNEL_POSTS_PER_RUN = 5       # safety cap per hour
 
 PAID_TIERS = {
     "basic": {
