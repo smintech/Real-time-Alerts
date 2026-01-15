@@ -2,7 +2,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, Optional, Any
 from urllib.parse import urlparse
-
+import request
 # Attempt to import a timezone object from your settings; fall back to UTC if unavailable.
 try:
     from bot.settings import TIMEZONE  # expected to be a tzinfo instance
@@ -15,23 +15,37 @@ if not logger.handlers:
     # Basic logging config if the host app hasn't configured logging.
     logging.basicConfig(level=logging.INFO)
 
+LIVE_USD_NGN_RATE = 1450.0
 
-def _safe_currency(value: Any, symbol: str = "₦") -> str:
-    """
-    Return a nicely formatted currency string or a readable fallback if value invalid.
-    """
+async def update_exchange_rate():
+    global LIVE_USD_NGN_RATE
     try:
-        # Accept numeric strings too
-        num = float(value)
-        # Show as integer if close to integer, else show 2 decimals
-        if abs(num - int(num)) < 1e-9:
-            formatted = f"{int(num):,}"
-        else:
-            formatted = f"{num:,.2f}"
-        return f"{symbol}{formatted}"
-    except Exception:
-        return f"{symbol}unknown"
+        # We fetch USDTNGN because it represents the actual street value of the Dollar in Naira
+        url = "https://api.binance.com/api/v3/ticker/price?symbol=USDTNGN"
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        
+        new_rate = float(data['price'])
+        if new_rate > 500:  # Simple safety check
+            LIVE_USD_NGN_RATE = new_rate
+            print(f"✅ Exchange Rate Updated: ₦{LIVE_USD_NGN_RATE:,.2f}")
+    except Exception as e:
+        print(f"⚠️ Failed to update rate: {e}")
 
+def _safe_currency(value: Any, site: str = "jumia") -> str:
+    try:
+        num = float(value)
+        
+        # Check if the product is from Binance/Crypto
+        if "binance" in site.lower() or "crypto" in site.lower():
+            naira_equivalent = num * LIVE_USD_NGN_RATE
+            # Returns both: "$3,300 (₦4,785,000)"
+            return f"${num:,.2f} (₦{naira_equivalent:,.0f})"
+            
+        # Default for Jumia/Konga
+        return f"₦{int(num):,}"
+    except:
+        return "Price Unknown"
 
 def _safe_percent(value: Any) -> float:
     """
