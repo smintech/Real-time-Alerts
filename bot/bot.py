@@ -326,7 +326,8 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
     - Detects 'Significant Change' by comparing current price to the last price posted.
     - Respects MAX_CHANNEL_POSTS_PER_RUN by prioritizing the longest-waiting deals.
     - Loops through CHANNEL_DEAL_CHAT_ID list to post to multiple targets.
-    - Adds per-site comparison (✅ BEST, ⚠️ May consider) and quotes the product description.
+    - Adds per-site comparison (✅ BEST, ⚠️ May consider) with clickable site names.
+    - Quotes the product description using proper HTML <blockquote> for reliable rendering.
     """
     start_time = time.time()
     LOG.info("--- CHANNEL DEALS JOB STARTED ---")
@@ -384,7 +385,6 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
         is_crypto = any("binance" in (e["data"].get("site", "").lower()) or "SYMBOL:" in e["url"] for e in entries)
 
         # Logic for "Significant Change"
-        # If item is new, it's significant. If not, check if price dropped by 3% vs last post.
         ref_price = last_posted_price if last_posted_price else current_price
         drop_pct = round(((ref_price - current_price) / ref_price) * 100, 1) if ref_price > current_price else 0.0
 
@@ -407,7 +407,6 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             })
 
     # --- PHASE 3: SORT & LIMIT ---
-    # Sort by last_posted_at (ascending) to get the longest-waiting/never-posted deals first
     eligible_candidates.sort(key=lambda x: x["last_posted_at"])
 
     to_post = eligible_candidates[:max_posts]
@@ -425,17 +424,14 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
         description = best_entry["data"].get("description", "").strip()
         title = (best_entry["data"].get("title") or group_key.replace("-", " ").title()).strip()
 
-        # --- Build per-site comparison lines (sorted by price)
+        # --- Build per-site comparison lines (sorted by price) ---
         comparison_lines = []
         try:
             sorted_entries = sorted(item["entries"], key=lambda e: float(e["data"].get("current_price") or float("inf")))
             best_price_val = float(sorted_entries[0]["data"]["current_price"])
         except Exception:
             sorted_entries = item["entries"]
-            try:
-                best_price_val = float(best_entry["data"]["current_price"])
-            except Exception:
-                best_price_val = price
+            best_price_val = price
 
         for e in sorted_entries:
             try:
@@ -443,7 +439,6 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 p = 0.0
             site_label = _get_domain_from_url(e["url"]).upper()
-            # percent relative to best
             rel_pct = round(((p - best_price_val) / best_price_val) * 100, 1) if best_price_val and best_price_val > 0 else 0.0
             if p == best_price_val:
                 mark = "✅ BEST"
@@ -451,52 +446,50 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                 mark = "⚠️ May consider"
             else:
                 mark = "•"
-            # price string
             try:
                 price_str = _safe_currency(p)
             except Exception:
                 price_str = str(p)
-            comparison_lines.append(f"{mark} {site_label}: {price_str} — [On {site_label}]({e['url']})")
+            # Site name is now clickable
+            comparison_lines.append(
+                f"{mark} <a href=\"{e['url']}\">{site_label}</a>: {price_str}"
+            )
 
         comparison_text = "🏪 Comparison:\n" + "\n".join(comparison_lines) if comparison_lines else ""
 
-        # Build Caption
+        # Build Caption (now using HTML for reliable blockquote support)
         if stats["is_crypto"]:
             header = "🆕 NEW CRYPTO TRACKED" if stats["is_new"] else "📊 CRYPTO PRICE UPDATE"
             caption = (
-                f"*{header}*\n━━━━━━━━━━━━━━━━━━\n"
+                f"<b>{header}</b>\n━━━━━━━━━━━━━━━━━━\n"
                 f"💰 Current: {_safe_currency(price)}\n"
                 f"📊 Change: {stats['drop_pct']}%\n"
                 f"{comparison_text}\n━━━━━━━━━━━━━━━━━━\n"
-                f"🔗 Trade: {best_entry['url']}"
+                f"🔗 <a href=\"{best_entry['url']}\">Trade on {site}</a>"
             )
         else:
             header = "🆕 NEW DEAL!" if stats["is_new"] else f"🔥 {stats['drop_pct']}% DROP!"
             caption = (
-                f"*{header}*\n━━━━━━━━━━━━━━━━━━\n"
+                f"<b>{header}</b>\n━━━━━━━━━━━━━━━━━━\n"
                 f"📦 {title}\n"
                 f"💰 Now: {_safe_currency(price)}\n"
                 f"📉 Saved: {_safe_currency(stats['savings'])}\n"
                 f"{comparison_text}\n━━━━━━━━━━━━━━━━━━\n"
-                f"🛒 [Shop on {site}]({best_entry['url']})"
+                f"🛒 <a href=\"{best_entry['url']}\">Shop on {site}</a>"
             )
 
         caption += "\n\n🔔"
 
-        # Quote description (blockquote style). Keep caption length constraints in mind.
+        # Quote description using proper HTML blockquote (single block, preserves newlines)
         if description:
-            # truncate description to fit Telegram caption (~1024 chars). Reserve space for caption already built.
             max_caption_len = 1024
-            # compute remaining characters after current caption and a small buffer for the quote markers
-            remaining = max_caption_len - len(caption) - len("\n\n📄 *Product Details:*\n") - 6
+            remaining = max_caption_len - len(caption) - len("\n\n📄 <b>Product Details:</b>\n<blockquote></blockquote>") - 10
             if remaining < 0:
                 remaining = 0
             truncated = description[:remaining].rstrip()
             if len(description) > len(truncated):
                 truncated += "..."
-            # quote each line
-            quoted_lines = "\n".join([f"> {ln}" for ln in truncated.splitlines()])
-            caption += f"\n\n📄 *Product Details:*\n{quoted_lines}"
+            caption += f"\n\n📄 <b>Product Details:</b>\n<blockquote>{truncated}</blockquote>"
 
         # Send to EACH target ID in the CHANNEL_DEAL_CHAT_ID list
         sent_successfully = False
@@ -508,13 +501,13 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                         chat_id=chat_id,
                         photo=image,
                         caption=caption,
-                        parse_mode="Markdown"
+                        parse_mode="HTML"
                     )
                 else:
                     await context.bot.send_message(
                         chat_id=chat_id,
                         text=caption,
-                        parse_mode="Markdown",
+                        parse_mode="HTML",
                         disable_web_page_preview=True
                     )
                 sent_successfully = True
@@ -523,7 +516,6 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                 LOG.error("Failed to post %s to chat %s: %s", group_key, chat_id, e)
 
         if sent_successfully:
-            # Only update snapshot if at least one target received it
             now_iso = now.isoformat()
             for e in item["entries"]:
                 await save_channel_snapshot(e["url"], {**e["data"], "last_posted_at": now_iso})
@@ -532,7 +524,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             if posted_count < len(to_post):
                 await asyncio.sleep(send_delay)
 
-    LOG.info("--- JOB FINISHED: %d deals posted across %d channels ---", posted_count, len(CHANNEL_DEAL_CHAT_ID))
+    LOG.info("--- JOB FINISHED: %d deals posted across %d channels ---", posted_count, len(targets if isinstance(CHANNEL_DEAL_CHAT_ID, list) else 1))
 
 async def check_trials(context: ContextTypes.DEFAULT_TYPE):
     """Validate trials and downgrade users whose trial expired."""
