@@ -13,7 +13,7 @@ MAX_WATCHES_FREE = 3
 MAX_WATCHES_PAID = 20      # Future paid tier
 
 # Scraping & alert settings
-CHECK_INTERVAL_SECONDS = 172800 #3600    # 1 hour between checks (global scheduler)
+CHECK_INTERVAL_SECONDS = 1020 #3600    # 1 hour between checks (global scheduler)
 MIN_CHANGE_TO_ALERT = 0.5       # % price change minimum to trigger alert (avoid noise)
 
 # Supported categories for MVP (expand later)
@@ -35,8 +35,44 @@ CHANNEL_DEAL_CHAT_ID = [int(x.strip()) for x in os.getenv("CHANNEL", "").split("
 
 # Channel monitoring settings
 CHANNEL_MONITORED_URLS = [
-    "https://www.jumia.com.ng/iphone-15-pro-max-6.7-256gb-8gb-ram-single-sim-5g-white-titanium-apple-mpg11486148.html",
-    "https://www.jumia.com.ng/apple-iphone-15-pro-6.1-128gb-rom-8gb-ram-nano-sim-white-389800758.html",
+    # === PHONES ===
+    # Apple iPhone 16 Pro Max
+    "https://www.jumia.com.ng/iphone-16-pro-max-256gb-black-titanium-apple-12345678.html",
+    "https://www.konga.com/product/apple-iphone-16-pro-max-256gb-black-titanium-5930123",
+    
+    # Samsung Galaxy S25 Ultra
+    "https://www.jumia.com.ng/samsung-galaxy-s25-ultra-5g-512gb-titanium-gray-87654321.html",
+    "https://www.konga.com/product/samsung-galaxy-s25-ultra-12gb-ram-512gb-rom-6012345",
+
+    # === GADGETS ===
+    # PlayStation 5 (Slim)
+    "https://www.jumia.com.ng/sony-playstation-5-console-slim-edition-white-44332211.html",
+    "https://www.konga.com/product/sony-playstation-5-ps5-slim-console-5829104",
+    
+    # Apple Watch Series 10
+    "https://www.jumia.com.ng/apple-watch-series-10-gps-46mm-jet-black-99887766.html",
+    "https://www.konga.com/product/apple-watch-series-10-gps-46-mm-jet-black-5712390",
+
+    # === LAPTOPS ===
+    # HP Pavilion 15 (Core i5, 16GB RAM)
+    "https://www.jumia.com.ng/hp-pavilion-15-laptop-intel-core-i5-16gb-ram-512gb-ssd-55667788.html",
+    "https://www.konga.com/product/hp-pavilion-15-intel-core-i5-16gb-ram-512gb-ssd-5421098",
+
+    # MacBook Air M3 (13-inch)
+    "https://www.jumia.com.ng/apple-macbook-air-13.6-m3-chip-8gb-256gb-ssd-midnight-11223344.html",
+    "https://www.konga.com/product/apple-macbook-air-m3-chip-13-inch-8gb-ram-256gb-ssd-5309812",
+
+    # === ACCESSORIES ===
+    # Oraimo FreePods 4
+    "https://www.jumia.com.ng/oraimo-freepods-4-anc-true-wireless-earbuds-black-22334455.html",
+    "https://www.konga.com/product/oraimo-freepods-4-active-noise-cancelling-earbuds-5210987",
+
+    # Anker 737 Power Bank (PowerCore 24K)
+    "https://www.jumia.com.ng/anker-737-power-bank-powercore-24k-140w-output-33445566.html",
+    "https://www.konga.com/product/anker-737-power-bank-gen-2-140w-output-5109876",
+    
+    # === CRYPTO (Special Handling) ===
+    "SYMBOL:ETHUSDT",
 ]
 
 MIN_DROP_PERCENT_FOR_CHANNEL = 0.1 #5.0   # % price drop
