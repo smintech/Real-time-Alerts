@@ -481,7 +481,7 @@ async def check_and_post_channel_deals(context, force: bool = False, send_delay_
             f"{comparison}"
             f"━━━━━━━━━━━━━━━━━━\n"
             f"🔗 [View on {best_site}]({best_entry['url']})\n"
-            f"📢 Personal Alerts: @YourBotUsername"
+            f"📢 Personal Alerts: Soon...."
         )
 
         # E. Execution & Snapshot Update
