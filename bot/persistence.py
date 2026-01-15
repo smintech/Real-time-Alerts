@@ -158,6 +158,7 @@ def _db_create_channel_table():
           title TEXT,
           url TEXT,
           current_price NUMERIC,
+          last_posted_price NUMERIC,
           raw JSONB,
           last_seen TIMESTAMPTZ DEFAULT NOW(),
           expires_at TIMESTAMPTZ,
@@ -208,7 +209,8 @@ def _db_upsert_channel_snapshot(ref: str, snapshot: dict, expires_hours: int):
               raw = EXCLUDED.raw,
               last_seen = EXCLUDED.last_seen,
               expires_at = EXCLUDED.expires_at,
-              last_posted_at = EXCLUDED.last_posted_at
+              last_posted_at = EXCLUDED.last_posted_at,
+              last_posted_price = EXCLUDED.last_posted_price
         """, (
             ref,
             snapshot.get("site"),
@@ -218,7 +220,8 @@ def _db_upsert_channel_snapshot(ref: str, snapshot: dict, expires_hours: int):
             json.dumps(snapshot.get("raw") or {}),
             datetime.now(timezone.utc),
             expires_at,
-            last_posted_at
+            last_posted_at,
+            snapshot.get("last_posted_price")
         ))
         conn.commit()
         cur.close()
@@ -233,7 +236,7 @@ def _db_get_channel_snapshot(ref: str):
         conn = pool_conn.getconn()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
-            SELECT ref, site, title, url, current_price, raw, last_seen, expires_at, last_posted_at
+            SELECT ref, site, title, url, current_price, raw, last_seen, expires_at, last_posted_at, last_posted_price
             FROM channel_snapshots
             WHERE ref = %s
             LIMIT 1
@@ -354,7 +357,8 @@ async def save_channel_snapshot(ref: str, snapshot: dict, ttl_seconds: int = 48 
                 "current_price": snapshot.get("current_price"),
                 "raw": snapshot.get("raw") or {},
                 "last_seen": datetime.now(timezone.utc).isoformat(),
-                "last_posted_at": snapshot.get("last_posted_at")
+                "last_posted_at": snapshot.get("last_posted_at"),
+                "last_posted_price": snapshot.get("last_posted_price")
             }), ex=ttl_seconds)
         except Exception:
             logger.exception("Redis channel write failed %s", ref)
