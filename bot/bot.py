@@ -398,6 +398,11 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
         elif drop_pct >= 3.0:  # Significant 3% drop
             should_post = True
             LOG.info("Significant drop for %s: %.1f%% lower than last post", group_key, drop_pct)
+            
+        if should_post and not is_new:
+            if current_price >= ref_price:
+                should_post = False
+                LOG.info("Skipped repost: price not lower (current ₦%.0f >= ref ₦%.0f for %s)",current_price, ref_price, group_key)
 
         if should_post:
             eligible_candidates.append({
@@ -521,7 +526,8 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             now_iso = now.isoformat()
             for e in item["entries"]:
                 await save_channel_snapshot(e["url"], {**e["data"], "last_posted_at": now_iso})
-
+                LOG.info("Updating snapshot for group %s with price ₦%.0f at %s",group_key, price, now_iso)
+                
             posted_count += 1
             if posted_count < len(to_post):
                 await asyncio.sleep(send_delay)
