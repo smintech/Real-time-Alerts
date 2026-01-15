@@ -9,7 +9,7 @@ import re
 import requests
 from typing import Dict, Optional, Any, Tuple, Callable
 from functools import wraps
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
 import cloudscraper
 from requests.exceptions import RequestException
@@ -220,6 +220,9 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
         "site": domain,
         "currency": "NGN",
         "raw": {},
+        # new image fields
+        "images": [],
+        "image": None,
     }
 
     # 1. JSON-LD structured data (most reliable)
@@ -246,11 +249,21 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
                             avail = offer.get("availability", "")
                             if "OutOfStock" in avail or "Discontinued" in avail:
                                 product["stock_status"] = "out_of_stock"
+
+                    # images from JSON-LD (may be string or list)
+                    img_field = item.get("image") or item.get("images")
+                    if img_field:
+                        if isinstance(img_field, str):
+                            product["images"].append(urljoin(url, img_field))
+                        elif isinstance(img_field, list):
+                            for it in img_field:
+                                if isinstance(it, str) and it.strip():
+                                    product["images"].append(urljoin(url, it))
                     break
         except Exception:
             continue
 
-    # 2. Open Graph meta tags
+    # 2. Open Graph / meta tags
     if product["title"] == "Product":
         og_title = soup.find("meta", property="og:title")
         if og_title and og_title.get("content"):
@@ -264,34 +277,71 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
             except:
                 pass
 
-    # 3. Site-specific selectors (Jumia, Konga, etc.)
-    if "jumia" in domain and product["current_price"] is None:
-        selectors = ["span.-b", ".-fs24", ".prc", ".-prc", "[class*='price']", "div.prc"]
-        for sel in selectors:
-            el = soup.select_one(sel)
-            if el:
-                text = el.get_text(strip=True)
-                if "₦" in text:
-                    clean = re.sub(r"[^\d]", "", text)
-                    if clean:
-                        try:
-                            product["current_price"] = float(clean)
-                            break
-                        except:
-                            pass
-# Add this below the Jumia block
-    if "konga" in domain and product["current_price"] is None:
-        # Konga often uses these classes for price
-        selectors = ["span._3e_22_199e7", "._3e_22_199e7", "h4._44738_3988u"]
-        for sel in selectors:
-            el = soup.select_one(sel)
-            if el:
-                text = el.get_text(strip=True)
-                clean = re.sub(r"[^\d]", "", text)
-                if clean:
-                    product["current_price"] = float(clean)
-                    break
-    # 4. Generic regex fallback
+    # Try og:image / twitter:image / link rel=image_src
+    def _add_image_candidate(src):
+        if not src:
+            return
+        try:
+            abs_url = urljoin(url, src.strip())
+            if abs_url not in product["images"]:
+                product["images"].append(abs_url)
+        except Exception:
+            pass
+
+    og_image = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"})
+    if og_image and og_image.get("content"):
+        _add_image_candidate(og_image["content"])
+
+    twitter_img = soup.find("meta", attrs={"name": "twitter:image"})
+    if twitter_img and twitter_img.get("content"):
+        _add_image_candidate(twitter_img["content"])
+
+    link_img = soup.find("link", rel="image_src")
+    if link_img and link_img.get("href"):
+        _add_image_candidate(link_img["href"])
+
+    # 3. Site-specific selectors (Jumia, Konga, etc.) only if no image yet
+    if "jumia" in domain:
+        # common Jumia gallery selector heuristics
+        possible = soup.select("img[class*='prd-img'], img[class*='image'], img[class*='gallery'], img")
+        for img in possible:
+            src = img.get("data-src") or img.get("src") or img.get("data-original")
+            if src and len(product["images"]) < 6:
+                _add_image_candidate(src)
+    elif "konga" in domain:
+        possible = soup.select("img[class*='product-image'], img[class*='image'], img")
+        for img in possible:
+            src = img.get("data-src") or img.get("src") or img.get("data-original")
+            if src and len(product["images"]) < 6:
+                _add_image_candidate(src)
+
+    # 4. Generic img fallback (largest-ish or first few)
+    if not product["images"]:
+        img_tags = soup.find_all("img")
+        seen = set()
+        for img in img_tags:
+            src = img.get("data-src") or img.get("src") or img.get("data-original")
+            if not src:
+                continue
+            src = urljoin(url, src.strip())
+            if src in seen:
+                continue
+            # filter out tiny icons / trackers by rough heuristics
+            w = img.get("width") or img.get("data-width")
+            h = img.get("height") or img.get("data-height")
+            try:
+                w_n = int(w) if w and str(w).isdigit() else 0
+                h_n = int(h) if h and str(h).isdigit() else 0
+            except Exception:
+                w_n = h_n = 0
+            if w_n and h_n and (w_n < 50 or h_n < 50):
+                continue
+            seen.add(src)
+            product["images"].append(src)
+            if len(product["images"]) >= 6:
+                break
+
+    # 5. Generic regex fallback for price
     if product["current_price"] is None:
         page_text = soup.get_text(separator=" ")
         matches = re.findall(r"(?:₦|NGN)[\s]?([\d,]+\.?\d*)", page_text)
@@ -302,7 +352,6 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
                 if clean.replace(".", "").isdigit():
                     prices.append(float(clean))
             if prices:
-                # Usually the highest price on page is the main current price
                 product["current_price"] = max(prices)
 
     # Stock status text fallback
@@ -312,7 +361,7 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
 
     # Final title fallback
     if product["title"] == "Product" or "Buy" in product["title"]:
-        h1 = soup.select_one("h1.-fs20, h1.-pb10, h1.brd, .v-p-hd h1")
+        h1 = soup.select_one("h1.-fs20, h1.-pb10, h1.brd, .v-p-hd h1, h1")
         if h1:
             product["title"] = h1.get_text(strip=True)
         elif soup.title:
@@ -320,6 +369,20 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
 
     if product["current_price"] is None:
         raise NoDataError("No price found after all extraction methods")
+
+    # tidy images list and set primary image
+    # remove empty / short values and duplicates
+    cleaned = []
+    for i in product["images"]:
+        try:
+            if i and isinstance(i, str) and len(i) > 8:
+                u = urljoin(url, i)
+                if u not in cleaned:
+                    cleaned.append(u)
+        except Exception:
+            continue
+    product["images"] = cleaned
+    product["image"] = cleaned[0] if cleaned else None
 
     # Store raw JSON-LD if found
     product["raw"] = {"json_ld": json_ld_data} if json_ld_data else {"snippet": product["title"]}
