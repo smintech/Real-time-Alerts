@@ -2,7 +2,7 @@ import logging
 from datetime import datetime, timezone
 from typing import Dict, Optional, Any
 from urllib.parse import urlparse
-import request
+import requests
 # Attempt to import a timezone object from your settings; fall back to UTC if unavailable.
 try:
     from bot.settings import TIMEZONE  # expected to be a tzinfo instance
