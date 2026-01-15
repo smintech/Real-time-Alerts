@@ -34,10 +34,10 @@ AUTO_POST_TO_CHANNEL = True  # Set to False to disable entirely
 CHANNEL_DEAL_CHAT_ID = [int(x.strip()) for x in os.getenv("CHANNEL", "").split(",") if x.strip()] # Your channel ID (make bot admin with post rights)
 
 CHANNEL_MONITORED_URLS = {
-    # Phones (originals kept)
+    # Phones
     "iphone-15-pro-max-256": [
-        "https://www.jumia.com.ng/apple-iphone-15-pro-max-6.7-256gb-nano-sim-esim-5g-natural-381382767.html",   # Jumia — live
-        "https://www.konga.com/product/apple-iphone-15-pro-max-6-7-256gb-rom-8gb-ram-1-sim-esim-5g-4441mah-blue-6612850"  # Konga — live
+        "https://www.jumia.com.ng/apple-iphone-15-pro-max-6.7-256gb-nano-sim-esim-5g-natural-381382767.html",
+        "https://www.konga.com/product/apple-iphone-15-pro-max-6-7-256gb-rom-8gb-ram-1-sim-esim-5g-4441mah-blue-6612850"
     ],
     "iphone-15-pro-128": [
         "https://www.jumia.com.ng/apple-iphone-15-pro-6.1-128gb-rom-8gb-ram-nano-sim-white-389800758.html",
@@ -56,42 +56,26 @@ CHANNEL_MONITORED_URLS = {
         "https://www.konga.com/product/apple-macbook-air-m3-chip-with-8-core-cpu-and-8-core-gpu-256gb-ssd-silver-13-inch-6656405"
     ],
 
-    # Earbuds — replaced dead Konga entry with a working Konga product (several Konga Oraimo FreePods 4 pages available)
+    # Earbuds
     "freepods-4": [
-        "https://www.jumia.com.ng/oraimo-freepods-4-anc-wireless-stereo-earbuds-413570378.html",   # Jumia (live)
-        "https://www.konga.com/product/oraimo-freepods-4-anc-true-wireless-stereo-earbuds-6624829"  # Konga (working replacement)
+        "https://www.jumia.com.ng/oraimo-freepods-4-anc-wireless-stereo-earbuds-413570378.html",
+        "https://www.konga.com/product/oraimo-freepods-4-anc-true-wireless-stereo-earbuds-6624829"
     ],
 
-    # Crypto (keep BINANCE symbol reference)
+    # Crypto
     "crypto-eth": [
         "SYMBOL:ETHUSDT"
     ],
 
-    # --- NEW useful products for Nigerian shoppers (examples) ---
-    # Popular/affordable Android phone (Tecno CAMON series)
+    # New helpful / real product pages
     "tecno-camon-30": [
         "https://www.jumia.com.ng/camon-30-5g-6.78-512gb88gb-dual-sim-5000mah-dark-tecno-mpg8184353.html"
     ],
-
-    # Xiaomi / Redmi midrange phone
-    "xiaomi-redmi-note-12": [
-        "https://www.jumia.com.ng/mlp-xiaomi-redmi-note-12/"   # Jumia listing/collection (good for scraping variations)
-    ],
-
-    # Power banks (20000mAh popular models)
     "powerbank-20k": [
-        "https://www.jumia.com.ng/mlp-k-20000mah-power-bank/"   # Jumia collection with multiple sellers/models
+        "https://www.konga.com/product/oraimo-powernova-q21-20000mah-22-5w-6898183",
+        "https://www.konga.com/product/anker-prime-power-bank-20000mah-portable-charger-with-200w-output-smart-digital-display-6571853"
     ],
-
-    # Home inverter (1KVA) — very useful given frequent power issues
-    "inverter-1kva": [
-        "https://www.jumia.com.ng/mlp-1kva-inverters/"   # Jumia collection page (lots of model options)
-    ],
-
-    # Wi-Fi router / home networking (Huawei / TP-Link)
-    "wifi-router-huawei": [
-        "https://www.jumia.com.ng/mlp-huawei-wifi-router/"   # Jumia collection for routers
-    ]
+    # ...add more real product URLs under new groups as needed...
 }
 
 MIN_DROP_PERCENT_FOR_CHANNEL = 5.0   # % price drop
