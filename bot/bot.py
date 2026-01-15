@@ -322,8 +322,10 @@ async def check_all_watches(context: ContextTypes.DEFAULT_TYPE):
 
 async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
     """
-    Scrapes ALL products every run to keep DB fresh.
-    Posts only the top X eligible deals based on how long it's been since their last post.
+    - Scrapes ALL products every run to keep DB fresh.
+    - Detects 'Significant Change' by comparing current price to the last price posted.
+    - Respects MAX_CHANNEL_POSTS_PER_RUN by prioritizing the longest-waiting deals.
+    - Loops through CHANNEL_DEAL_CHAT_ID list to post to multiple targets.
     """
     start_time = time.time()
     LOG.info("--- CHANNEL DEALS JOB STARTED ---")
@@ -333,16 +335,16 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
         return
 
     max_posts = MAX_CHANNEL_POSTS_PER_RUN or 5
-    send_delay = 60 
+    send_delay = 15  # Reasonable delay to prevent API flood limits
     eligible_candidates = []
     now = datetime.now(timezone.utc)
 
-    # --- PHASE 1: SCRAPE EVERYTHING ---
+    # --- PHASE 1: SCRAPE EVERYTHING & UPDATE DB ---
     for group_key, urls in CHANNEL_MONITORED_URLS.items():
         entries = []
         for url in urls:
             try:
-                # Scrape every URL to ensure snapshots are updated
+                # Always scrape to ensure the general DB has the latest prices
                 data = await asyncio.get_event_loop().run_in_executor(None, scrape_product, url)
                 if data and data.get("current_price") is not None:
                     entries.append({"url": url, "data": data})
@@ -352,142 +354,130 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
         if not entries:
             continue
 
-        # --- PHASE 2: EVALUATE ELIGIBILITY ---
+        # --- PHASE 2: EVALUATE ELIGIBILITY & SIGNIFICANT CHANGE ---
         best_entry = min(entries, key=lambda e: float(e["data"]["current_price"]))
-        best_price = float(best_entry["data"]["current_price"])
+        current_price = float(best_entry["data"]["current_price"])
         
-        # Load historical data for gating
-        old_prices = []
+        # We need the last price we ACTUALLY POSTED to calculate "Significant Change"
+        last_posted_price = None
         last_posted_at_dt = datetime.min.replace(tzinfo=timezone.utc)
         
         for e in entries:
             snap = await load_channel_snapshot(e["url"])
-            if snap:
-                if snap.get("current_price"): old_prices.append(float(snap["current_price"]))
-                if snap.get("last_posted_at"):
-                    try:
-                        dt = datetime.fromisoformat(snap["last_posted_at"])
-                        if dt > last_posted_at_dt: last_posted_at_dt = dt
-                    except: pass
+            if snap and snap.get("last_posted_at"):
+                try:
+                    dt = datetime.fromisoformat(snap["last_posted_at"])
+                    if dt > last_posted_at_dt:
+                        last_posted_at_dt = dt
+                        # Extract the price we had when we last made a post
+                        last_posted_price = float(snap.get("current_price") or current_price)
+                except: pass
 
-        highest_old = max(old_prices) if old_prices else best_price
-        is_new = not old_prices
-        drop_pct = round(((highest_old - best_price) / highest_old) * 100, 1) if highest_old > best_price else 0.0
-        
+        is_new = last_posted_price is None
         is_crypto = any("binance" in (e["data"].get("site", "").lower()) or "SYMBOL:" in e["url"] for e in entries)
-
-        # Gating Logic
-        should_post = True
-        if not is_new and not is_crypto and drop_pct < 3.0:
-            should_post = False
         
+        # Logic for "Significant Change"
+        # If item is new, it's significant. If not, check if price dropped by 3% vs last post.
+        ref_price = last_posted_price if last_posted_price else current_price
+        drop_pct = round(((ref_price - current_price) / ref_price) * 100, 1) if ref_price > current_price else 0.0
+        
+        should_post = False
+        if is_new:
+            should_post = True
+        elif is_crypto and abs(drop_pct) >= 1.0:
+            should_post = True
+        elif drop_pct >= 3.0: # Significant 3% drop
+            should_post = True
+            LOG.info("Significant drop for %s: %.1f%% lower than last post", group_key, drop_pct)
+
         if should_post:
-            # Add to queue for sorting
             eligible_candidates.append({
                 "group_key": group_key,
                 "best_entry": best_entry,
                 "entries": entries,
-                "last_posted_at": last_posted_at_dt,
-                "stats": {"drop_pct": drop_pct, "highest_old": highest_old, "is_new": is_new, "is_crypto": is_crypto}
+                "last_posted_at": last_posted_at_dt, # For sorting
+                "stats": {"drop_pct": drop_pct, "is_new": is_new, "is_crypto": is_crypto, "savings": ref_price - current_price}
             })
 
-    # --- PHASE 3: SORT & LIMIT POSTS ---
-    # Sort by last_posted_at (ascending) so the ones NOT posted for the longest time come first
+    # --- PHASE 3: SORT & LIMIT ---
+    # Sort by last_posted_at (ascending) to get the longest-waiting/never-posted deals first
     eligible_candidates.sort(key=lambda x: x["last_posted_at"])
     
     to_post = eligible_candidates[:max_posts]
     posted_count = 0
 
+    # --- PHASE 4: MULTI-CHANNEL POSTING LOOP ---
     for item in to_post:
         group_key = item["group_key"]
         best_entry = item["best_entry"]
         stats = item["stats"]
         
-        best_price = float(best_entry["data"]["current_price"])
-        best_site = best_entry["data"].get("site", "unknown").upper()
-        best_image = best_entry["data"].get("image")
+        price = float(best_entry["data"]["current_price"])
+        site = best_entry["data"].get("site", "unknown").upper()
+        image = best_entry["data"].get("image")
         description = best_entry["data"].get("description", "").strip()
-        savings = stats["highest_old"] - best_price
-
-        # === CAPTION TEMPLATES (STRUCTURE UNCHANGED) ===
         title = (best_entry["data"].get("title") or group_key.replace("-", " ").title()).strip()
 
+        # Build Caption
         if stats["is_crypto"]:
             header = "🆕 NEW CRYPTO TRACKED" if stats["is_new"] else "📊 CRYPTO PRICE UPDATE"
             caption = (
-                f"*{header}*\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"💰 Current: {_safe_currency(best_price)}\n"
-                f"📊 Change: {stats['drop_pct']}%\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
+                f"*{header}*\n━━━━━━━━━━━━━━━━━━\n"
+                f"💰 Current: {_safe_currency(price)}\n"
+                f"📊 Change: {stats['drop_pct']}%\n━━━━━━━━━━━━━━━━━━\n"
                 f"🔗 Trade: {best_entry['url']}"
-            )
-        elif len(item["entries"]) > 1:
-            caption = (
-                f"⚔️ *PRICE WAR DETECTED*\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"🏆 BEST: {best_site} — {_safe_currency(best_price)}\n"
-                f"🛒 [Buy Here]({best_entry['url']})\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"Compare across {len(item['entries'])} sites"
             )
         else:
             header = "🆕 NEW DEAL!" if stats["is_new"] else f"🔥 {stats['drop_pct']}% DROP!"
             caption = (
-                f"*{header}*\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
+                f"*{header}*\n━━━━━━━━━━━━━━━━━━\n"
                 f"📦 {title}\n"
-                f"💰 Now: {_safe_currency(best_price)}\n"
-                f"📉 Saved: {_safe_currency(savings)}\n"
-                f"━━━━━━━━━━━━━━━━━━\n"
-                f"🛒 [Shop on {best_site}]({best_entry['url']})"
+                f"💰 Now: {_safe_currency(price)}\n"
+                f"📉 Saved: {_safe_currency(stats['savings'])}\n━━━━━━━━━━━━━━━━━━\n"
+                f"🛒 [Shop on {site}]({best_entry['url']})"
             )
 
         caption += "\n\n🔔"
-
         if description:
-            remaining_space = 1024 - len(caption) - 50
-            truncated_desc = description[:max(remaining_space, 300)]
-            if len(description) > len(truncated_desc): truncated_desc += "..."
-            caption += f"\n\n📄 *Product Details:*\n{truncated_desc}"
+            remaining = 1024 - len(caption) - 60
+            truncated = description[:max(remaining, 300)]
+            if len(description) > len(truncated): truncated += "..."
+            caption += f"\n\n📄 *Product Details:*\n{truncated}"
 
-        # --- SENDING ---
-        sent = False
-        try:
-            if best_image:
-                # Removed disable_web_page_preview as it's not valid for send_photo
-                await context.bot.send_photo(
-                    chat_id=CHANNEL_DEAL_CHAT_ID,
-                    photo=best_image,
-                    caption=caption,
-                    parse_mode="Markdown"
-                )
-                sent = True
-        except Exception as e:
-            LOG.warning("Photo failed for %s: %s", group_key, e)
-
-        if not sent:
+        # Send to EACH target ID in the CHANNEL_DEAL_CHAT_ID list
+        sent_successfully = False
+        for chat_id in CHANNEL_DEAL_CHAT_ID:
             try:
-                await context.bot.send_message(
-                    chat_id=CHANNEL_DEAL_CHAT_ID,
-                    text=caption,
-                    parse_mode="Markdown",
-                    disable_web_page_preview=True
-                )
-                sent = True
+                if image:
+                    await context.bot.send_photo(
+                        chat_id=chat_id,
+                        photo=image,
+                        caption=caption,
+                        parse_mode="Markdown"
+                    )
+                else:
+                    await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=caption,
+                        parse_mode="Markdown",
+                        disable_web_page_preview=True
+                    )
+                sent_successfully = True
+                LOG.info("Post successful for %s in chat %s", group_key, chat_id)
             except Exception as e:
-                LOG.error("Post failed for %s: %s", group_key, e)
+                LOG.error("Failed to post %s to chat %s: %s", group_key, chat_id, e)
 
-        if sent:
-            # Update DB only on successful post
+        if sent_successfully:
+            # Only update snapshot if at least one target received it
             now_iso = now.isoformat()
             for e in item["entries"]:
                 await save_channel_snapshot(e["url"], {**e["data"], "last_posted_at": now_iso})
+            
             posted_count += 1
             if posted_count < len(to_post):
                 await asyncio.sleep(send_delay)
 
-    LOG.info("--- JOB FINISHED: %d posts made ---", posted_count)
+    LOG.info("--- JOB FINISHED: %d deals posted across %d channels ---", posted_count, len(CHANNEL_DEAL_CHAT_ID))
 
 async def check_trials(context: ContextTypes.DEFAULT_TYPE):
     """Validate trials and downgrade users whose trial expired."""
