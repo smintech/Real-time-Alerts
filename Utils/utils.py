@@ -311,8 +311,8 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
         product["stock_status"] = "out_of_stock"
 
     # Final title fallback
-    if product["title"] == "Product":
-        h1 = soup.find("h1")
+    if product["title"] == "Product" or "Buy" in product["title"]:
+        h1 = soup.select_one("h1.-fs20, h1.-pb10, h1.brd, .v-p-hd h1")
         if h1:
             product["title"] = h1.get_text(strip=True)
         elif soup.title:
