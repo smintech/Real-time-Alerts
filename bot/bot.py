@@ -342,6 +342,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
     send_delay = 15  # Reasonable delay to prevent API flood limits
     eligible_candidates = []
     now = datetime.now(timezone.utc)
+    now_iso = now.isoformat()
 
     # --- PHASE 1: SCRAPE EVERYTHING & UPDATE DB ---
     for group_key, urls in CHANNEL_MONITORED_URLS.items():
@@ -351,14 +352,17 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                 # Always scrape to ensure the general DB has the latest prices
                 data = await asyncio.get_event_loop().run_in_executor(None, scrape_product, url)
                 if data and data.get("current_price") is not None:
-                    # FIX: Load existing channel snapshot to preserve last_posted_at, then save/refresh with new data
-                    # This extends expires_at and updates last_seen/current_price without touching last_posted_at
+                    # Preserve last_posted_at and last_posted_price from existing snapshot
                     existing_snap = await load_channel_snapshot(url)
                     last_posted_at = existing_snap.get("last_posted_at") if existing_snap else None
+                    last_posted_price = existing_snap.get("last_posted_price") if existing_snap else None
+
                     await save_channel_snapshot(
                         url, 
-                        {**data, "last_posted_at": last_posted_at},
-                        expires_hours=168  # Example: Bump to 7 days (168 hours) for less-frequent jobs; adjust as needed
+                        {**data, 
+                         "last_posted_at": last_posted_at,
+                         "last_posted_price": last_posted_price},  # Preserve old values
+                        expires_hours=168
                     )
                     entries.append({"url": url, "data": data})
             except Exception as e:
@@ -376,27 +380,36 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
 
         current_price = float(best_entry["data"]["current_price"])
 
-        # We need the last price we ACTUALLY POSTED to calculate "Significant Change"
+        # Find the most recent last_posted_at and the corresponding last_posted_price
         last_posted_price = None
         last_posted_at_dt = datetime.min.replace(tzinfo=timezone.utc)
 
         for e in entries:
             snap = await load_channel_snapshot(e["url"])
-            if snap and snap.get("last_posted_at"):
-                try:
-                    dt = datetime.fromisoformat(snap["last_posted_at"])
-                    if dt > last_posted_at_dt:
-                        last_posted_at_dt = dt
-                        # Extract the price we had when we last made a post
-                        last_posted_price = float(snap.get("current_price") or current_price)
-                except Exception:
-                    pass
+            if snap:
+                dt_str = snap.get("last_posted_at")
+                posted_price = snap.get("last_posted_price")  # Preferred: the group's best at post time
+                if dt_str:
+                    try:
+                        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00") if "Z" in dt_str else dt_str)
+                        if dt > last_posted_at_dt:
+                            last_posted_at_dt = dt
+                            if posted_price is not None:
+                                last_posted_price = float(posted_price)
+                            else:
+                                # Fallback for old snapshots: use the price stored at that time
+                                last_posted_price = float(snap.get("current_price", current_price))
+                    except Exception:
+                        pass
+                elif posted_price is not None:
+                    # Rare edge: price exists but no timestamp
+                    last_posted_price = float(posted_price)
 
         is_new = last_posted_price is None
         is_crypto = any("binance" in (e["data"].get("site", "").lower()) or "SYMBOL:" in e["url"] for e in entries)
 
         # Logic for "Significant Change"
-        ref_price = last_posted_price if last_posted_price else current_price
+        ref_price = last_posted_price if last_posted_price is not None else current_price
         drop_pct = round(((ref_price - current_price) / ref_price) * 100, 1) if ref_price > current_price else 0.0
 
         should_post = False
@@ -466,14 +479,13 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                 price_str = _safe_currency(p)
             except Exception:
                 price_str = str(p)
-            # Site name is now clickable
             comparison_lines.append(
                 f"{mark} <a href=\"{e['url']}\">{site_label}</a>: {price_str}"
             )
 
         comparison_text = "🏪 Comparison:\n" + "\n".join(comparison_lines) if comparison_lines else ""
 
-        # Build Caption (now using HTML for reliable blockquote support)
+        # Build Caption
         if stats["is_crypto"]:
             header = "🆕 NEW CRYPTO TRACKED" if stats["is_new"] else "📊 CRYPTO PRICE UPDATE"
             caption = (
@@ -496,7 +508,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
 
         caption += "\n\n🔔"
 
-        # Quote description using proper HTML blockquote (single block, preserves newlines)
+        # Quote description using proper HTML blockquote
         if description:
             max_caption_len = 1024
             remaining = max_caption_len - len(caption) - len("\n\n📄 <b>Product Details:</b>\n<blockquote></blockquote>") - 10
@@ -507,7 +519,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                 truncated += "..."
             caption += f"\n\n📄 <b>Product Details:</b>\n<blockquote>{truncated}</blockquote>"
 
-        # Send to EACH target ID in the CHANNEL_DEAL_CHAT_ID list
+        # Send to EACH target ID
         sent_successfully = False
         targets = CHANNEL_DEAL_CHAT_ID if isinstance(CHANNEL_DEAL_CHAT_ID, list) else [CHANNEL_DEAL_CHAT_ID]
         for chat_id in targets:
@@ -532,13 +544,14 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                 LOG.error("Failed to post %s to chat %s: %s", group_key, chat_id, e)
 
         if sent_successfully:
-            now_iso = now.isoformat()
+            # Update ALL snapshots in the group with the new timestamp AND the group's current best price
             for e in item["entries"]:
-                # When posting, update with new last_posted_at (overrides the preserved one from scrape)
                 await save_channel_snapshot(
                     e["url"], 
-                    {**e["data"], "last_posted_at": now_iso},
-                    expires_hours=168  # Consistent with scrape update
+                    {**e["data"], 
+                     "last_posted_at": now_iso,
+                     "last_posted_price": price},  # ← Critical: same best price for the whole group
+                    expires_hours=168
                 )
                 LOG.info("Updating snapshot for group %s with price ₦%.0f at %s", group_key, price, now_iso)
                 
