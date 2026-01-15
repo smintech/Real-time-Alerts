@@ -33,31 +33,64 @@ NOTIFY_ON_DELISTED = True      # send user notice on delist/OOS/pause
 AUTO_POST_TO_CHANNEL = True  # Set to False to disable entirely
 CHANNEL_DEAL_CHAT_ID = [int(x.strip()) for x in os.getenv("CHANNEL", "").split(",") if x.strip()] # Your channel ID (make bot admin with post rights)
 
-# Channel monitoring settings
-# Use a unique Key for each product to force comparison
 CHANNEL_MONITORED_URLS = {
+    # Phones (originals kept)
     "iphone-15-pro-max-256": [
-        "https://www.jumia.com.ng/apple-iphone-15-pro-max-6.7-256gb-nano-sim-esim-5g-natural-381382767.html",
-        "https://www.konga.com/product/apple-iphone-15-pro-max-6-7-256gb-rom-8gb-ram-1-sim-esim-5g-4441mah-blue-6612850"
+        "https://www.jumia.com.ng/apple-iphone-15-pro-max-6.7-256gb-nano-sim-esim-5g-natural-381382767.html",   # Jumia — live
+        "https://www.konga.com/product/apple-iphone-15-pro-max-6-7-256gb-rom-8gb-ram-1-sim-esim-5g-4441mah-blue-6612850"  # Konga — live
     ],
     "iphone-15-pro-128": [
         "https://www.jumia.com.ng/apple-iphone-15-pro-6.1-128gb-rom-8gb-ram-nano-sim-white-389800758.html",
         "https://www.konga.com/product/apple-iphone-15-pro-6-1-128gb-rom-8gb-ram-nano-sim-5g-6826852"
     ],
+
+    # Gaming
     "ps5-slim-1tb": [
         "https://www.jumia.com.ng/sony-playstation-5-slim-ps5-slim-console-1tb-410637026.html",
         "https://www.konga.com/product/sony-playstation-5-slim-ps5-slim-console-1tb-6834464"
     ],
+
+    # Laptops
     "macbook-air-m3-256": [
         "https://www.jumia.com.ng/apple-macbook-air-13-m3-chip-8gb-256gb-space-gray-389242856.html",
         "https://www.konga.com/product/apple-macbook-air-m3-chip-with-8-core-cpu-and-8-core-gpu-256gb-ssd-silver-13-inch-6656405"
     ],
+
+    # Earbuds — replaced dead Konga entry with a working Konga product (several Konga Oraimo FreePods 4 pages available)
     "freepods-4": [
-        "https://www.jumia.com.ng/oraimo-freepods-4-anc-wireless-stereo-earbuds-413570378.html",
-        "https://www.konga.com/product/oraimo-freepods-4-active-noise-cancellation-wireless-earbuds-6295340"
+        "https://www.jumia.com.ng/oraimo-freepods-4-anc-wireless-stereo-earbuds-413570378.html",   # Jumia (live)
+        "https://www.konga.com/product/oraimo-freepods-4-anc-true-wireless-stereo-earbuds-6624829"  # Konga (working replacement)
     ],
+
+    # Crypto (keep BINANCE symbol reference)
     "crypto-eth": [
         "SYMBOL:ETHUSDT"
+    ],
+
+    # --- NEW useful products for Nigerian shoppers (examples) ---
+    # Popular/affordable Android phone (Tecno CAMON series)
+    "tecno-camon-30": [
+        "https://www.jumia.com.ng/camon-30-5g-6.78-512gb88gb-dual-sim-5000mah-dark-tecno-mpg8184353.html"
+    ],
+
+    # Xiaomi / Redmi midrange phone
+    "xiaomi-redmi-note-12": [
+        "https://www.jumia.com.ng/mlp-xiaomi-redmi-note-12/"   # Jumia listing/collection (good for scraping variations)
+    ],
+
+    # Power banks (20000mAh popular models)
+    "powerbank-20k": [
+        "https://www.jumia.com.ng/mlp-k-20000mah-power-bank/"   # Jumia collection with multiple sellers/models
+    ],
+
+    # Home inverter (1KVA) — very useful given frequent power issues
+    "inverter-1kva": [
+        "https://www.jumia.com.ng/mlp-1kva-inverters/"   # Jumia collection page (lots of model options)
+    ],
+
+    # Wi-Fi router / home networking (Huawei / TP-Link)
+    "wifi-router-huawei": [
+        "https://www.jumia.com.ng/mlp-huawei-wifi-router/"   # Jumia collection for routers
     ]
 }
 
