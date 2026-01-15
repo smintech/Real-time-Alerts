@@ -188,7 +188,7 @@ def _migrate_channel_table():
         if conn:
             pool_conn.putconn(conn)
 
-def _db_upsert_channel_snapshot(ref: str, snapshot: dict, expires_hours: int = 48):
+def _db_upsert_channel_snapshot(ref: str, snapshot: dict, expires_hours: int):
     conn = None
     try:
         pool_conn = get_pg_pool()
@@ -339,7 +339,7 @@ async def save_snapshot(snapshot: dict, redis_ttl: int = REDIS_TTL_SECONDS):
     except Exception:
         logger.exception("Failed updating alternatives index for %s", snapshot.get("url"))
 
-async def save_channel_snapshot(ref: str, snapshot: dict, ttl_seconds: int = 48 * 3600):
+async def save_channel_snapshot(ref: str, snapshot: dict, ttl_seconds: int = 48 * 3600, expires_hours: int = 48):
     loop = asyncio.get_event_loop()
     key = _channel_key(ref)
 
@@ -365,7 +365,7 @@ async def save_channel_snapshot(ref: str, snapshot: dict, ttl_seconds: int = 48 
         pass
 
     try:
-        await loop.run_in_executor(None, _db_upsert_channel_snapshot, ref, snapshot)
+        await loop.run_in_executor(None, _db_upsert_channel_snapshot, ref, snapshot, expires_hours)
     except Exception:
         logger.exception("DB channel upsert failed %s", ref)
 
