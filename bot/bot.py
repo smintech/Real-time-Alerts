@@ -323,7 +323,7 @@ async def check_all_watches(context: ContextTypes.DEFAULT_TYPE):
 async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE, force: bool = False, send_delay_seconds: int | None = None):
     """
     Monitors monitored product groups, compares prices, and posts a single professional
-    Photo + Caption message to the channel.
+    Photo + Caption message to the channel with persistence gating.
     """
     start_time = time.time()
     LOG.info("--- CHANNEL DEALS JOB STARTED ---")
@@ -341,10 +341,6 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE, force
 
     # --- 1. SCRAPE & GROUP ---
     grouped: Dict[str, list] = {}
-    
-    # We loop through your manually defined PRODUCT_GROUPS
-    # (Assuming CHANNEL_MONITORED_URLS is now a dictionary based on previous advice)
-    # If it's still a list, we wrap it in a dummy group, but dictionary is best.
     iterable_groups = CHANNEL_MONITORED_URLS if isinstance(CHANNEL_MONITORED_URLS, dict) else {"Mixed Products": CHANNEL_MONITORED_URLS}
 
     for group_key, url_list in iterable_groups.items():
@@ -353,7 +349,6 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE, force
         entries_for_group = []
         for url in url_list:
             try:
-                # Run blocking scrape in executor
                 loop = asyncio.get_event_loop()
                 data = await loop.run_in_executor(None, scrape_product, url)
                 
@@ -376,62 +371,64 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE, force
         # A. Find Best Price
         best_entry = min(entries, key=lambda x: float(x["data"].get("current_price") or float("inf")))
         best_price = float(best_entry["data"]["current_price"])
-        best_site = _get_domain_from_url(best_entry["url"]).upper() # e.g., JUMIA, KONGA
+        best_site = _get_domain_from_url(best_entry["url"]).upper() 
         best_image = best_entry["data"].get("image") or (best_entry["data"].get("images") or [None])[0]
 
-        # B. Analyze History (Snapshot)
-        old_prices = []
-        last_posted_at = None
-        
-        for e in entries:
-            snap = await load_channel_snapshot(e["url"])
-            if snap:
-                if snap.get("current_price"): old_prices.append(float(snap["current_price"]))
-                if snap.get("last_posted_at"):
-                    try:
-                        dt = datetime.fromisoformat(snap["last_posted_at"])
-                        if not last_posted_at or dt > last_posted_at: last_posted_at = dt
-                    except: pass
-
-        highest_old = max(old_prices) if old_prices else 0.0
-        is_new = highest_old <= 0
-
-        # Calculate Stats
-        percent_change = round(((best_price - highest_old) / highest_old) * 100, 2) if (highest_old > 0 and not is_new) else 0.0
-        drop_pct = -percent_change if percent_change < 0 else 0.0
-        savings = highest_old - best_price
-
-        # C. Identify Type
+        # B. Identify Type
         is_crypto = any("binance" in (e["data"].get("site") or "").lower() or str(e["url"]).startswith("SYMBOL:") for e in entries)
 
-        # D. Gating Logic (Skip if deal isn't good enough)
+        # C. PERSISTENCE & GATING LOGIC
+        snap = await load_channel_snapshot(best_entry["url"])
+        
+        last_posted_at = None
+        last_posted_price = 0.0
+        
+        if snap:
+            if snap.get("last_posted_at"):
+                try:
+                    last_posted_at = datetime.fromisoformat(snap["last_posted_at"])
+                except: pass
+            last_posted_price = float(snap.get("current_price") or 0.0)
+
+        is_new = last_posted_price <= 0
+        # Percent change relative to the LAST price we actually posted to the channel
+        diff_from_last = last_posted_price - best_price
+        real_drop_pct = (diff_from_last / last_posted_price * 100) if last_posted_price > 0 else 0.0
+
         if not force_mode:
             cooldown = timedelta(hours=4 if is_crypto else 24)
-            time_last = (now - last_posted_at) if last_posted_at else timedelta(days=99)
+            time_since_last = (now - last_posted_at) if last_posted_at else timedelta(days=99)
             
             if is_crypto:
-                # Crypto Gating: Only post if changed > 1% (reduce spam)
-                if abs(percent_change) < 1.0 and not is_new: continue
+                # Crypto: Post if change > 1% or if cooldown expired
+                if abs(real_drop_pct) < 1.0 and time_since_last < cooldown and not is_new:
+                    continue
             else:
-                # E-commerce Gating
-                if time_last < cooldown:
-                    # OVERRIDE: Post if price dropped ANOTHER 5% since last post
-                    if drop_pct < 5.0: continue
+                # E-commerce: Already posted within 24h?
+                if time_since_last < cooldown:
+                    # Only repost if price dropped ANOTHER 5% since that specific post
+                    if real_drop_pct < 5.0: 
+                        LOG.info(f"Skipping {product_key}: Posted {time_since_last} ago and drop only {real_drop_pct}%")
+                        continue
                 else:
-                    # Standard check
-                    if not is_new and drop_pct < 3.0: continue
+                    # Older than 24h: Still requires a 3% drop to be worth a new notification
+                    if not is_new and real_drop_pct < 3.0: 
+                        continue
 
         # --- 3. BUILD THE CAPTION ---
-        # We build one master text block.
+        # Note: percent_change here is calculated for the template stats
+        # (Assuming highest_old logic from your original version for "Was/Now" display)
+        old_prices = [float(e["data"].get("current_price", 0)) for e in entries] # Simplification for template
+        highest_old = max(old_prices) if old_prices else best_price
+        percent_change = round(((best_price - highest_old) / highest_old) * 100, 2) if highest_old > 0 else 0.0
+        drop_pct = -percent_change if percent_change < 0 else 0.0
+        savings = highest_old - best_price
         
-        # Safe Currency Formatter (Assuming you updated _safe_currency with Binance logic)
         curr_str = _safe_currency(best_price, best_entry["data"].get("site", ""))
 
         if is_crypto:
-            # === CRYPTO CAPTION TEMPLATE ===
             direction = "🚀 PUMPING" if percent_change > 0 else ("📉 DUMPING" if percent_change < 0 else "⚖️ STABLE")
             color = "🟢" if percent_change > 0 else "🔴"
-            
             caption = (
                 f"{color} **{direction}: {product_key}**\n"
                 f"━━━━━━━━━━━━━━━━\n"
@@ -440,39 +437,28 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE, force
                 f"━━━━━━━━━━━━━━━━\n"
                 f"🔗 [Trade on Binance]({best_entry['url']})"
             )
-        
         elif len(entries) > 1:
-            # === PRICE BATTLE TEMPLATE (Comparison) ===
-            # Sort entries: Cheapest first
             sorted_deals = sorted(entries, key=lambda x: float(x["data"]["current_price"]))
             winner = sorted_deals[0]
-            loser = sorted_deals[-1] # Most expensive
-            
+            loser = sorted_deals[-1]
             loser_price = float(loser["data"]["current_price"])
             price_diff = loser_price - best_price
-            
-            # Extract site names for cleaner display
             winner_site = winner['data'].get('site', 'Unknown').upper()
             loser_site = loser['data'].get('site', 'Unknown').upper()
             
             caption = (
                 f"⚔️ **PRICE WARS: {product_key}**\n"
                 f"━━━━━━━━━━━━━━━━\n"
-                # Winner Name is now a clickable link
                 f"🏆 **WINNER:** [{winner_site}]({winner['url']})\n"
                 f"✅ Price: `{curr_str}`\n\n"
-                # Loser Name is now a clickable link
                 f"❌ **LOSER:** [{loser_site}]({loser['url']})\n"
                 f"💀 Price: ~{_safe_currency(loser_price)}~\n\n"
                 f"📉 **You Save:** `{_safe_currency(price_diff)}`\n"
                 f"━━━━━━━━━━━━━━━━\n"
                 f"🛒 [GRAB THE DEAL]({winner['url']})"
             )
-            
         else:
-            # === STANDARD SINGLE DEAL TEMPLATE ===
             header = "🆕 **FRESH FIND**" if is_new else f"🔥 **HOT DROP: {drop_pct}% OFF**"
-            
             caption = (
                 f"{header}\n"
                 f"━━━━━━━━━━━━━━━━\n"
@@ -484,55 +470,40 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE, force
                 f"🛒 [View Deal on {best_site}]({best_entry['url']})"
             )
 
-        # Add generic footer
         caption += f"\n\n🔔"
 
-        # --- 4. SENDING LOGIC (Photo Priority) ---
+        # --- 4. SENDING LOGIC ---
         targets = CHANNEL_DEAL_CHAT_ID if isinstance(CHANNEL_DEAL_CHAT_ID, list) else [CHANNEL_DEAL_CHAT_ID]
         
         for chat_id in targets:
             sent_ok = False
             try:
-                # A. Try sending as PHOTO with CAPTION
                 if best_image and "http" in best_image:
                     await context.bot.send_photo(
-                        chat_id=chat_id, 
-                        photo=best_image, 
-                        caption=caption, 
-                        parse_mode="Markdown"
+                        chat_id=chat_id, photo=best_image, caption=caption, parse_mode="Markdown"
                     )
                     sent_ok = True
                     LOG.info(f"Sent PHOTO post for {product_key}")
-                
             except Exception as e:
                 LOG.warning(f"Failed to send photo for {product_key}: {e}")
             
-            # B. Fallback: If photo failed (or didn't exist), send TEXT only
             if not sent_ok:
                 try:
-                    # We enable preview so the link might generate a thumbnail
                     await context.bot.send_message(
-                        chat_id=chat_id, 
-                        text=caption, 
-                        parse_mode="Markdown", 
-                        disable_web_page_preview=False
+                        chat_id=chat_id, text=caption, parse_mode="Markdown", disable_web_page_preview=False
                     )
                     sent_ok = True
                     LOG.info(f"Sent TEXT fallback for {product_key}")
                 except Exception as e:
                     LOG.error(f"Failed to send text fallback for {product_key}: {e}")
 
-            # C. Update Database if sent
             if sent_ok:
                 now_iso = now.isoformat()
-                for e in entries:
-                    await save_channel_snapshot(e["url"], {**e["data"], "last_posted_at": now_iso})
+                # Crucial: Update the snapshot with the price and time it was actually POSTED
+                await save_channel_snapshot(best_entry["url"], {**best_entry["data"], "last_posted_at": now_iso})
         
         posted_count += 1
-        
-        # D. Smart Sleep (Throttle)
         if posted_count < len(grouped) and send_delay_seconds > 0:
-            LOG.info(f"Sleeping {send_delay_seconds}s before next post...")
             await asyncio.sleep(send_delay_seconds)
 
     duration = time.time() - start_time
