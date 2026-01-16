@@ -432,3 +432,31 @@ async def fetch_alternatives(product_key: str, exclude_site: str = None) -> list
         return results
 
     return await loop.run_in_executor(None, _fetch)
+
+def wipe_channel_snapshots_redis(dry_run: bool = False) -> int:
+    """
+    Wipes Redis channel snapshots only (channel:snap:*).
+
+    dry_run=True → just prints keys, does NOT delete
+    Returns number of keys matched.
+    """
+    r = get_redis()
+    pattern = f"{CHANNEL_REDIS_PREFIX}*"
+    keys = list(r.scan_iter(pattern))
+
+    logger.warning("Channel snapshot Redis wipe requested | keys=%d | dry_run=%s", len(keys), dry_run)
+
+    for key in keys:
+        try:
+            ttl = r.ttl(key)
+            val = r.get(key)
+            logger.warning("KEY=%s TTL=%s VAL=%s", key, ttl, val[:200] if val else None)
+        except Exception:
+            logger.warning("KEY=%s (unable to read value)", key)
+
+    if keys and not dry_run:
+        r.delete(*keys)
+        logger.warning("Channel snapshot Redis wipe completed")
+
+    return len(keys)
+
