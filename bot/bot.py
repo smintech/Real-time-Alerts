@@ -436,7 +436,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             })
 
     # --- PHASE 3: SORT & LIMIT ---
-    eligible_candidates.sort(key=lambda x: x["last_posted_at"])
+    eligible_candidates.sort(key=lambda x: (0 if x["last_posted_at"] == datetime.min.replace(tzinfo=timezone.utc) else 1,x["last_posted_at"] ))
 
     to_post = eligible_candidates[:max_posts]
     posted_count = 0
