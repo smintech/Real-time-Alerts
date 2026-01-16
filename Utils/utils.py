@@ -248,7 +248,7 @@ def _gather_price_candidates_from_dom(soup: BeautifulSoup) -> List[float]:
 
     return found
 
-def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain: str, page_text: str) -> Optional[float]:
+def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain: str, page_text: str, current_price: Optional[float]) -> Optional[float]:
     """
     Try many heuristics to find a 'struck' / earlier / list price on the page.
     Returns float or None.
@@ -262,36 +262,21 @@ def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain
             if offers:
                 offers_list = offers if isinstance(offers, list) else [offers]
                 for offer in offers_list:
-                    # priceBeforeDiscount, listPrice, price, priceSpecification
-                    for key in ("priceBeforeDiscount", "listPrice", "price", "priceSpecification"):
-                        v = offer.get(key) if isinstance(offer, dict) else None
-                        if v:
-                            if isinstance(v, dict):
-                                sub = v.get("price") or v.get("value")
-                                if isinstance(sub, (int, float)):
-                                    candidates.append(float(sub))
-                                elif isinstance(sub, str):
-                                    p = _parse_price_string(sub)
-                                    if p:
-                                        candidates.append(p)
-                            else:
-                                p = _parse_price_string(str(v))
-                                if p:
-                                    candidates.append(p)
-                    # sometimes there's a separate 'wasPrice' or 'previousPrice'
-                    for alt in ("wasPrice", "priceBefore", "previousPrice", "priceBeforeDiscount", "was_price"):
-                        if isinstance(offer, dict) and alt in offer:
-                            p = _parse_price_string(str(offer.get(alt)))
-                            if p:
-                                candidates.append(p)
+                    # Check common price fields
+                    for key in ("priceBeforeDiscount", "listPrice", "originalPrice", "highPrice"):
+                        v = offer.get(key)
+                        if isinstance(v, (int, float)):
+                            candidates.append(float(v))
+                        elif isinstance(v, str):
+                            p = _parse_price_string(v)
+                            if p: candidates.append(p)
+                    
                     # nested priceSpecification
-                    ps = offer.get("priceSpecification") if isinstance(offer, dict) else None
+                    ps = offer.get("priceSpecification")
                     if isinstance(ps, dict):
                         v = ps.get("price") or ps.get("value")
-                        if v:
-                            p = _parse_price_string(str(v))
-                            if p:
-                                candidates.append(p)
+                        p = _parse_price_string(str(v))
+                        if p: candidates.append(p)
     except Exception:
         pass
 
@@ -310,73 +295,68 @@ def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain
             p = _parse_price_string(txt)
             if p:
                 candidates.append(p)
-            else:
-                for token in re.findall(r"[\d\.,]{6,}", txt):
-                    split = _split_concatenated_numeric_token(token)
-                    if split:
-                        candidates.extend(split)
 
     # 4) Class/attribute patterns (extra coverage)
     class_selectors = [
-        "[class*='old-price']",
-        "[class*='was-price']",
-        "[class*='wasprice']",
-        "[class*='strike']",
-        "[class*='compare']",
-        "[class*='list-price']",
-        "[class*='regular-price']",
-        "[class*='price--was']",
-        "[class*='price-old']",
-        "[class*='priceWas']",
-        "[class*='previous-price']",
+        "[class*='old-price']", "[class*='was-price']", "[class*='wasprice']",
+        "[class*='strike']", "[class*='list-price']", "[class*='regular-price']",
+        "[class*='price--was']", "[class*='price-old']", "[class*='previous-price']",
+        "span.-old", "div.-old"
     ]
     for sel in class_selectors:
         for el in soup.select(sel):
             txt = el.get_text(" ", strip=True)
             p = _parse_price_string(txt)
-            if p:
-                candidates.append(p)
+            if p: candidates.append(p)
 
-    # 5) Inline label-based fallbacks (e.g., "Was ₦1,500,000", "Original price", "List price")
+    # 5) Inline label-based fallbacks
+    # strictly require a currency symbol or label nearby to avoid phone numbers
     label_patterns = [
-        r"(?:was|was price|original price|list price|before|rrp|recommended retail price|you save)\s*[:\-\u2014]?\s*(?:₦|NGN|N)?\s*[\d\.,]+",
-        r"(?:was|original|list|rrp)\s*(?:[:\-\u2014])\s*[\d\.,]+",
-        r"[\u20A6]\s*[\d\.,]+",  # any ₦ occurrences
+        r"(?:was|old|list|rrp)\s*[:\-\u2014]?\s*(?:₦|NGN|N)?\s*([\d\.,]+)",
+        r"(?:₦|NGN|N)\s*([\d\.,]+)", # strict currency match
     ]
     for pat in label_patterns:
         for m in re.findall(pat, page_text, flags=re.IGNORECASE):
             p = _parse_price_string(m)
-            if p:
-                candidates.append(p)
+            if p: candidates.append(p)
 
-    # 6) Page text fallback - currency token pairs and concatenated numeric tokens
-    # explicit currency-labeled pairs like "₦270000 ₦290000"
+    # 6) Page text fallback - REMOVED the "naked" number scan to prevent phone number matches
+    # Only keep the specific split logic for concatenated currency strings
     for m in re.findall(r"(?:₦|NGN|N)\s*[\d\.,]+\s*(?:₦|NGN|N)\s*[\d\.,]+", page_text):
         parts = re.findall(r"[\d\.,]+", m)
         if len(parts) >= 2:
             p1 = _parse_price_string(parts[0])
             p2 = _parse_price_string(parts[1])
-            if p1:
-                candidates.append(p1)
-            if p2:
-                candidates.append(p2)
-    # try splitting long numeric tokens like '270000290000'
-    for token in re.findall(r"[\d\.,]{8,}", page_text):
-        p = _parse_price_string(token)
-        if p:
-            candidates.append(p)
-        else:
-            split = _split_concatenated_numeric_token(token)
-            if split:
-                candidates.extend(split)
+            if p1: candidates.append(p1)
+            if p2: candidates.append(p2)
 
-    # Clean candidates and enforce sanity
+    # --- CLEANUP & SANITY CHECK ---
     cleaned: List[float] = []
+    
+    # Define a sane upper limit multiplier. 
+    # If previous price is > 10x current price, it's likely a phone number or error.
+    # Exception: If current_price is very low (e.g. < 1000), 10x might still be valid, 
+    # but for phones/laptops, 10x is impossible.
+    limit_multiplier = 10.0 
+    
     for c in candidates:
         try:
             v = float(c)
-            if v <= 0 or v < 10:  # Naira prices <10 are unlikely
+            if v <= 0 or v < 10: 
                 continue
+                
+            # SANITY CHECK:
+            if current_price and current_price > 0:
+                # If the candidate is less than current price, it's not a "previous" price (usually)
+                # But sometimes it is (if price increased).
+                # However, if candidate is > 10x current price, reject it.
+                if v > (current_price * limit_multiplier):
+                    continue
+                
+                # Double check against specific massive numbers you saw in logs (optional hard block)
+                if v > 1_000_000_000: # 1 Billion threshold
+                     continue
+
             cleaned.append(v)
         except Exception:
             continue
@@ -384,8 +364,14 @@ def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain
     if not cleaned:
         return None
 
-    # In most cases the previous/list/struck price is the max (higher than current)
-    return max(cleaned)
+    # Usually previous price is the highest valid number found
+    best_guess = max(cleaned)
+    
+    # Final logical check: if best guess is same as current, return None
+    if current_price and abs(best_guess - current_price) < 1.0:
+        return None
+        
+    return best_guess
 
 # ---------------------------
 # Binance scraper (unchanged)
@@ -665,7 +651,13 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
                     product["current_price"] = max(prices)
 
     page_text = soup.get_text(separator=" ")
-    prev_price = _extract_previous_price(soup, json_ld_data, domain, page_text)
+    prev_price = _extract_previous_price(
+        soup, 
+        json_ld_data, 
+        domain, 
+        page_text, 
+        product["current_price"]
+    )
     if prev_price:
         product["previous_price"] = prev_price
         LOG.info("Found previous price: ₦%.0f for %s", prev_price, product["title"])
