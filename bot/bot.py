@@ -600,28 +600,31 @@ async def check_trials(context: ContextTypes.DEFAULT_TYPE):
 
 async def acquire_long_running_lock(r: redis_async.Redis, lock_name: str = "telegram-bot-single-instance"):
     """
-    Acquires & auto-renews lock using async redis client
+    Acquires & auto-renews an **asynchronous** Redis lock.
+    Uses redis.asyncio's native async lock implementation.
     """
-    lock = await r.lock(lock_name, timeout=90)  # longer initial TTL
+    # Create async lock
+    lock = r.lock(lock_name, timeout=90)  # timeout = TTL in seconds
 
+    # Try to acquire immediately (non-blocking)
     acquired = await lock.acquire(blocking=False)
     if not acquired:
         LOG.warning("Lock already taken — another instance is running")
         return False, None
 
-    LOG.info("Lock acquired — starting renewal task")
+    LOG.info("Async lock acquired — starting renewal task")
 
     async def renew_loop():
         try:
             while True:
                 await asyncio.sleep(40)  # renew more frequently than TTL/2
                 if await lock.owned():
-                    await lock.extend(90)
-                    LOG.debug("Lock renewed")
+                    await lock.extend(90)  # extend TTL
+                    LOG.debug("Async lock renewed")
         except asyncio.CancelledError:
             pass
         except Exception as e:
-            LOG.warning("Lock renewal failed: %s", e)
+            LOG.warning("Async lock renewal failed: %s", e)
 
     renewal_task = asyncio.create_task(renew_loop())
 
