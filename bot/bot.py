@@ -634,16 +634,14 @@ async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYP
 
 async def run_bot():
     """
-    PTB v20+/v21-compatible run_bot intended to be launched as a background task
-    (e.g. asyncio.create_task(run_bot()) from FastAPI startup).
+    PTB v20+/v21-compatible run_bot intended to be launched as a background task.
     """
     global application
 
-    # sanity
     if not TELEGRAM_TOKEN:
         LOG.error("TELEGRAM_TOKEN is empty — bot will not start.")
         return
-        
+
     REDIS_URL = os.getenv("REDIS_URL")
     if not REDIS_URL:
         LOG.error("REDIS_URL not set")
@@ -663,79 +661,92 @@ async def run_bot():
 
         lock, renewal_task = lock_info
 
+        # ── Bot initialization ────────────────────────────────────────
+        LOG.info("Building Telegram Application...")
+        application = Application.builder().token(TELEGRAM_TOKEN).build()
 
-    LOG.info("Building Telegram Application...")
-    application = Application.builder().token(TELEGRAM_TOKEN).build()
+        # Explicit initialize (recommended)
+        await application.initialize()
 
-    # Add handlers and error handler
-    for handler in get_application_handlers():
-        application.add_handler(handler)
-    application.add_error_handler(global_error_handler)
+        # Add handlers & error handler
+        for handler in get_application_handlers():
+            application.add_handler(handler)
+        application.add_error_handler(global_error_handler)
 
-    # Register jobs BEFORE starting so job_queue is present when app starts
-    if application.job_queue:
-        application.job_queue.run_repeating(
-            callback=check_all_watches,
-            interval=CHECK_INTERVAL_SECONDS,
-            first=30,
-            name="price_checker"
+        # Register jobs
+        if application.job_queue:
+            application.job_queue.run_repeating(
+                callback=check_all_watches,
+                interval=CHECK_INTERVAL_SECONDS,
+                first=30,
+                name="price_checker"
+            )
+            application.job_queue.run_repeating(
+                callback=check_and_post_channel_deals,
+                interval=CHECK_INTERVAL_SECONDS,
+                first=10,
+                name="channel_deals"
+            )
+            application.job_queue.run_repeating(
+                callback=check_trials,
+                interval=86400,
+                first=3600,
+                name="trial_checker"
+            )
+
+        # Clean webhook if exists
+        try:
+            await application.bot.delete_webhook(drop_pending_updates=True)
+            LOG.info("Webhook cleared (if any existed)")
+        except Exception as e:
+            LOG.debug("Webhook cleanup: %s", e)
+
+        # Start the bot and polling
+        LOG.info("Starting long-running polling...")
+        await application.start()
+        await application.updater.start_polling(
+            drop_pending_updates=True,
+            allowed_updates=Update.ALL_TYPES
         )
-        application.job_queue.run_repeating(
-            callback=check_and_post_channel_deals,
-            interval=CHECK_INTERVAL_SECONDS,
-            first=10,
-            name="channel_deals"
-        )
-        application.job_queue.run_repeating(
-            callback=check_trials,
-            interval=86400,
-            first=3600,
-            name="trial_checker"
-        )
 
-    # Optional quick test job to confirm job queue is running (uncomment while debugging)
-    # async def _test_job(ctx):
-    #     LOG.info("TEST JOB tick: %s", datetime.now(timezone.utc).isoformat())
-    # application.job_queue.run_repeating(_test_job, interval=10, first=5, name="test_job")
+        # Keep running until cancelled
+        await asyncio.Event().wait()  # Wait forever
 
-    # Attempt to remove webhook (polling is ignored if webhook is set)
-    try:
-        # application.bot may not be ready until initialize() but in practice builder sets it
-        if application.bot:
-            try:
-                await application.bot.delete_webhook()
-                LOG.info("Deleted existing Telegram webhook (if any).")
-            except Exception as e:
-                LOG.debug("delete_webhook() returned: %s", e)
-    except Exception:
-        LOG.debug("Could not check/delete webhook (not fatal).", exc_info=True)
-
-    # Run polling (this will run until stopped); because run_bot() is started as a task,
-    # awaiting run_polling() keeps the background task alive.
-    try:
-        LOG.info("Starting Application.run_polling() (PTB v20+/v21)...")
-        # run_polling handles init/start/stop lifecycle internally
-        await application.run_polling(drop_pending_updates=True)
-        LOG.info("Application.run_polling() finished (bot stopped).")
     except asyncio.CancelledError:
-        LOG.info("run_bot task cancelled — stopping application.")
-        # ensure graceful stop
-        try:
-            await application.stop()
-        except Exception:
-            LOG.exception("Error while stopping application after cancellation.")
-    except Exception as exc:
-        LOG.exception("Unexpected exception in run_polling(): %s", exc)
-        # Try graceful shutdown
-        try:
-            await application.stop()
-        except Exception:
-            LOG.exception("application.stop() failed after run_polling error.")
-    finally:
-        # Ensure resources cleaned
-        try:
-            await application.shutdown()
-        except Exception:
-            LOG.debug("application.shutdown() error (ignored).", exc_info=True)
+        LOG.info("run_bot task cancelled — graceful shutdown")
 
-    LOG.info("run_bot() exit complete.")  # Run forever
+    except Exception as exc:
+        LOG.exception("Fatal error in run_bot: %s", exc)
+
+    finally:
+        LOG.info("Cleaning up resources...")
+
+        # Stop application
+        if application:
+            try:
+                if application.updater:
+                    await application.updater.stop()
+                await application.stop()
+                await application.shutdown()
+            except Exception as e:
+                LOG.warning("Application shutdown error: %s", e)
+
+        # Cancel renewal task
+        if renewal_task:
+            renewal_task.cancel()
+
+        # Release Redis lock
+        if lock:
+            try:
+                if await lock.owned():
+                    await lock.release()
+                    LOG.info("Redis lock released")
+            except Exception as e:
+                LOG.warning("Failed to release lock: %s", e)
+
+        # Close Redis connection
+        if r:
+            await r.aclose()
+            LOG.info("Redis connection closed")
+
+    LOG.info("run_bot finished.")  # Run forever
