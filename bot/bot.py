@@ -412,17 +412,20 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
         drop_pct = round(((ref_price - current_price) / ref_price) * 100, 1) if ref_price > current_price else 0.0
         savings = max(ref_price - current_price, 0)
 
-        should_post = False
-        if is_new:
-            should_post = True
-        elif is_crypto and drop_pct >= 1.0:
-            should_post = True
-        elif drop_pct >= 3.0:
-            should_post = True
+        # Always post the very first time we see/track this group
+        should_post = is_new
 
-        # Prevent reposting if the price actually went UP
-        if should_post and not is_new and current_price >= ref_price:
-            should_post = False
+        if not is_new:
+            # Only post on further drops (current best price < last posted price)
+            if drop_pct > 0:
+                if is_crypto:
+                    # Lighter threshold for crypto (volatile)
+                    if drop_pct >= 1.0:
+                        should_post = True
+                else:
+                    # Use configured thresholds for regular deals
+                    if drop_pct >= MIN_DROP_PERCENT_FOR_CHANNEL and savings >= MIN_SAVINGS_FOR_CHANNEL:
+                        should_post = True
 
         if should_post:
             eligible_candidates.append({
@@ -434,7 +437,12 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             })
 
     # --- PHASE 4: PRIORITIZE & POST ---
-    eligible_candidates.sort(key=lambda x: x["last_posted_at"])
+    # Prioritize biggest drops/savings first, then oldest posted time
+    eligible_candidates.sort(key=lambda x: (
+        -x["stats"]["drop_pct"],   # Biggest % drop first
+        -x["stats"]["savings"],    # Biggest absolute savings
+        x["last_posted_at"]        # Oldest last (for catch-up)
+    ))
     to_post = eligible_candidates[:max_posts]
     
     if not to_post:
