@@ -197,10 +197,12 @@ def _db_upsert_channel_snapshot(ref: str, snapshot: dict, expires_hours: int):
         cur = conn.cursor()
         expires_at = datetime.now(timezone.utc) + timedelta(hours=expires_hours)
         last_posted_at = snapshot.get("last_posted_at")
+        last_posted_price = snapshot.get("last_posted_price")  # Extract once
+
         cur.execute("""
             INSERT INTO channel_snapshots
-              (ref, site, title, url, current_price, raw, last_seen, expires_at, last_posted_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
+              (ref, site, title, url, current_price, raw, last_seen, expires_at, last_posted_at, last_posted_price)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (ref) DO UPDATE SET
               site = EXCLUDED.site,
               title = EXCLUDED.title,
@@ -221,7 +223,7 @@ def _db_upsert_channel_snapshot(ref: str, snapshot: dict, expires_hours: int):
             datetime.now(timezone.utc),
             expires_at,
             last_posted_at,
-            snapshot.get("last_posted_price")
+            last_posted_price          # ← 10th parameter, matches the column
         ))
         conn.commit()
         cur.close()
