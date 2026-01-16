@@ -43,6 +43,7 @@ from bot.persistence import (
     save_channel_snapshot,
     _db_ensure_table,
     delete_expired_channel_snapshots,
+    wipe_channel_snapshots_redis,
 )
 from Utils.format import format_telegram_alert, _safe_currency, update_exchange_rate
 
@@ -657,7 +658,10 @@ async def run_bot():
         for handler in get_application_handlers():
             application.add_handler(handler)
         application.add_error_handler(global_error_handler)
-
+        
+        if os.getenv("WIPE_CHANNEL_REDIS") == "1":
+            wipe_channel_snapshots_redis(dry_run=False)
+        
         # Register jobs
         if application.job_queue:
             application.job_queue.run_repeating(
