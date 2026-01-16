@@ -587,7 +587,7 @@ async def acquire_long_running_lock(r: redis_async.Redis, lock_name: str = "tele
     Uses redis.asyncio's native async lock implementation.
     """
     # Create async lock
-    lock = r.lock(lock_name, timeout=90)  # timeout = TTL in seconds
+    lock = r.lock(lock_name, timeout=50)  # timeout = TTL in seconds
 
     # Try to acquire immediately (non-blocking)
     acquired = await lock.acquire(blocking=False)
@@ -600,9 +600,9 @@ async def acquire_long_running_lock(r: redis_async.Redis, lock_name: str = "tele
     async def renew_loop():
         try:
             while True:
-                await asyncio.sleep(40)  # renew more frequently than TTL/2
+                await asyncio.sleep(20)  # renew more frequently than TTL/2
                 if await lock.owned():
-                    await lock.extend(90)  # extend TTL
+                    await lock.extend(50)  # extend TTL
                     LOG.debug("Async lock renewed")
         except asyncio.CancelledError:
             pass
