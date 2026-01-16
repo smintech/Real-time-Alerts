@@ -618,6 +618,27 @@ async def run_bot():
 
     LOG.info("Building Telegram Application...")
     application = Application.builder().token(TELEGRAM_TOKEN).build()
+    
+    import redis
+    import sys
+
+    REDIS_URL = os.getenv("REDIS_URL")  # Must be set in Render env vars
+    if not REDIS_URL:
+        LOG.error("REDIS_URL not set — cannot acquire lock. Exiting to prevent duplicates.")
+        return
+
+    try:
+        r = redis.from_url(REDIS_URL, decode_responses=True)
+        lock = r.lock("telegram-bot-single-instance", timeout=120, blocking_timeout=10)
+
+        if not lock.acquire(blocking=False):
+            LOG.warning("Another bot instance is already running (lock taken). Exiting to avoid conflicts.")
+            sys.exit(1)  # Hard exit – safe here, prevents polling
+
+        LOG.info("Successfully acquired bot lock — only this instance will run.")
+    except Exception as exc:
+        LOG.exception("Failed to acquire Redis lock: %s", exc)
+        sys.exit(1) 
 
     # Add handlers and error handler
     for handler in get_application_handlers():
