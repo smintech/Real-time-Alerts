@@ -270,18 +270,6 @@ def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain
     # often struck price >= current price; take max candidate (most likely original)
     return max(cleaned)
 
-# --- then, inside scrape_ecommerce, after you have soup, json_ld_data and page_text_lower/page_text defined ---
-# add this (example insertion point: after JSON-LD extraction and before "Price fallbacks"):
-page_text = soup.get_text(separator=" ")
-prev_price = _extract_previous_price(soup, json_ld_data, domain, page_text)
-if prev_price:
-    try:
-        product["previous_price"] = float(prev_price)
-    except Exception:
-        product["previous_price"] = None
-else:
-    product["previous_price"] = None
-
 # ---------------------------
 # Binance scraper (unchanged)
 # ---------------------------
