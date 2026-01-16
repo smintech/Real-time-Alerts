@@ -442,8 +442,6 @@ def _fetch_html(url: str) -> str:
     if response.status_code != 200:
         raise ScrapeError(f"HTTP {response.status_code} for {url}")
     return response.text
-
-
 # ---------------------------
 # Main e-commerce scraper (multi-layer extraction)
 # ---------------------------
@@ -475,7 +473,7 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
         "raw": {},
         "images": [],
         "image": None,
-        "description": "",  # NEW: full product description
+        "description": "",
     }
 
     json_ld_data = None
@@ -487,7 +485,6 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
                 if item.get("@type") == "Product":
                     json_ld_data = item
                     product["title"] = item.get("name") or product["title"]
-                    # Description from JSON-LD
                     if item.get("description"):
                         product["description"] = item["description"].strip()
                     offers = item.get("offers")
@@ -549,7 +546,7 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
             if desc_sel:
                 product["description"] = desc_sel.get_text(separator="\n", strip=True)
 
-    # Image extraction (unchanged from your version)
+    # Image extraction
     def _add_image_candidate(src):
         if not src:
             return
@@ -563,14 +560,6 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
     og_image = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"})
     if og_image and og_image.get("content"):
         _add_image_candidate(og_image["content"])
-
-    twitter_img = soup.find("meta", attrs={"name": "twitter:image"})
-    if twitter_img and twitter_img.get("content"):
-        _add_image_candidate(twitter_img["content"])
-
-    link_img = soup.find("link", rel="image_src")
-    if link_img and link_img.get("href"):
-        _add_image_candidate(link_img["href"])
 
     if "jumia" in domain:
         possible = soup.select("img[class*='prd-img'], img[class*='image'], img[class*='gallery'], img")
@@ -595,6 +584,7 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
             src = urljoin(url, src.strip())
             if src in seen:
                 continue
+            # Filter small icons
             w = img.get("width") or img.get("data-width")
             h = img.get("height") or img.get("data-height")
             try:
@@ -609,59 +599,77 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
             if len(product["images"]) >= 6:
                 break
 
-    # Price fallbacks (your existing code)
+    # -------------------------------------------------------
+    # CRITICAL FIX: CURRENT PRICE EXTRACTION
+    # -------------------------------------------------------
     if product["current_price"] is None:
+        
         # Jumia specific
         if "jumia" in domain:
-            selectors = ["span.-b", ".-fs24", ".prc", ".-prc", "[class*='price']", "div.prc"]
+            selectors = ["span.-b", ".-fs24", ".prc", ".-prc", "div.prc"]
             for sel in selectors:
                 el = soup.select_one(sel)
                 if el:
-                    text = el.get_text(strip=True)
-                    if "₦" in text:
-                        clean = re.sub(r"[^\d]", "", text)
-                        if clean:
-                            try:
-                                product["current_price"] = float(clean)
-                                break
-                            except:
-                                pass
+                    # FIX: Use " " separator so ₦45000₦50000 becomes "₦45000 ₦50000"
+                    text = el.get_text(" ", strip=True) 
+                    p = _parse_price_string(text)
+                    if p:
+                        product["current_price"] = p
+                        break
+
         # Konga specific
         if "konga" in domain and product["current_price"] is None:
-            selectors = ["span._3e_22_199e7", "._3e_22_199e7", "h4._44738_3988u", "[class*='price']"]
+            selectors = ["span._3e_22_199e7", "._3e_22_199e7", "h4._44738_3988u", "div.price", "[class*='price']"]
             for sel in selectors:
                 el = soup.select_one(sel)
                 if el:
-                    text = el.get_text(strip=True)
-                    clean = re.sub(r"[^\d]", "", text)
-                    if clean:
-                        try:
-                            product["current_price"] = float(clean)
-                            break
-                        except:
-                            pass
+                    # FIX: Force space between elements inside the tag
+                    text = el.get_text(" ", strip=True)
+                    
+                    # FIX: Use robust parser instead of blind regex replace
+                    p = _parse_price_string(text)
+                    
+                    # FIX: If parser still returns a massive number (concatenation happened in text source), try split
+                    if p and p > 100_000_000: 
+                        split = _split_concatenated_numeric_token(str(int(p)))
+                        if split:
+                            p = min(split) # Current price is usually the lower one (discounted)
+                            
+                    if p:
+                        product["current_price"] = p
+                        break
 
-        # Generic regex
+        # Generic regex (last resort)
         if product["current_price"] is None:
-            page_text = soup.get_text(separator=" ")
+            page_text = soup.get_text(" ", strip=True) # Use space separator here too!
             matches = re.findall(r"(?:₦|NGN)[\s]?([\d,]+\.?\d*)", page_text)
             if matches:
-                prices = [float(m.replace(",", "")) for m in matches if m.replace(",", "").replace(".", "").isdigit()]
+                prices = []
+                for m in matches:
+                    clean = m.replace(",", "")
+                    try:
+                        prices.append(float(clean))
+                    except:
+                        pass
                 if prices:
+                    # usually the largest price on page is NOT the current price (it might be old price), 
+                    # but for generic fallback, it's risky. 
+                    # Let's try to pick the most frequent or reasonable one, but max() is the standard fallback behavior.
                     product["current_price"] = max(prices)
 
-    page_text = soup.get_text(separator=" ")
-    prev_price = _extract_previous_price(
-        soup, 
-        json_ld_data, 
-        domain, 
-        page_text, 
-        product["current_price"]
-    )
+    # -------------------------------------------------------
+    # PREVIOUS PRICE EXTRACTION (With Sanity Checks)
+    # -------------------------------------------------------
+    page_text = soup.get_text(" ", strip=True) # Ensure spaces
+    
+    # Pass current_price to helper for validation
+    prev_price = _extract_previous_price(soup, json_ld_data, domain, page_text, product["current_price"])
+    
     if prev_price:
         product["previous_price"] = prev_price
         LOG.info("Found previous price: ₦%.0f for %s", prev_price, product["title"])
-    # Stock & title fallbacks (unchanged)
+
+    # Stock & title fallbacks
     page_text_lower = soup.get_text().lower()
     if any(phrase in page_text_lower for phrase in ["out of stock", "sold out", "unavailable", "not available"]):
         product["stock_status"] = "out_of_stock"
@@ -688,11 +696,11 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
                     cleaned.append(u)
         except Exception:
             continue
-    product["images"] = cleaned[:6]  # limit to 6
+    product["images"] = cleaned[:6]
     product["image"] = cleaned[0] if cleaned else None
 
-    # Truncate description to avoid Telegram limits when appended
-    product["description"] = product["description"][:1500].strip()  # safe length
+    # Truncate description
+    product["description"] = product["description"][:1500].strip()
 
     product["raw"] = {"json_ld": json_ld_data} if json_ld_data else {"snippet": product["title"]}
 
