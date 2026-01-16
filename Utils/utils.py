@@ -396,7 +396,23 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
                 prices = [float(m.replace(",", "")) for m in matches if m.replace(",", "").replace(".", "").isdigit()]
                 if prices:
                     product["current_price"] = max(prices)
-
+        
+    if product["current_price"] is None or product["current_price"] > 10_000_000:  # sanity check for garbage
+        page_text = soup.get_text(separator=" ")
+        matches = re.findall(r"₦[\s]*([\d,]+(?:\.\d+)?)", page_text)
+        prices = []
+        for m in matches:
+            clean = m.replace(",", "")
+            if clean.replace(".", "").isdigit():
+                try:
+                    prices.append(float(clean))
+                except:
+                    pass
+        if prices:
+            product["current_price"] = min(prices)
+            LOG.info("Fallback price extraction succeeded: used lowest ₦%.0f from %d prices found on page",
+                     product["current_price"], len(prices))
+        
     # Stock & title fallbacks (unchanged)
     page_text_lower = soup.get_text().lower()
     if any(phrase in page_text_lower for phrase in ["out of stock", "sold out", "unavailable", "not available"]):
