@@ -119,6 +119,168 @@ def normalize_product_key(scrape_result: Dict[str, Any]) -> str:
     price = scrape_result.get("current_price") or 0
     return f"UNK::{site}::{int(price)}"
 
+# --- add near the top of the file with other helpers ---
+def _parse_price_string(s: str) -> Optional[float]:
+    if not s or not isinstance(s, str):
+        return None
+    # Normalize common whitespace (including NBSP) and remove non-digits except dot/comma
+    s = s.replace('\xa0', ' ').strip()
+    # Remove currency letters/symbols but keep digits, commas and dots
+    # Also accept 'N' (sometimes used for Naira) and 'NGN'
+    # We first try to find pieces like 1,234.56 or 1,234
+    m = re.findall(r"[\d\.,]+", s)
+    if not m:
+        return None
+    # choose the longest numeric piece (usually the full price)
+    num = max(m, key=len)
+    # if both comma and dot exist and dot is last 3 characters -> treat comma as thousands
+    try:
+        if ',' in num and '.' in num and num.rfind('.') > num.rfind(','):
+            # 1,234.56 -> remove commas
+            clean = num.replace(',', '')
+        elif num.count(',') > 0 and num.count('.') == 0:
+            # 1,234 or 1.234 (ambiguous). Remove commas as thousands sep
+            clean = num.replace(',', '')
+        else:
+            clean = num
+        # final safe replace any stray non-digit/dot
+        clean = re.sub(r"[^\d\.]", "", clean)
+        if clean == "":
+            return None
+        return float(clean)
+    except Exception:
+        return None
+
+def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain: str, page_text: str) -> Optional[float]:
+    """
+    Try many heuristics to find a 'struck' / earlier / list price on the page.
+    Returns float or None.
+    """
+    candidates = []
+
+    # 1) JSON-LD common fields
+    try:
+        if isinstance(json_ld, dict):
+            # JSON-LD may contain offers -> priceSpecification -> listPrice / priceBeforeDiscount etc.
+            offers = json_ld.get("offers")
+            if offers:
+                if isinstance(offers, list):
+                    offers_list = offers
+                else:
+                    offers_list = [offers]
+                for offer in offers_list:
+                    # priceBeforeDiscount, listPrice, priceValidUntil? priceSpecification
+                    for key in ("priceBeforeDiscount", "listPrice", "price", "priceSpecification"):
+                        v = offer.get(key)
+                        if v:
+                            # priceSpecification might be dict with 'price' or 'value'
+                            if isinstance(v, dict):
+                                sub = v.get("price") or v.get("value") or v.get("priceCurrency")
+                                if isinstance(sub, (int, float)):
+                                    candidates.append(float(sub))
+                                elif isinstance(sub, str):
+                                    p = _parse_price_string(sub)
+                                    if p:
+                                        candidates.append(p)
+                            else:
+                                p = _parse_price_string(str(v))
+                                if p:
+                                    candidates.append(p)
+                    # sometimes there's a separate 'priceBefore' or 'wasPrice'
+                    for alt in ("wasPrice", "priceBefore", "previousPrice", "priceBeforeDiscount"):
+                        if alt in offer:
+                            p = _parse_price_string(str(offer.get(alt)))
+                            if p:
+                                candidates.append(p)
+    except Exception:
+        pass
+
+    # 2) Semantic HTML tags often used for struck price
+    for tag in ("del", "s", "strike"):
+        for el in soup.find_all(tag):
+            txt = el.get_text(" ", strip=True)
+            p = _parse_price_string(txt)
+            if p:
+                candidates.append(p)
+
+    # 3) Common class/attribute patterns
+    class_selectors = [
+        "[class*='old-price']",
+        "[class*='was-price']",
+        "[class*='wasprice']",
+        "[class*='strike']",
+        "[class*='compare']",
+        "[class*='list-price']",
+        "[class*='regular-price']",
+        "[class*='price--was']",
+        "[class*='price-old']",
+        "[class*='priceWas']",
+        "[class*='price-old']",
+        "[class*='previous-price']",
+    ]
+    for sel in class_selectors:
+        for el in soup.select(sel):
+            txt = el.get_text(" ", strip=True)
+            p = _parse_price_string(txt)
+            if p:
+                candidates.append(p)
+
+    # 4) Inline label-based fallbacks (e.g., "Was ₦1,500,000", "Original price", "List price")
+    label_patterns = [
+        r"(?:was|was price|original price|list price|before|rrp|recommended retail price|you save)\s*[:\-\u2014]?\s*(?:₦|NGN|N)?\s*[\d\.,]+",
+        r"(?:was|original|list|rrp)\s*(?:[:\-\u2014])\s*[\d\.,]+",
+        r"[\u20A6]\s*[\d\.,]+",  # any ₦ occurrences
+    ]
+    for pat in label_patterns:
+        for m in re.findall(pat, page_text, flags=re.IGNORECASE):
+            p = _parse_price_string(m)
+            if p:
+                candidates.append(p)
+
+    # 5) If nothing found yet, find HTML fragments with "was" or "save" near price tokens
+    try:
+        # find short snippets containing keywords
+        for phrase in ("was", "save", "you save", "before", "original"):
+            for match in re.finditer(rf"(.{{0,40}}{phrase}.{{0,60}})", page_text, flags=re.IGNORECASE):
+                snippet = match.group(1)
+                p = _parse_price_string(snippet)
+                if p:
+                    candidates.append(p)
+    except Exception:
+        pass
+
+    # Clean candidates and choose the most plausible one
+    cleaned = []
+    for c in candidates:
+        try:
+            if isinstance(c, (int, float)):
+                v = float(c)
+            else:
+                v = float(c)
+            # sanity: ignore zero or tiny numbers
+            if v <= 0 or v < 10:  # Naira prices < 10 unlikely
+                continue
+            cleaned.append(v)
+        except Exception:
+            continue
+
+    if not cleaned:
+        return None
+
+    # often struck price >= current price; take max candidate (most likely original)
+    return max(cleaned)
+
+# --- then, inside scrape_ecommerce, after you have soup, json_ld_data and page_text_lower/page_text defined ---
+# add this (example insertion point: after JSON-LD extraction and before "Price fallbacks"):
+page_text = soup.get_text(separator=" ")
+prev_price = _extract_previous_price(soup, json_ld_data, domain, page_text)
+if prev_price:
+    try:
+        product["previous_price"] = float(prev_price)
+    except Exception:
+        product["previous_price"] = None
+else:
+    product["previous_price"] = None
 
 # ---------------------------
 # Binance scraper (unchanged)
@@ -396,23 +558,12 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
                 prices = [float(m.replace(",", "")) for m in matches if m.replace(",", "").replace(".", "").isdigit()]
                 if prices:
                     product["current_price"] = max(prices)
-        
-    if product["current_price"] is None or product["current_price"] > 10_000_000:  # sanity check for garbage
-        page_text = soup.get_text(separator=" ")
-        matches = re.findall(r"₦[\s]*([\d,]+(?:\.\d+)?)", page_text)
-        prices = []
-        for m in matches:
-            clean = m.replace(",", "")
-            if clean.replace(".", "").isdigit():
-                try:
-                    prices.append(float(clean))
-                except:
-                    pass
-        if prices:
-            product["current_price"] = min(prices)
-            LOG.info("Fallback price extraction succeeded: used lowest ₦%.0f from %d prices found on page",
-                     product["current_price"], len(prices))
-        
+
+    page_text = soup.get_text(separator=" ")
+    prev_price = _extract_previous_price(soup, json_ld_data, domain, page_text)
+    if prev_price:
+        product["previous_price"] = prev_price
+        LOG.info("Found previous price: ₦%.0f for %s", prev_price, product["title"])
     # Stock & title fallbacks (unchanged)
     page_text_lower = soup.get_text().lower()
     if any(phrase in page_text_lower for phrase in ["out of stock", "sold out", "unavailable", "not available"]):
