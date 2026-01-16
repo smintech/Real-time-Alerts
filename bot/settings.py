@@ -78,7 +78,7 @@ CHANNEL_MONITORED_URLS = {
     # ...add more real product URLs under new groups as needed...
 }
 
-MIN_DROP_PERCENT_FOR_CHANNEL = 5.0   # % price drop
+MIN_DROP_PERCENT_FOR_CHANNEL = 3.0   # % price drop
 MIN_SAVINGS_FOR_CHANNEL = 10000      # ₦15,000 minimum savings
 MIN_DEAL_SCORE_FOR_CHANNEL = "medium"  # only medium/high
 MAX_CHANNEL_POSTS_PER_RUN = 5       # safety cap per hour
