@@ -6,6 +6,9 @@ from typing import Dict, Any
 import nest_asyncio
 from telegram.ext import Application, ContextTypes
 import os
+import redis
+import sys
+import redis.asyncio as redis_async
 from Utils.config import TELEGRAM_TOKEN, DB_URL
 from bot.commands import get_application_handlers, user_watches, user_settings, user_subscriptions
 from bot.settings import (
@@ -328,6 +331,10 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
     - Loops through CHANNEL_DEAL_CHAT_ID list to post to multiple targets.
     - Adds per-site comparison (✅ BEST, ⚠️ May consider) with clickable site names.
     - Quotes the product description using proper HTML <blockquote> for reliable rendering.
+
+    FIXED: Grouping is now reliable even with legacy/inconsistent snapshot data.
+          Stuck groups (partial or old posting history) are detected and treated as "new"
+          to force a one-time post that synchronizes all URLs in the group.
     """
     start_time = time.time()
     LOG.info("--- CHANNEL DEALS JOB STARTED ---")
@@ -339,39 +346,38 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
         return
 
     max_posts = MAX_CHANNEL_POSTS_PER_RUN or 5
-    send_delay = 15  # Reasonable delay to prevent API flood limits
+    send_delay = 15
     eligible_candidates = []
     now = datetime.now(timezone.utc)
     now_iso = now.isoformat()
+    min_dt = datetime.min.replace(tzinfo=timezone.utc)
 
     # --- PHASE 1: SCRAPE EVERYTHING & UPDATE DB ---
     for group_key, urls in CHANNEL_MONITORED_URLS.items():
         entries = []
         for url in urls:
             try:
-                # Always scrape to ensure the general DB has the latest prices
                 data = await asyncio.get_event_loop().run_in_executor(None, scrape_product, url)
                 if data and data.get("current_price") is not None:
-                    # Preserve last_posted_at and last_posted_price from existing snapshot
                     existing_snap = await load_channel_snapshot(url)
                     last_posted_at = existing_snap.get("last_posted_at") if existing_snap else None
                     last_posted_price = existing_snap.get("last_posted_price") if existing_snap else None
 
                     await save_channel_snapshot(
-                        url, 
-                        {**data, 
+                        url,
+                        {**data,
                          "last_posted_at": last_posted_at,
-                         "last_posted_price": last_posted_price},  # Preserve old values
+                         "last_posted_price": last_posted_price},
                         expires_hours=168
                     )
-                    entries.append({"url": url, "data": data})
+                    entries.append({"url": url, "data": data, "snap": existing_snap})
             except Exception as e:
                 LOG.warning("Scrape failed for %s in group %s: %s", url, group_key, e)
 
         if not entries:
             continue
 
-        # --- PHASE 2: EVALUATE ELIGIBILITY & SIGNIFICANT CHANGE ---
+        # --- PHASE 2: DETERMINE GROUP HISTORY (consistency check) ---
         try:
             best_entry = min(entries, key=lambda e: float(e["data"]["current_price"]))
         except Exception:
@@ -380,68 +386,87 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
 
         current_price = float(best_entry["data"]["current_price"])
 
-        # Find the most recent last_posted_at and the corresponding last_posted_price
-        last_posted_price = None
-        last_posted_at_dt = datetime.min.replace(tzinfo=timezone.utc)
-
-        for e in entries:
-            snap = await load_channel_snapshot(e["url"])
+        # Collect all (last_posted_at, last_posted_price) tuples
+        history_tuples = []
+        valid_timestamps = []
+        for entry in entries:
+            snap = entry.get("snap") or await load_channel_snapshot(entry["url"])
             if snap:
-                dt_str = snap.get("last_posted_at")
-                posted_price = snap.get("last_posted_price")  # Preferred: the group's best at post time
-                if dt_str:
+                at_str = snap.get("last_posted_at")
+                price_val = snap.get("last_posted_price")
+                history_tuples.append((at_str, price_val))
+
+                if at_str:
                     try:
-                        dt = datetime.fromisoformat(dt_str.replace("Z", "+00:00") if "Z" in dt_str else dt_str)
-                        if dt > last_posted_at_dt:
-                            last_posted_at_dt = dt
-                            if posted_price is not None:
-                                last_posted_price = float(posted_price)
-                            else:
-                                # Fallback for old snapshots: use the price stored at that time
-                                last_posted_price = float(snap.get("current_price", current_price))
+                        dt = datetime.fromisoformat(at_str.replace("Z", "+00:00") if "Z" in at_str else at_str)
+                        valid_timestamps.append(dt)
                     except Exception:
                         pass
-                elif posted_price is not None:
-                    # Rare edge: price exists but no timestamp
-                    last_posted_price = float(posted_price)
 
-        is_new = last_posted_price is None
         is_crypto = any("binance" in (e["data"].get("site", "").lower()) or "SYMBOL:" in e["url"] for e in entries)
 
-        # Logic for "Significant Change"
+        # Determine group state
+        unique_histories = set(filter(None, history_tuples))  # Ignore None/None
+        has_any_history = len(unique_histories) > 0 or any(t[0] or t[1] is not None for t in history_tuples)
+
+        if not has_any_history:
+            # Truly new group
+            is_new = True
+            last_posted_at_dt = min_dt
+            last_posted_price = None
+            LOG.debug("Group %s is truly new", group_key)
+        elif len(unique_histories) <= 1:
+            # Consistent history (or all missing, but we already handled no history)
+            at_str, price_val = (unique_histories.pop() if unique_histories else (None, None))
+            is_new = (price_val is None)
+            last_posted_price = float(price_val) if price_val is not None else None
+
+            # Use the most recent timestamp for "last posted" (consistent anyway)
+            last_posted_at_dt = max(valid_timestamps) if valid_timestamps else min_dt
+        else:
+            # INCONSISTENT — this is the root cause of "silent forever" groups
+            LOG.warning("INCONSISTENT history detected for group %s: %s — treating as NEW to synchronize", group_key, unique_histories)
+            is_new = True
+            last_posted_at_dt = min_dt  # Highest priority to force sync soon
+            last_posted_price = None
+
+        # --- PHASE 3: ELIGIBILITY ---
         ref_price = last_posted_price if last_posted_price is not None else current_price
         drop_pct = round(((ref_price - current_price) / ref_price) * 100, 1) if ref_price > current_price else 0.0
+        savings = max(ref_price - current_price, 0)  # Never negative
 
         should_post = False
         if is_new:
             should_post = True
-        elif is_crypto and abs(drop_pct) >= 1.0:
+        elif is_crypto and drop_pct >= 1.0:
             should_post = True
-        elif drop_pct >= 3.0:  # Significant 3% drop
+        elif drop_pct >= 3.0:
             should_post = True
-            LOG.info("Significant drop for %s: %.1f%% lower than last post", group_key, drop_pct)
-            
+            LOG.info("Significant drop for %s: %.1f%% (₦%.0f → ₦%.0f)", group_key, drop_pct, ref_price, current_price)
+
         if should_post and not is_new:
             if current_price >= ref_price:
                 should_post = False
-                LOG.info("Skipped repost: price not lower (current ₦%.0f >= ref ₦%.0f for %s)", current_price, ref_price, group_key)
+                LOG.info("Skipped repost (no real drop) for %s", group_key)
 
         if should_post:
             eligible_candidates.append({
                 "group_key": group_key,
                 "best_entry": best_entry,
                 "entries": entries,
-                "last_posted_at": last_posted_at_dt,  # For sorting
-                "stats": {"drop_pct": drop_pct, "is_new": is_new, "is_crypto": is_crypto, "savings": ref_price - current_price}
+                "last_posted_at": last_posted_at_dt,
+                "stats": {"drop_pct": drop_pct, "is_new": is_new, "is_crypto": is_crypto, "savings": savings}
             })
 
-    # --- PHASE 3: SORT & LIMIT ---
-    eligible_candidates.sort(key=lambda x: (0 if x["last_posted_at"] == datetime.min.replace(tzinfo=timezone.utc) else 1,x["last_posted_at"] ))
+    # --- PHASE 4: PRIORITIZE longest-waiting first ---
+    eligible_candidates.sort(key=lambda x: x["last_posted_at"])  # Ascending → never-posted/min_dt first, then oldest
 
     to_post = eligible_candidates[:max_posts]
     posted_count = 0
 
-    # --- PHASE 4: MULTI-CHANNEL POSTING LOOP ---
+    # --- PHASE 5: POSTING ---
+    targets = CHANNEL_DEAL_CHAT_ID if isinstance(CHANNEL_DEAL_CHAT_ID, list) else [CHANNEL_DEAL_CHAT_ID]
+
     for item in to_post:
         group_key = item["group_key"]
         best_entry = item["best_entry"]
@@ -453,7 +478,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
         description = best_entry["data"].get("description", "").strip()
         title = (best_entry["data"].get("title") or group_key.replace("-", " ").title()).strip()
 
-        # --- Build per-site comparison lines (sorted by price) ---
+        # Comparison block
         comparison_lines = []
         try:
             sorted_entries = sorted(item["entries"], key=lambda e: float(e["data"].get("current_price") or float("inf")))
@@ -468,30 +493,20 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             except Exception:
                 p = 0.0
             site_label = _get_domain_from_url(e["url"]).upper()
-            rel_pct = round(((p - best_price_val) / best_price_val) * 100, 1) if best_price_val and best_price_val > 0 else 0.0
-            if p == best_price_val:
-                mark = "✅ BEST"
-            elif rel_pct <= 5.0:
-                mark = "⚠️ May consider"
-            else:
-                mark = "•"
-            try:
-                price_str = _safe_currency(p)
-            except Exception:
-                price_str = str(p)
-            comparison_lines.append(
-                f"{mark} <a href=\"{e['url']}\">{site_label}</a>: {price_str}"
-            )
+            rel_pct = round(((p - best_price_val) / best_price_val) * 100, 1) if best_price_val > 0 else 0.0
+            mark = "✅ BEST" if p == best_price_val else ("⚠️ May consider" if rel_pct <= 5.0 else "•")
+            price_str = _safe_currency(p) if p else "N/A"
+            comparison_lines.append(f"{mark} <a href=\"{e['url']}\">{site_label}</a>: {price_str}")
 
         comparison_text = "🏪 Comparison:\n" + "\n".join(comparison_lines) if comparison_lines else ""
 
-        # Build Caption
+        # Caption
         if stats["is_crypto"]:
             header = "🆕 NEW CRYPTO TRACKED" if stats["is_new"] else "📊 CRYPTO PRICE UPDATE"
             caption = (
                 f"<b>{header}</b>\n━━━━━━━━━━━━━━━━━━\n"
                 f"💰 Current: {_safe_currency(price)}\n"
-                f"📊 Change: {stats['drop_pct']}%\n"
+                f"📊 Change: -{stats['drop_pct']}%\n"
                 f"{comparison_text}\n━━━━━━━━━━━━━━━━━━\n"
                 f"🔗 <a href=\"{best_entry['url']}\">Trade on {site}</a>"
             )
@@ -508,58 +523,41 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
 
         caption += "\n\n🔔"
 
-        # Quote description using proper HTML blockquote
         if description:
             max_caption_len = 1024
-            remaining = max_caption_len - len(caption) - len("\n\n📄 <b>Product Details:</b>\n<blockquote></blockquote>") - 10
-            if remaining < 0:
-                remaining = 0
+            overhead = len("\n\n📄 <b>Product Details:</b>\n<blockquote></blockquote>") + 20
+            remaining = max(0, max_caption_len - len(caption) - overhead)
             truncated = description[:remaining].rstrip()
             if len(description) > len(truncated):
                 truncated += "..."
             caption += f"\n\n📄 <b>Product Details:</b>\n<blockquote>{truncated}</blockquote>"
 
-        # Send to EACH target ID
+        # Send
         sent_successfully = False
-        targets = CHANNEL_DEAL_CHAT_ID if isinstance(CHANNEL_DEAL_CHAT_ID, list) else [CHANNEL_DEAL_CHAT_ID]
         for chat_id in targets:
             try:
                 if image:
-                    await context.bot.send_photo(
-                        chat_id=chat_id,
-                        photo=image,
-                        caption=caption,
-                        parse_mode="HTML"
-                    )
+                    await context.bot.send_photo(chat_id=chat_id, photo=image, caption=caption, parse_mode="HTML")
                 else:
-                    await context.bot.send_message(
-                        chat_id=chat_id,
-                        text=caption,
-                        parse_mode="HTML",
-                        disable_web_page_preview=True
-                    )
+                    await context.bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML", disable_web_page_preview=True)
                 sent_successfully = True
-                LOG.info("Post successful for %s in chat %s", group_key, chat_id)
+                LOG.info("Posted %s to chat %s", group_key, chat_id)
             except Exception as e:
-                LOG.error("Failed to post %s to chat %s: %s", group_key, chat_id, e)
+                LOG.error("Failed posting %s to %s: %s", group_key, chat_id, e)
 
         if sent_successfully:
-            # Update ALL snapshots in the group with the new timestamp AND the group's current best price
+            # Synchronize ALL URLs in the group
             for e in item["entries"]:
                 await save_channel_snapshot(
-                    e["url"], 
-                    {**e["data"], 
-                     "last_posted_at": now_iso,
-                     "last_posted_price": price},  # ← Critical: same best price for the whole group
+                    e["url"],
+                    {**e["data"], "last_posted_at": now_iso, "last_posted_price": price},
                     expires_hours=168
                 )
-                LOG.info("Updating snapshot for group %s with price ₦%.0f at %s", group_key, price, now_iso)
-                
             posted_count += 1
             if posted_count < len(to_post):
                 await asyncio.sleep(send_delay)
 
-    LOG.info("--- JOB FINISHED: %d deals posted across %d channels ---", posted_count, len(targets if isinstance(CHANNEL_DEAL_CHAT_ID, list) else 1))
+    LOG.info("--- JOB FINISHED: %d deals posted across %d channels ---", posted_count, len(targets))
 
 async def check_trials(context: ContextTypes.DEFAULT_TYPE):
     """Validate trials and downgrade users whose trial expired."""
@@ -600,6 +598,36 @@ async def check_trials(context: ContextTypes.DEFAULT_TYPE):
             continue
 
 
+async def acquire_long_running_lock(r: redis_async.Redis, lock_name: str = "telegram-bot-single-instance"):
+    """
+    Acquires & auto-renews lock using async redis client
+    """
+    lock = await r.lock(lock_name, timeout=90)  # longer initial TTL
+
+    acquired = await lock.acquire(blocking=False)
+    if not acquired:
+        LOG.warning("Lock already taken — another instance is running")
+        return False, None
+
+    LOG.info("Lock acquired — starting renewal task")
+
+    async def renew_loop():
+        try:
+            while True:
+                await asyncio.sleep(40)  # renew more frequently than TTL/2
+                if await lock.owned():
+                    await lock.extend(90)
+                    LOG.debug("Lock renewed")
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            LOG.warning("Lock renewal failed: %s", e)
+
+    renewal_task = asyncio.create_task(renew_loop())
+
+    return True, (lock, renewal_task)
+
+
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     LOG.exception("Unhandled handler error: %s", context.error)
 
@@ -615,30 +643,29 @@ async def run_bot():
     if not TELEGRAM_TOKEN:
         LOG.error("TELEGRAM_TOKEN is empty — bot will not start.")
         return
+        
+    REDIS_URL = os.getenv("REDIS_URL")
+    if not REDIS_URL:
+        LOG.error("REDIS_URL not set")
+        return
+
+    r = None
+    lock = None
+    renewal_task = None
+
+    try:
+        r = await redis_async.from_url(REDIS_URL, decode_responses=True)
+
+        lock_acquired, lock_info = await acquire_long_running_lock(r)
+        if not lock_acquired:
+            LOG.warning("Could not acquire lock → exiting")
+            return
+
+        lock, renewal_task = lock_info
+
 
     LOG.info("Building Telegram Application...")
     application = Application.builder().token(TELEGRAM_TOKEN).build()
-    
-    import redis
-    import sys
-
-    REDIS_URL = os.getenv("REDIS_URL")  # Must be set in Render env vars
-    if not REDIS_URL:
-        LOG.error("REDIS_URL not set — cannot acquire lock. Exiting to prevent duplicates.")
-        return
-
-    try:
-        r = redis.from_url(REDIS_URL, decode_responses=True)
-        lock = r.lock("telegram-bot-single-instance", timeout=120, blocking_timeout=10)
-
-        if not lock.acquire(blocking=False):
-            LOG.warning("Another bot instance is already running (lock taken). Exiting to avoid conflicts.")
-            sys.exit(1)  # Hard exit – safe here, prevents polling
-
-        LOG.info("Successfully acquired bot lock — only this instance will run.")
-    except Exception as exc:
-        LOG.exception("Failed to acquire Redis lock: %s", exc)
-        sys.exit(1) 
 
     # Add handlers and error handler
     for handler in get_application_handlers():
