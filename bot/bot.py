@@ -477,7 +477,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             try:
                 p = float(e["data"].get("current_price") or 0.0)
             except: p = 0.0
-            site_label = _get_domain_from_url(e["url"]).upper()
+            site_label = e["data"].get("site", _get_domain_from_url(e["url"])).upper()
             rel_pct = round(((p - best_price_val) / best_price_val) * 100, 1) if best_price_val > 0 else 0.0
             mark = "✅ BEST" if p == best_price_val else ("⚠️ Good" if rel_pct <= 5.0 else "•")
             price_str = _safe_currency(p, site=site_label) if p else "N/A"
@@ -490,7 +490,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             header = "🆕 NEW CRYPTO TRACKED" if stats["is_new"] else "📊 CRYPTO PRICE UPDATE"
             caption = (
                 f"<b>{header}</b>\n━━━━━━━━━━━━━━━━━━\n"
-                f"💰 Current: {_safe_currency(price)}\n"
+                f"💰 Current: {_safe_currency(price, site=best_entry['data'].get('site', 'unknown'))}\n"
                 f"📊 Change: -{stats['drop_pct']}%\n\n"
                 f"{comparison_text}\n━━━━━━━━━━━━━━━━━━\n"
                 f"🔗 <a href=\"{best_entry['url']}\">Trade on {site}</a>"
