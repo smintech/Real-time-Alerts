@@ -511,7 +511,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
             max_desc_len = 1024 - len(caption) - 50
             if max_desc_len > 20:
                 truncated = description[:max_desc_len].rstrip() + "..." if len(description) > max_desc_len else description
-                caption += f"\n\n📄 <b>Details:</b>\n<blockquote>{truncated}</blockquote>"
+                caption += f"\n\n📄 <b>Product details:</b>\n<blockquote>{truncated}</blockquote>"
 
         caption += "\n\n🔔 @Real_Time_Alert" # Optional: add your handle
 
