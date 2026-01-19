@@ -921,6 +921,13 @@ def _parse_oando(html: str) -> Dict[str, Any]:
 # ---------------------------
 # Async entrypoint for fuel scrapes (uses the sync _fetch_html in executor)
 # ---------------------------
+FUEL_SITE_SOURCES = [
+    {"url": "https://www.fuelpricewatch.com/fuel-price-index", "parser": _parse_fuelpricewatch},
+    {"url": "https://www.nnpcgroup.com/media-center/news", "parser": _parse_nnpc},
+    {"url": "https://www.totalenergies.com.ng/en", "parser": _parse_total},
+    {"url": "https://www.oandoplc.com/news/", "parser": _parse_oando},
+]
+
 async def scrape_fuel_prices(site_sources: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """
     Async wrapper that fetches multiple fuel price sources using the sync _fetch_html
