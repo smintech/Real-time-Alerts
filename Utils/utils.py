@@ -17,6 +17,7 @@ from typing import Dict, Optional, Any, Tuple, Callable, List
 # Settings / thresholds
 from bot.settings import (
     SUPPORTED_SITES,
+    FUEL_SITE_SOURCES,
     MIN_CHANGE_TO_ALERT,
     HIGH_DEAL_THRESHOLD,
     MEDIUM_DEAL_THRESHOLD,
@@ -932,7 +933,7 @@ async def scrape_fuel_prices(site_sources: Optional[List[Dict[str, Any]]] = None
     }
     """
     loop = asyncio.get_event_loop()
-    sources_cfg = site_sources or _FUEL_SITE_SOURCES
+    sources_cfg = site_sources or FUEL_SITE_SOURCES
 
     async def _fetch_and_parse(source_cfg: Dict[str, Any]) -> Dict[str, Any]:
         url = source_cfg["url"]
