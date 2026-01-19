@@ -498,7 +498,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                 f"💰 Current: {_safe_currency(price, site=best_entry['data'].get('site', 'unknown'))}\n"
                 f"📊 Change: -{stats['drop_pct']}%\n\n"
                 f"{comparison_text}\n━━━━━━━━━━━━━━━━━━\n"
-                f"🔗 <a href=\"{best_entry['url']}\">BINANCE{site}</a>"
+                f"🔗 <a href=\"{best_entry['url']}\">{site}</a>"
             )
         else:
             header = "🆕 NEW DEAL!" if stats["is_new"] else f"🔥 {stats['drop_pct']}% DROP!"
