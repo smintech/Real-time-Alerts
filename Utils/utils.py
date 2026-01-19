@@ -815,3 +815,31 @@ def safe_scrape_product(url: str) -> Tuple[bool, Optional[Dict], Optional[str]]:
     except Exception as e:
         LOG.exception("Unexpected scrape error")
         return False, None, f"Error: {e}"
+
+async def scrape_fuel_prices():
+    """Scrape fuel price data from FuelPriceWatch.com"""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(
+                "https://www.fuelpricewatch.com/fuel-price-index",
+                headers={"User-Agent": "NaijaPriceBot/1.0 (@IsraelmooreTG)"},
+                timeout=15.0
+            )
+            resp.raise_for_status()
+            html = resp.text
+
+        soup = BeautifulSoup(html, "lxml")
+
+        # Example selectors - UPDATE THESE BASED ON SITE INSPECTION
+        avg_petrol = soup.select_one(".average-petrol .price-value").get_text(strip=True) if soup.select_one(".average-petrol .price-value") else "N/A"
+        change_today = soup.select_one(".change-today").get_text(strip=True) if soup.select_one(".change-today") else "No change"
+        last_updated = soup.select_one(".last-updated").get_text(strip=True) if soup.select_one(".last-updated") else "Recent"
+
+        return {
+            "avg_petrol": avg_petrol,
+            "change_today": change_today,
+            "last_updated": last_updated
+        }
+    except Exception as e:
+        LOG.exception("Fuel scrape failed: %s", e)
+        return None
