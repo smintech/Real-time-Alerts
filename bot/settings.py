@@ -78,14 +78,6 @@ CHANNEL_MONITORED_URLS = {
     # ...add more real product URLs under new groups as needed...
 }
 
-FUEL_SITE_SOURCES = [
-    {"url": "https://www.fuelpricewatch.com/fuel-price-index", "parser": _parse_fuelpricewatch},
-    {"url": "https://www.nnpcgroup.com/media-center/news", "parser": _parse_nnpc},
-    {"url": "https://www.totalenergies.com.ng/en", "parser": _parse_total},
-    {"url": "https://www.oandoplc.com/news/", "parser": _parse_oando},
-]
-
-
 MIN_DROP_PERCENT_FOR_CHANNEL = 3.0   # % price drop
 MIN_SAVINGS_FOR_CHANNEL = 10000      # ₦15,000 minimum savings
 MIN_DEAL_SCORE_FOR_CHANNEL = "medium"  # only medium/high
