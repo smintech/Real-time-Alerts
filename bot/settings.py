@@ -64,7 +64,7 @@ CHANNEL_MONITORED_URLS = {
 
     # Crypto
     "crypto-eth": [
-        "SYMBOL:ETHUSDT"
+        "SYMBOL:USDT"
     ],
 
     # New helpful / real product pages
