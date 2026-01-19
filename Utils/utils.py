@@ -17,7 +17,6 @@ from typing import Dict, Optional, Any, Tuple, Callable, List
 # Settings / thresholds
 from bot.settings import (
     SUPPORTED_SITES,
-    FUEL_SITE_SOURCES,
     MIN_CHANGE_TO_ALERT,
     HIGH_DEAL_THRESHOLD,
     MEDIUM_DEAL_THRESHOLD,
