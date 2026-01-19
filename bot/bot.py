@@ -53,6 +53,7 @@ LOG = logging.getLogger(__name__)
 
 application: Application | None = None  # global if needed elsewhere
 nest_asyncio.apply()
+TEST_MODE = os.getenv("TEST_MODE", "false").lower() in ("1", "true", "yes")
 
 async def safe_send(bot, chat_id: int | list[int], text: str, **kwargs):
     """
@@ -411,6 +412,9 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
 
         # --- PHASE 3: ELIGIBILITY CHECK ---
         ref_price = last_posted_price if last_posted_price is not None else current_price
+        price_change = round(((current_price - ref_price) / ref_price) * 100, 1) if ref_price != 0 else 0.0
+        abs_change = abs(price_change)
+        time_since_last = float('inf') if last_posted_at_dt == min_dt else (now - last_posted_at_dt).total_seconds()
         drop_pct = round(((ref_price - current_price) / ref_price) * 100, 1) if ref_price > current_price else 0.0
         savings = max(ref_price - current_price, 0)
 
@@ -419,10 +423,10 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
 
         if not is_new:
             # Only post on further drops (current best price < last posted price)
-            if drop_pct > 0:
+            if abs_change > 0:
                 if is_crypto:
                     # Lighter threshold for crypto (volatile)
-                    if drop_pct >= 1.0:
+                    if abs_change >= 1.0 and time_since_last >= 21600:
                         should_post = True
                 else:
                     # Use configured thresholds for regular deals
@@ -544,51 +548,174 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
     LOG.info("--- JOB FINISHED: %d deals posted ---", posted_count)
 
 async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
-    """Daily fuel update job - with wake-up check"""
-    now = datetime.now(WAT)
-    
-    # Check if it's close to schedule (e.g., within 1 hour of 7 AM)
-    target_time = now.replace(hour=7, minute=0, second=0, microsecond=0)
-    if now > target_time:
-        target_time += timedelta(days=1)  # next day
-    time_diff = (target_time - now).total_seconds()
-    
-    if time_diff > 3600:  # more than 1 hour away
-        logger.debug("Not close to morning schedule — skipping fuel update")
-        return
+    """
+    Daily fuel update job - uses persistent snapshots to ensure once-per-day posting.
+    Prefers scrape_fuel_prices_many() (multi-source) but falls back to scrape_fuel_prices().
+    """
+    now = datetime.now(TIMEZONE)
+    FUEL_TRACKING_KEY = "https://fuelpricewatch.com/nigeria"
 
-    r = save_channel_snapshot()
-    last_run_key = "fuel_last_run"
-    last_run_str = r.get(last_run_key)
-    if last_run_str:
-        last_run = datetime.fromisoformat(last_run_str)
-        if (now - last_run).total_seconds() < 82800:  # ~23 hours
-            logger.debug("Fuel update already sent today — skipping")
+    # Wake-up window: only run between 07:00-07:59 local TIMEZONE
+    if not TEST_MODE:
+        if not (7 <= now.hour < 8):
+            LOG.debug("Outside of 7 AM window — skipping fuel update")
             return
 
-    data = await scrape_fuel_prices()
-    if not data or data["avg_petrol"] == "N/A":
-        logger.warning("No valid fuel data - skipping post")
+    # Load last snapshot and short-circuit if already posted recently
+    try:
+        snapshot = await load_channel_snapshot(FUEL_TRACKING_KEY)
+    except Exception:
+        LOG.exception("Failed to load fuel snapshot")
+        snapshot = None
+
+    if snapshot and snapshot.get("last_posted_at"):
+        if not TEST_MODE:
+            try:
+                last_run = datetime.fromisoformat(snapshot["last_posted_at"])
+                if (now - last_run).total_seconds() < 72_000:
+                    LOG.info("Fuel update already sent today at %s — skipping", last_run.isoformat())
+                    return
+            except Exception:
+                LOG.warning("Could not parse last_posted_at; proceeding to scrape")
+
+    # Scrape data (prefer many-source scraper)
+    data = None
+    try:
+        # prefer the multi-source async entrypoint if available
+        if "scrape_fuel_prices" in globals():
+            data = await scrape_fuel_prices()
+        else:
+            # fallback to older scraper name (your codebase imported scrape_fuel_prices earlier)
+            data = await scrape_fuel_prices_()
+    except Exception:
+        LOG.exception("Error during fuel price scraping")
         return
 
-    message = (
-        f"🌅 Good Morning! Fuel Price Update ({now.strftime('%b %d, %Y')})\n\n"
-        f"National Avg Petrol (PMS): {data['avg_petrol']}\n"
-        f"Today: {data['change_today']}\n"
-        f"Last Updated: {data['last_updated']}\n\n"
-        f"Live data from FuelPriceWatch.com\n"
-        f"Stay smart at the pump! ⛽"
-    )
+    # Normalize data to expected fields for formatting
+    # two possible shapes:
+    #  - {"avg_formatted": "₦123,456", "sources": [...], "avg_raw": 123456.0, "timestamp": "..."}
+    #  - {"avg_petrol": "₦123,456", "change_today": "...", "last_updated": "..."}
+    avg_formatted = None
+    change_today = None
+    last_updated = None
+    sources = []
 
-    await safe_send(
-        context.bot,
-        chat_id=CHANNEL_DEAL_CHAT_ID,
-        text=message,
-        parse_mode="Markdown"
-    )
-    logger.info("Fuel update posted successfully")
+    if not data:
+        LOG.warning("No data returned from scraper — skipping post")
+        return
 
-    r.set(last_run_key, now.isoformat(), ex=86400*2)
+    # Multi-source shape
+    if isinstance(data, dict) and "avg_formatted" in data:
+        avg_formatted = data.get("avg_formatted") or "N/A"
+        # some parsers return string prices inside sources; normalize them
+        sources = data.get("sources", []) or []
+        # try to derive change and last_updated from per-source last_updated if present
+        last_updated = None
+        for s in sources:
+            if s.get("last_updated"):
+                last_updated = s.get("last_updated")
+                break
+    else:
+        # Legacy shape
+        avg_formatted = data.get("avg_petrol") if isinstance(data, dict) else None
+        change_today = data.get("change_today") if isinstance(data, dict) else None
+        last_updated = data.get("last_updated") if isinstance(data, dict) else None
+        # build a minimal sources array if possible
+        if isinstance(data, dict):
+            sources = []
+            # prefer any explicit source items
+            for key in ("source", "sources", "details"):
+                val = data.get(key)
+                if isinstance(val, list):
+                    sources = val
+                    break
+
+    # final sanity
+    if not avg_formatted or avg_formatted == "N/A":
+        LOG.warning("Scraper returned no average petrol price — skipping post")
+        return
+
+    # compute confidence: count how many sources returned a usable price
+    reported = 0
+    total = max(1, len(sources))
+    sources_lines = []
+    for s in sources:
+        # each s expected to have: source, price_raw/price_str, error, url
+        src_name = s.get("source") or _get_domain_from_url(s.get("url") or "") or "source"
+        price_str = s.get("price_str") or s.get("price_raw") or s.get("price") or None
+        err = s.get("error")
+        url = s.get("url") or ""
+        if price_str and not err:
+            reported += 1
+            # normalize display string
+            if isinstance(price_str, (int, float)):
+                price_str = f"₦{int(price_str):,}"
+            sources_lines.append(f"• {src_name} — {price_str} — <a href=\"{_safe_url(url)}\">link</a>")
+        else:
+            # show error label
+            err_label = err or "no data"
+            sources_lines.append(f"• {src_name} — {err_label}")
+
+    confidence = f"{reported}/{total}" if total else f"{reported}/4"
+
+    # use provided change_today if available, else try to infer small delta from sources (best-effort)
+    change_text = change_today or data.get("change_today") or "No change"
+    last_updated_text = last_updated or data.get("timestamp") or now.strftime("%b %d, %H:%M")
+
+    # Build message (HTML) in your requested format
+    message_lines = [
+        "🌅 <b>Fuel Price Report — Nigeria</b>",
+        f"📅 {now.strftime('%b %d, %Y')} — <i>Morning update</i>",
+        "━━━━━━━━━━━━━━━━━━",
+        f"⛽ <b>National Avg (PMS):</b> <b>{avg_formatted}</b>",
+    ]
+
+    # If change_text is a numeric or a small string, present it; allow both forms like "-₦1,200 (-0.7%)" or "No change"
+    message_lines.append(f"📉 <b>Change today:</b> {change_text}")
+    message_lines.append(f"🕒 <b>Last updated:</b> {last_updated_text}")
+    message_lines.append(f"🔎 <b>Confidence:</b> {confidence} sources reported")
+    message_lines.append("")  # blank
+    message_lines.append("🏷️ <b>Sources</b>")
+
+    # Append each source line
+    message_lines.extend(sources_lines or ["• FuelPriceWatch — data unavailable"])
+
+    message_lines.append("")  # blank
+    message_lines.append("━━━━━━━━━━━━━━━━━━")
+    message_lines.append("<i>Tip:</i> tap a source to view the bulletin. 🔗")
+
+    message = "\n".join(message_lines)
+
+    # Send to channel(s)
+    try:
+        sent_results = await safe_send(
+            context.bot,
+            CHANNEL_DEAL_CHAT_ID,
+            text=message,
+            parse_mode="HTML",
+            disable_web_page_preview=True
+        )
+    except Exception:
+        LOG.exception("Failed to safe_send fuel update")
+        sent_results = []
+
+    # Persist snapshot only if at least one send succeeded
+    if any(res[1] for res in sent_results if isinstance(res, (list, tuple))):
+        try:
+            await save_channel_snapshot(
+                FUEL_TRACKING_KEY,
+                {
+                    "last_posted_at": now.isoformat(),
+                    "last_posted_price": avg_formatted,
+                    "sources_confidence": confidence,
+                },
+                expires_hours=48
+            )
+            LOG.info("Fuel update posted and snapshot saved.")
+        except Exception:
+            LOG.exception("Failed to save fuel snapshot after posting")
+    else:
+        LOG.warning("No successful sends recorded; snapshot not updated.")
 
 
 
@@ -726,6 +853,13 @@ async def run_bot():
                 interval=CHECK_INTERVAL_SECONDS,
                 first=10,
                 name="channel_deals"
+            )
+            application.job_queue.run_repeating(
+                callback=check_and_post_fuel_prices,
+                interval=120,
+                #time=dt_time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
+                name="check_and_post_fuel_prices",
+                first=10,
             )
             application.job_queue.run_repeating(
                 callback=check_trials,
