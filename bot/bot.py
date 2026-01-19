@@ -34,7 +34,8 @@ from Utils.utils import (
     compute_changes,
     calculate_deal_score,
     normalize_product_key,
-    _get_domain_from_url,  # helper from utils (if present)
+    _get_domain_from_url,
+    scrape_fuel_prices,
 )
 from bot.persistence import (
     load_last_snapshot,
@@ -541,6 +542,56 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                 await asyncio.sleep(send_delay)
 
     LOG.info("--- JOB FINISHED: %d deals posted ---", posted_count)
+
+async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
+    """Daily fuel update job - with wake-up check"""
+    now = datetime.now(WAT)
+    
+    # Check if it's close to schedule (e.g., within 1 hour of 7 AM)
+    target_time = now.replace(hour=7, minute=0, second=0, microsecond=0)
+    if now > target_time:
+        target_time += timedelta(days=1)  # next day
+    time_diff = (target_time - now).total_seconds()
+    
+    if time_diff > 3600:  # more than 1 hour away
+        logger.debug("Not close to morning schedule — skipping fuel update")
+        return
+
+    r = save_channel_snapshot()
+    last_run_key = "fuel_last_run"
+    last_run_str = r.get(last_run_key)
+    if last_run_str:
+        last_run = datetime.fromisoformat(last_run_str)
+        if (now - last_run).total_seconds() < 82800:  # ~23 hours
+            logger.debug("Fuel update already sent today — skipping")
+            return
+
+    data = await scrape_fuel_prices()
+    if not data or data["avg_petrol"] == "N/A":
+        logger.warning("No valid fuel data - skipping post")
+        return
+
+    message = (
+        f"🌅 Good Morning! Fuel Price Update ({now.strftime('%b %d, %Y')})\n\n"
+        f"National Avg Petrol (PMS): {data['avg_petrol']}\n"
+        f"Today: {data['change_today']}\n"
+        f"Last Updated: {data['last_updated']}\n\n"
+        f"Live data from FuelPriceWatch.com\n"
+        f"Stay smart at the pump! ⛽"
+    )
+
+    await safe_send(
+        context.bot,
+        chat_id=CHANNEL_DEAL_CHAT_ID,
+        text=message,
+        parse_mode="Markdown"
+    )
+    logger.info("Fuel update posted successfully")
+
+    r.set(last_run_key, now.isoformat(), ex=86400*2)
+
+
+
 
 async def check_trials(context: ContextTypes.DEFAULT_TYPE):
     """Validate trials and downgrade users whose trial expired."""
