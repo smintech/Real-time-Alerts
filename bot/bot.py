@@ -430,7 +430,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                         should_post = True
                 else:
                     # Use configured thresholds for regular deals
-                    if drop_pct >= MIN_DROP_PERCENT_FOR_CHANNEL and savings >= MIN_SAVINGS_FOR_CHANNEL:
+                    if price_change < 0 and -price_change >= MIN_DROP_PERCENT_FOR_CHANNEL and savings >= MIN_SAVINGS_FOR_CHANNEL:
                         should_post = True
 
         if should_post:
@@ -439,7 +439,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                 "best_entry": best_entry,
                 "entries": entries,
                 "last_posted_at": last_posted_at_dt,
-                "stats": {"drop_pct": drop_pct, "is_new": is_new, "is_crypto": is_crypto, "savings": savings}
+                "stats": {"drop_pct": drop_pct, "change_pct": price_change, "is_new": is_new, "is_crypto": is_crypto, "savings": savings}
             })
 
     # --- PHASE 4: PRIORITIZE & POST ---
@@ -492,13 +492,13 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
 
         # Construct Caption HTML
         if stats["is_crypto"]:
-            header = "🆕 NEW CRYPTO TRACKED" if stats["is_new"] else "📊 CRYPTO PRICE UPDATE"
+            header = "🆕 NEW CRYPTO TRACKED" if stats["is_new"] else "📊 NAIRA STRENGTH"
             caption = (
                 f"<b>{header}</b>\n━━━━━━━━━━━━━━━━━━\n"
                 f"💰 Current: {_safe_currency(price, site=best_entry['data'].get('site', 'unknown'))}\n"
                 f"📊 Change: -{stats['drop_pct']}%\n\n"
                 f"{comparison_text}\n━━━━━━━━━━━━━━━━━━\n"
-                f"🔗 <a href=\"{best_entry['url']}\">Trade on {site}</a>"
+                f"🔗 <a href=\"{best_entry['url']}\">BINANCE{site}</a>"
             )
         else:
             header = "🆕 NEW DEAL!" if stats["is_new"] else f"🔥 {stats['drop_pct']}% DROP!"
