@@ -822,7 +822,7 @@ async def scrape_fuel_prices():
         async with httpx.AsyncClient() as client:
             resp = await client.get(
                 "https://www.fuelpricewatch.com/fuel-price-index",
-                headers={"User-Agent": "NaijaPriceBot/1.0 (@IsraelmooreTG)"},
+                headers={"User-Agent": "Real-time-Alerts/1.0 (twitter:@IsraelmooreTG)"},
                 timeout=15.0
             )
             resp.raise_for_status()
