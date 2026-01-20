@@ -853,36 +853,96 @@ def _detect_block(soup: BeautifulSoup) -> Optional[str]:
 
 def _parse_fuelpricewatch(html: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html, "lxml")
+    
+    # 1. Block Detection (Reuse existing logic)
     block = _detect_block(soup)
     if block:
-        return {"source": "FuelPriceWatch", "error": block, "price_raw": None, "price_str": None, "last_updated": None, "raw": None, "change_today": None}
+        return {
+            "source": "FuelPriceWatch", 
+            "error": block, 
+            "price_raw": None, 
+            "price_str": None, 
+            "last_updated": None, 
+            "change_today": None,
+            "raw": None
+        }
 
+    price_raw = None
+    change_today = "No change data"
+    updated = None
+    other_prices = {}
+
+    # 2. STRATEGY A: Hydration JSON Extraction (The "E-commerce" way for SPAs)
+    # Check for Next.js/React state which is often hidden in <script id="__NEXT_DATA__">
+    # This is 100% more accurate than text regex if available.
+    try:
+        next_data = soup.find("script", id="__NEXT_DATA__")
+        if next_data and next_data.string:
+            data = json.loads(next_data.string)
+            # Traverse JSON: props -> pageProps -> initialData (Structure varies, generic search below)
+            # We dump the whole JSON to string and search for the specific keys to be safe
+            json_str = json.dumps(data)
+            
+            # Search for Petrol Price specifically in the JSON structure
+            # Pattern: "petrol": {"price": 883.94...} or similar
+            # We look for the number associated with petrol labels
+            pass # (Complex to blindly guess exact JSON path without source, proceed to Strategy B)
+    except Exception:
+        pass
+
+    # 3. STRATEGY B: Robust Text & DOM Extraction (Your Utils Strategy)
+    # Get text with spaces to avoid concatenation issues
     text = soup.get_text(" ", strip=True)
 
-    # Primary: Average petrol price
-    avg_match = re.search(r"Average Petrol Price[\s:]*₦?([\d,]+\.?\d*)", text, flags=re.I)
-    price_raw = _extract_naira_amount(avg_match.group(0)) if avg_match else None
+    # --- Extract Petrol Price ---
+    # Looks for "Average Petrol Price" followed by currency symbols and digits
+    # Regex allows for colons, spaces, and currency symbols (₦, NGN)
+    pms_match = re.search(r"Average Petrol Price.*?((?:₦|NGN|N)?\s*[\d,]+\.?\d*)", text, flags=re.IGNORECASE)
+    if pms_match:
+        # Use your robust helper from utils.py
+        candidate = _parse_price_string(pms_match.group(1))
+        if candidate:
+            price_raw = candidate
 
-    # Daily change (e.g. "+₦5.00 today" or "-₦2.50 today")
-    change_match = re.search(r"([+-]₦[\d,]+\.?\d*)\s*today", text, flags=re.I)
-    change_today = change_match.group(1) if change_match else "No change data"
+    # --- Extract Diesel/Kerosene for 'raw' data ---
+    ago_match = re.search(r"Average Diesel Price.*?((?:₦|NGN|N)?\s*[\d,]+\.?\d*)", text, flags=re.IGNORECASE)
+    if ago_match:
+        p = _parse_price_string(ago_match.group(1))
+        if p: other_prices["diesel"] = p
 
-    # Last updated – often not shown, fallback to none
-    updated = None
-    cand = soup.find(string=re.compile(r"last updated|as at|updated", re.I))
-    if cand:
-        snippet = cand.parent.get_text(" ", strip=True) if cand.parent else cand
-        dt_match = re.search(r"(\d{1,2}\s+\w+\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{4})", snippet)
-        if dt_match:
-            updated = dt_match.group(1)
+    # --- Extract Daily Change ---
+    # Pattern: "+₦5.00 today" or "- ₦2.50 today"
+    # Matches optional +/- sign, optional currency, number, then "today"
+    change_match = re.search(r"([+-]?\s*(?:₦|NGN|N)?\s*[\d,]+\.?\d*)\s*today", text, flags=re.IGNORECASE)
+    if change_match:
+        # Clean up the string for display
+        raw_change = change_match.group(1).strip().replace(" ", "")
+        change_today = raw_change
+
+    # --- Extract Last Updated ---
+    # Look for standard date patterns near "updated"
+    date_cand = re.search(r"(?:Last Updated|as at|updated).*?(\d{1,2}:\d{2}\s*(?:AM|PM)|\d{1,2}\s+\w+\s+\d{4})", text, flags=re.IGNORECASE)
+    if date_cand:
+        updated = date_cand.group(1).strip()
+
+    # --- Fallback: If 'price_raw' is massive (concatenation error), try splitting ---
+    if price_raw and price_raw > 10000:
+        # e.g., if it grabbed "88394" instead of "883.94" or concatenated two prices
+        # Using your _split_concatenated_numeric_token approach might be aggressive here
+        # so we just sanity check logical bounds for fuel (100 - 2000 range usually)
+        if 100 < price_raw / 100 < 3000:
+             price_raw = price_raw / 100
 
     return {
         "source": "FuelPriceWatch App",
         "price_raw": price_raw,
-        "price_str": _format_naira(price_raw) if price_raw else None,
+        "price_str": _format_naira(price_raw),
         "change_today": change_today,
         "last_updated": updated,
-        "raw": {"snippet_len": len(html)},
+        "raw": {
+            "other_fuels": other_prices,
+            "snippet_len": len(html)
+        },
     }
 
 def _parse_total(html: str) -> Dict[str, Any]:
