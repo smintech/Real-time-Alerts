@@ -982,5 +982,5 @@ async def scrape_fuel_prices(site_sources: Optional[List[Dict[str, Any]]] = None
         "last_updated": last_updated or "Live data",
         # Keep new keys if you want them for debugging
         "avg_raw": avg_raw,
-        "sources": sources_out,
+        "sources": sources_cfg,
     }
