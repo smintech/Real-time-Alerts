@@ -925,7 +925,7 @@ FUEL_SITE_SOURCES = [
     {"url": "https://www.fuelpricewatch.com/fuel-price-index", "parser": _parse_fuelpricewatch},
     {"url": "https://www.nnpcgroup.com/media-center/news", "parser": _parse_nnpc},
     {"url": "https://www.totalenergies.com.ng/en", "parser": _parse_total},
-    {"url": "https://www.oandoplc.com/news/", "parser": _parse_oando},
+    {"url": "https://oandoplc.com/media/news", "parser": _parse_oando},
 ]
 
 async def scrape_fuel_prices(site_sources: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
