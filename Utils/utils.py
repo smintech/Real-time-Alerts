@@ -918,7 +918,7 @@ def _parse_oando(html: str) -> Dict[str, Any]:
 # Async entrypoint for fuel scrapes (uses the sync _fetch_html in executor)
 # ---------------------------
 FUEL_SITE_SOURCES = [
-    {"url": "https://www.fuelpricewatch.com/", "parser": _parse_fuelpricewatch},
+    {"url": "https://app.fuelpricewatch.com/", "parser": _parse_fuelpricewatch},
     #{"url": "https://www.totalenergies.com.ng/en", "parser": _parse_total},
 ]
 
