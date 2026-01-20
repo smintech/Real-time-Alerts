@@ -906,7 +906,7 @@ def _parse_fuelpricewatch(html: str) -> Dict[str, Any]:
                 m = re.search(r"(?:Average\s*)?(?:PMS|Petrol)[^\d]{0,30}(?:₦|NGN|N)?\s*([\d,]+\.?\d*)", idx_text, flags=re.I)
             if m:
                 v = _parse_price_string(m.group(1))
-                if v:
+                if v and 600 <= v <= 1500:  # Added sanity range to avoid outdated values like ₦617
                     return {
                         "source": "FuelPriceWatch (index page)",
                         "price_raw": v,
@@ -976,7 +976,6 @@ def _parse_fuelpricewatch(html: str) -> Dict[str, Any]:
         pass
 
     # ---------- 3) Search page for obvious XHR/JSON endpoints and call them ----------
-    # Look for absolute or relative URLs that look like /api, /prices, /data, /v1
     try:
         scripts_text = " ".join([s.string or "" for s in soup.find_all("script") if s.string])
         # regex for absolute endpoints
@@ -1022,8 +1021,6 @@ def _parse_fuelpricewatch(html: str) -> Dict[str, Any]:
         except Exception:
             base_url = None
         if not base_url:
-            # derive base from known host used to fetch page if available in html
-            # fallback: try fuelpricewatch.com root
             base_url = "https://app.fuelpricewatch.com"
         for rel in rels:
             full = rel if rel.startswith("http") else urljoin(base_url, rel)
@@ -1063,11 +1060,43 @@ def _parse_fuelpricewatch(html: str) -> Dict[str, Any]:
     # ---------- 4) DOM/text regex strategies on the provided HTML (fallback) ----------
     page_text = soup.get_text(" ", strip=True)
 
+    # Priority extraction for prominent average price (matches current site display: "Average Petrol Price ₦868.29")
+    priority_patterns = [
+        r"Average\s+Petrol\s+Price[\s:–\-]*₦?\s*([\d,]+\.?\d*)",
+        r"National\s+Average\s+(?:PMS|Petrol)[\s:–\-]*₦?\s*([\d,]+\.?\d*)",
+        r"Average\s+PMS[\s:–\-]*₦?\s*([\d,]+\.?\d*)",
+        r"PMS\s+Average\s+Price[\s:–\-]*₦?\s*([\d,]+\.?\d*)",
+        r"Average\s+Price[\s:–\-]*₦?\s*([\d,]+\.?\d*)",  # broader but still keyword-tied
+    ]
+    for pat in priority_patterns:
+        for m in re.findall(pat, page_text, flags=re.I):
+            v = _parse_price_string(m)
+            if v and 600 <= v <= 1500:  # Tight 2026+ range – rejects old/low values like ₦300 or ₦617
+                # Grab nearby change (e.g., "+₦5.00")
+                match_pos = page_text.find(m)
+                context_start = max(0, match_pos - 100)
+                context = page_text[context_start:match_pos + len(m) + 200]
+                ch_m = re.search(r"([+-]?\s*₦?\s*[\d,]+\.?\d*)", context, flags=re.I)
+                ch = ch_m.group(1).strip() if ch_m else None
+                
+                # Grab last updated time (e.g., "07:26 AM")
+                date_match = re.search(r"Last\s+Updated[\s:–\-]*([0-9:]+\s*(?:AM|PM)?)", page_text, flags=re.I)
+                upd = date_match.group(1).strip() if date_match else None
+                
+                return {
+                    "source": "FuelPriceWatch (priority average match)",
+                    "price_raw": v,
+                    "price_str": _format_naira(v),
+                    "change_today": ch or "N/A",
+                    "last_updated": upd or "Live data",
+                    "raw": {"priority_pattern": pat, "match_text": m, "context_snippet": context[:200]}
+                }
+
+    # Fallback regex patterns (safer – removed the super-loose naked number pattern)
     regex_patterns = [
         r"(?:Average\s*(?:PMS|Petrol|Petrol\s*\(PMS\)|PMS Price|Petrol Price)[\s:\-–]*)?(?:₦|NGN|N)?\s*([\d,]+\.?\d*)",
         r"(?:PMS|Petrol|Average PMS|Average Petrol)[^\d]{0,30}((?:₦|NGN|N)?\s*[\d,]+\.?\d*)",
         r"(?:₦|NGN|N)\s*([\d,]{2,}\.?\d*)",
-        r"([\d]{3,5}\.\d{0,2})"
     ]
     for pat in regex_patterns:
         for m in re.findall(pat, page_text, flags=re.I):
@@ -1117,18 +1146,17 @@ def _parse_fuelpricewatch(html: str) -> Dict[str, Any]:
             c = float(c)
         except Exception:
             continue
-        # direct reasonable range
-        if 5 <= c <= 5000:
+        if 600 <= c <= 1500:  # Tightened range for fallbacks too
             sanitized.append(round(c, 2))
             continue
         # if extremely large, try dividing by 100 (common concatenation)
-        if 5000 < c <= 500000 and 5 <= (c / 100) <= 5000:
+        if 5000 < c <= 500000 and 600 <= (c / 100) <= 1500:
             sanitized.append(round(c / 100, 2))
             continue
         # attempt split for concatenated token
         try:
             split_try = _split_concatenated_numeric_token(str(int(c)))
-            if split_try:
+            if split_try and 600 <= min(split_try) <= 1500:
                 sanitized.append(round(min(split_try), 2))
         except Exception:
             continue
@@ -1167,7 +1195,7 @@ def _parse_fuelpricewatch(html: str) -> Dict[str, Any]:
             m = re.search(r"(?:Petrol|PMS)[^\d]{0,120}(?:₦|NGN|N)?\s*([\d,]+\.?\d*)", page_text, flags=re.I)
             if m:
                 v = _parse_price_string(m.group(1))
-                if v and 5 <= v <= 5000:
+                if v and 600 <= v <= 1500:
                     chosen = v
                     chosen_source = "fallback:near_keyword_regex"
         except Exception:
@@ -1193,7 +1221,7 @@ def _parse_fuelpricewatch(html: str) -> Dict[str, Any]:
         }
 
     # minor final correction: if chosen looks like integer massively > expected, scale down
-    if chosen > 5000 and 5 <= (chosen / 100) <= 5000:
+    if chosen > 1500 and 600 <= (chosen / 100) <= 1500:
         chosen = round(chosen / 100, 2)
 
     return {
@@ -1201,7 +1229,7 @@ def _parse_fuelpricewatch(html: str) -> Dict[str, Any]:
         "price_raw": chosen,
         "price_str": _format_naira(chosen),
         "change_today": change_today or "N/A",
-        "last_updated": last_updated,
+        "last_updated": last_updated or "Live data",
         "raw": {
             "chosen_source": chosen_source,
             "candidates": price_candidates,
@@ -1210,6 +1238,7 @@ def _parse_fuelpricewatch(html: str) -> Dict[str, Any]:
             "snippet_len": len(html)
         }
     }
+
 def _parse_total(html: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html, "lxml")
     block = _detect_block(soup)
