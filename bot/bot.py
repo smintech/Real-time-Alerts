@@ -560,6 +560,56 @@ def _safe_url(u: str) -> str:
     # If no scheme, add https (most sites work)
     return f"https://{u}"
 
+def log_fuel_scraper_data(data: Any, *, test_mode: bool = False) -> None:
+    """
+    Log a compact, safe summary of fuel scraper output.
+    Standalone: no return value, no dependency on other helpers.
+    """
+
+    try:
+        if not isinstance(data, dict):
+            LOG.warning(
+                "Fuel scraper returned non-dict data: type=%s value=%r",
+                type(data).__name__,
+                str(data)[:200],
+            )
+            return
+
+        summary = {
+            "keys": list(data.keys()),
+            "avg_petrol": data.get("avg_petrol"),
+            "avg_formatted": data.get("avg_formatted"),
+            "avg_raw": data.get("avg_raw"),
+            "change_today": data.get("change_today"),
+            "last_updated": data.get("last_updated"),
+            "timestamp": data.get("timestamp"),
+            "sources_count": len(data.get("sources") or []),
+        }
+
+        sources_preview = []
+        for s in (data.get("sources") or [])[:5]:
+            if not isinstance(s, dict):
+                sources_preview.append({"type": type(s).__name__})
+                continue
+
+            sources_preview.append({
+                "source": s.get("source"),
+                "url": s.get("url"),
+                "price_raw": s.get("price_raw"),
+                "price_str": s.get("price_str"),
+                "error": s.get("error"),
+            })
+
+        summary["sources_preview"] = sources_preview
+
+        if test_mode:
+            LOG.info("Fuel scraper DEBUG snapshot: %s", summary)
+        else:
+            LOG.debug("Fuel scraper snapshot: %s", summary)
+
+    except Exception:
+        LOG.exception("Failed while logging fuel scraper output")
+
 async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
     """
     Daily fuel update job - uses persistent snapshots to ensure once-per-day posting.
@@ -616,10 +666,12 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
         # call the async scraper function (it should return a dict)
         if asyncio.iscoroutinefunction(scraper_fn):
             data = await scraper_fn()
+            log_fuel_scraper_data(data, test_mode=TEST_MODE)
         else:
             # if it's sync, run in executor to avoid blocking loop
             loop = asyncio.get_event_loop()
             data = await loop.run_in_executor(None, scraper_fn)
+            log_fuel_scraper_data(data, test_mode=TEST_MODE)
     except Exception:
         LOG.exception("Error during fuel price scraping")
         return
