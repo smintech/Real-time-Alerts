@@ -547,6 +547,19 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
 
     LOG.info("--- JOB FINISHED: %d deals posted ---", posted_count)
 
+def _safe_url(u: str) -> str:
+    """
+    Simple safety wrapper for URLs in HTML links.
+    Prevents broken/malformed links and avoids empty hrefs.
+    """
+    if not u:
+        return ""
+    u = u.strip()
+    if u.startswith(("http://", "https://")):
+        return u
+    # If no scheme, add https (most sites work)
+    return f"https://{u}"
+
 async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
     """
     Daily fuel update job - uses persistent snapshots to ensure once-per-day posting.
@@ -716,8 +729,6 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
             LOG.exception("Failed to save fuel snapshot after posting")
     else:
         LOG.warning("No successful sends recorded; snapshot not updated.")
-
-
 
 
 async def check_trials(context: ContextTypes.DEFAULT_TYPE):
