@@ -1250,14 +1250,11 @@ FUEL_SITE_SOURCES = [
 async def scrape_fuel_prices(site_sources: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
     """
     Async wrapper that fetches multiple fuel price sources using the sync _fetch_html
-    function inside an executor. Returns a dict:
-    {
-      "sources": [ {source, url, price_raw, price_str, last_updated, error, raw}, ... ],
-      "avg_raw": float | None,
-      "avg_formatted": str | None,
-      "timestamp": ISO string
-    }
+    function inside an executor. Adds validation/salvage logic but does NOT use Playwright.
+    Returns a dict similar to before plus improved debug info.
     """
+    from datetime import datetime
+
     loop = asyncio.get_event_loop()
     sources_cfg = site_sources or FUEL_SITE_SOURCES
 
@@ -1267,7 +1264,7 @@ async def scrape_fuel_prices(site_sources: Optional[List[Dict[str, Any]]] = None
         try:
             html = await loop.run_in_executor(None, _fetch_html, url)
         except Exception as e:
-            LOG.exception("Fuel site fetch failed")
+            LOG.exception("Fuel site fetch failed for %s", url)
             return {"url": url, "error": f"fetch_error: {e}", "price_raw": None, "price_str": None, "source": getattr(parser, "__name__", "unknown"), "raw": None}
 
         try:
@@ -1276,7 +1273,7 @@ async def scrape_fuel_prices(site_sources: Optional[List[Dict[str, Any]]] = None
             parsed["raw"] = parsed.get("raw") or {"snippet_len": len(html)}
             return parsed
         except Exception as e:
-            LOG.exception("Fuel site parse failed")
+            LOG.exception("Fuel site parse failed for %s", url)
             return {"url": url, "error": f"parse_error: {e}", "price_raw": None, "price_str": None, "source": getattr(parser, "__name__", "unknown"), "raw": None}
 
     tasks = [_fetch_and_parse(cfg) for cfg in sources_cfg]
@@ -1286,8 +1283,19 @@ async def scrape_fuel_prices(site_sources: Optional[List[Dict[str, Any]]] = None
     change_today = "N/A"
     last_updated = "N/A"
 
+    # collect raw values & debug
+    debug = {"per_source": [], "salvage_attempts": []}
+
     for r in results:
         pr = r.get("price_raw")
+        debug["per_source"].append({
+            "url": r.get("url"),
+            "source": r.get("source") or r.get("url"),
+            "price_raw": pr,
+            "price_str": r.get("price_str"),
+            "error": r.get("error"),
+            "raw": r.get("raw")
+        })
         if pr is not None:
             try:
                 nums.append(float(pr))
@@ -1301,11 +1309,76 @@ async def scrape_fuel_prices(site_sources: Optional[List[Dict[str, Any]]] = None
 
     avg_raw = sum(nums) / len(nums) if nums else None
 
+    # ---------- VALIDATION & SALVAGE ----------
+    # Tune these bounds to your country's typical fuel range
+    MIN_PLAUSIBLE = 500.0   # conservative lower bound (₦)
+    MAX_PLAUSIBLE = 1000.0  # realistic upper bound (₦)
+
+    def _is_plausible(v: Optional[float]) -> bool:
+        try:
+            return v is not None and MIN_PLAUSIBLE <= float(v) <= MAX_PLAUSIBLE
+        except Exception:
+            return False
+
+    # If avg_raw is missing or outside plausible bounds, attempt salvage
+    if not _is_plausible(avg_raw):
+        LOG.warning("avg_raw=%s outside plausible range [%s,%s] — attempting salvage", avg_raw, MIN_PLAUSIBLE, MAX_PLAUSIBLE)
+        debug["salvage_attempts"].append(f"initial_avg:{avg_raw}")
+
+        # 1) Use only per-source candidates that are plausible
+        plausible_candidates = []
+        for r in results:
+            try:
+                pr = r.get("price_raw")
+                if pr is None:
+                    continue
+                prf = float(pr)
+                if _is_plausible(prf):
+                    plausible_candidates.append(prf)
+            except Exception:
+                continue
+
+        if plausible_candidates:
+            avg_raw = sum(plausible_candidates) / len(plausible_candidates)
+            debug["salvage_attempts"].append({"method": "use_plausible_sources", "candidates": plausible_candidates, "new_avg": avg_raw})
+            LOG.info("Salvaged avg using plausible per-source values: %s", avg_raw)
+        else:
+            # 2) Try scaled-down candidates (common concatenation: 88394 -> 883.94 or integer tokens)
+            scaled_candidates = []
+            for r in results:
+                pr = r.get("price_raw")
+                if pr is None:
+                    continue
+                try:
+                    prf = float(pr)
+                except Exception:
+                    continue
+                # if candidate is huge, try dividing by 100
+                if prf > MAX_PLAUSIBLE and 10 <= (prf / 100) <= MAX_PLAUSIBLE:
+                    scaled_candidates.append(round(prf / 100, 2))
+                # also attempt split concatenation token if pr looks integer-like and long
+                elif prf >= 10000:
+                    split_try = _split_concatenated_numeric_token(str(int(prf)))
+                    if split_try:
+                        scaled_candidates.append(min(split_try))
+            if scaled_candidates:
+                avg_raw = sum(scaled_candidates) / len(scaled_candidates)
+                debug["salvage_attempts"].append({"method": "scaled_candidates", "candidates": scaled_candidates, "new_avg": avg_raw})
+                LOG.info("Salvaged avg using scaled/split candidates: %s", avg_raw)
+            else:
+                # 3) No further automated salvage available (Playwright intentionally removed)
+                debug["salvage_attempts"].append({"method": "none", "reason": "no plausible or scaled candidates"})
+                LOG.warning("Could not salvage avg_raw from candidates; leaving avg_raw as %s", avg_raw)
+
+    # final formatting
+    avg_formatted = _format_naira(avg_raw) if avg_raw else "N/A"
+
     return {
-        "avg_petrol": _format_naira(avg_raw) if avg_raw else "N/A",  # bold in message
+        "avg_petrol": avg_formatted,
         "change_today": change_today,
         "last_updated": last_updated or "Live data",
-        # Keep new keys if you want them for debugging
         "avg_raw": avg_raw,
         "sources": results,
+        "debug": debug,
+        "timestamp": datetime.now().isoformat()
     }
