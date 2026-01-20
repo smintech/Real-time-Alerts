@@ -918,7 +918,7 @@ def _parse_oando(html: str) -> Dict[str, Any]:
 # Async entrypoint for fuel scrapes (uses the sync _fetch_html in executor)
 # ---------------------------
 FUEL_SITE_SOURCES = [
-    {"url": "https://www.fuelpricewatch.com/fuel-price-index", "parser": _parse_fuelpricewatch},
+    {"url": "https://www.fuelpricewatch.com/", "parser": _parse_fuelpricewatch},
     #{"url": "https://www.totalenergies.com.ng/en", "parser": _parse_total},
 ]
 
@@ -982,5 +982,5 @@ async def scrape_fuel_prices(site_sources: Optional[List[Dict[str, Any]]] = None
         "last_updated": last_updated or "Live data",
         # Keep new keys if you want them for debugging
         "avg_raw": avg_raw,
-        "sources": sources_cfg,
+        "sources": results,
     }
