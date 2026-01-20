@@ -922,8 +922,8 @@ async def run_bot():
             renewal_task.cancel()
             try:
                await renewal_task # wait for cancellation to finish
-        except asyncio.CancelledError:
-            pass
+            except asyncio.CancelledError:
+                pass
         # Release Redis lock
         if lock:
             try:
