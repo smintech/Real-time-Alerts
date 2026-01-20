@@ -768,9 +768,16 @@ async def acquire_long_running_lock(r: redis_async.Redis, lock_name: str = "tele
     lock = r.lock(lock_name, timeout=10)  # timeout = TTL in seconds
 
     # Try to acquire immediately (non-blocking)
-    acquired = await lock.acquire(blocking=False)
-    if not acquired:
-        LOG.warning("Lock already taken — another instance is running")
+    max_retries = 5
+    for i in range(max_retries):
+        acquired = await lock.acquire(blocking=False)
+        if acquired:
+            break
+        LOG.warning(f"Lock taken, retry {i+1}/{max_retries} in 5s...")
+        await asyncio.sleep(5)
+    else:
+        # If we exhausted retries
+        LOG.error("Could not acquire lock after retries — exiting")
         return False, None
 
     LOG.info("Async lock acquired — starting renewal task")
