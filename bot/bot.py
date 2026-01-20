@@ -779,7 +779,8 @@ async def acquire_long_running_lock(r: redis_async.Redis, lock_name: str = "tele
     else:
         # If we exhausted retries
         LOG.warning("Stealing lock: Old instance failed to release within 40s.")
-        await r.set(lock_name, "stolen-identity", ex=10)
+        await r.delete(lock_name)
+        await asyncio.sleep(0.5)
         acquired = await lock.acquire(blocking=False)
         if not acquired:
             LOG.error("Critical: Could not acquire lock even after stealing.")
