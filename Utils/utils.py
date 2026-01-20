@@ -855,39 +855,35 @@ def _parse_fuelpricewatch(html: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html, "lxml")
     block = _detect_block(soup)
     if block:
-        return {"source": "FuelPriceWatch", "error": block, "price_raw": None, "price_str": None, "last_updated": None, "raw": None}
+        return {"source": "FuelPriceWatch", "error": block, "price_raw": None, "price_str": None, "last_updated": None, "raw": None, "change_today": None}
 
     text = soup.get_text(" ", strip=True)
-    m = re.search(r"(average.*?(petrol|pms).*?(?:₦|NGN|N)\s*[0-9][0-9,\.]*)", text, flags=re.I)
-    if m:
-        value = _extract_naira_amount(m.group(0))
-    else:
-        value = _extract_naira_amount(text)
 
+    # Primary: Average petrol price
+    avg_match = re.search(r"Average Petrol Price[\s:]*₦?([\d,]+\.?\d*)", text, flags=re.I)
+    price_raw = _extract_naira_amount(avg_match.group(0)) if avg_match else None
+
+    # Daily change (e.g. "+₦5.00 today" or "-₦2.50 today")
+    change_match = re.search(r"([+-]₦[\d,]+\.?\d*)\s*today", text, flags=re.I)
+    change_today = change_match.group(1) if change_match else "No change data"
+
+    # Last updated – often not shown, fallback to none
     updated = None
-    cand = soup.find(string=re.compile(r"last updated|updated|as at|updated:", re.I))
+    cand = soup.find(string=re.compile(r"last updated|as at|updated", re.I))
     if cand:
-        snippet = cand.parent.get_text(" ", strip=True)
-        dt_match = re.search(r"(\d{1,2}\s+\w+\s+\d{4}|\d{1,2}:\d{2}|\d{4}-\d{2}-\d{2})", snippet)
+        snippet = cand.parent.get_text(" ", strip=True) if cand.parent else cand
+        dt_match = re.search(r"(\d{1,2}\s+\w+\s+\d{4}|\d{1,2}[/-]\d{1,2}[/-]\d{4})", snippet)
         if dt_match:
-            updated = dt_match.group(0)
+            updated = dt_match.group(1)
 
-    return {"source": "FuelPriceWatch", "price_raw": value, "price_str": _format_naira(value) if value else None, "last_updated": updated, "raw": None}
-
-def _parse_nnpc(html: str) -> Dict[str, Any]:
-    soup = BeautifulSoup(html, "lxml")
-    block = _detect_block(soup)
-    if block:
-        return {"source": "NNPC", "error": block, "price_raw": None, "price_str": None, "last_updated": None, "raw": None}
-
-    text = soup.get_text(" ", strip=True)
-    m = re.search(r"(?:PMS|Petrol|Premium Motor Spirit).{0,120}?(?:₦|NGN|N)\s*[0-9][0-9,\.]*", text, flags=re.I)
-    if m:
-        value = _extract_naira_amount(m.group(0))
-    else:
-        value = _extract_naira_amount(text)
-
-    return {"source": "NNPC", "price_raw": value, "price_str": _format_naira(value) if value else None, "last_updated": None, "raw": None}
+    return {
+        "source": "FuelPriceWatch App",
+        "price_raw": price_raw,
+        "price_str": _format_naira(price_raw) if price_raw else None,
+        "change_today": change_today,
+        "last_updated": updated,
+        "raw": {"snippet_len": len(html)},
+    }
 
 def _parse_total(html: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html, "lxml")
@@ -923,9 +919,7 @@ def _parse_oando(html: str) -> Dict[str, Any]:
 # ---------------------------
 FUEL_SITE_SOURCES = [
     {"url": "https://www.fuelpricewatch.com/fuel-price-index", "parser": _parse_fuelpricewatch},
-    {"url": "https://www.nnpcgroup.com/media-center/news", "parser": _parse_nnpc},
-    {"url": "https://www.totalenergies.com.ng/en", "parser": _parse_total},
-    {"url": "https://oandoplc.com/media/news", "parser": _parse_oando},
+    #{"url": "https://www.totalenergies.com.ng/en", "parser": _parse_total},
 ]
 
 async def scrape_fuel_prices(site_sources: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
@@ -964,7 +958,9 @@ async def scrape_fuel_prices(site_sources: Optional[List[Dict[str, Any]]] = None
     results = await asyncio.gather(*tasks, return_exceptions=False)
 
     nums: List[float] = []
-    sources_out: List[Dict[str, Any]] = []
+    change_today = "N/A"
+    last_updated = "N/A"
+
     for r in results:
         pr = r.get("price_raw")
         if pr is not None:
@@ -972,14 +968,19 @@ async def scrape_fuel_prices(site_sources: Optional[List[Dict[str, Any]]] = None
                 nums.append(float(pr))
             except Exception:
                 pass
-        sources_out.append(r)
+        # Prefer change from the first successful source
+        if change_today == "N/A" and r.get("change_today"):
+            change_today = r["change_today"]
+        if last_updated == "N/A" and r.get("last_updated"):
+            last_updated = r["last_updated"]
 
     avg_raw = sum(nums) / len(nums) if nums else None
-    avg_formatted = _format_naira(avg_raw) if avg_raw else None
 
     return {
-        "sources": sources_out,
+        "avg_petrol": _format_naira(avg_raw) if avg_raw else "N/A",  # bold in message
+        "change_today": change_today,
+        "last_updated": last_updated or "Live data",
+        # Keep new keys if you want them for debugging
         "avg_raw": avg_raw,
-        "avg_formatted": avg_formatted,
-        "timestamp": asyncio.get_event_loop().time(),  # caller can convert to ISO if needed
+        "sources": sources_out,
     }
