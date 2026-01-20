@@ -768,17 +768,22 @@ async def acquire_long_running_lock(r: redis_async.Redis, lock_name: str = "tele
     lock = r.lock(lock_name, timeout=10)  # timeout = TTL in seconds
 
     # Try to acquire immediately (non-blocking)
-    max_retries = 5
+    max_retries = 8
     for i in range(max_retries):
         acquired = await lock.acquire(blocking=False)
         if acquired:
             break
-        LOG.warning(f"Lock taken, retry {i+1}/{max_retries} in 5s...")
+        if i > 5:
+            LOG.warning(f"Lock taken, retry {i+1}/{max_retries} in 5s...")
         await asyncio.sleep(5)
     else:
         # If we exhausted retries
-        LOG.error("Could not acquire lock after retries — exiting")
-        return False, None
+        LOG.warning("Stealing lock: Old instance failed to release within 40s.")
+        await r.set(lock_name, "stolen-identity", ex=10)
+        acquired = await lock.acquire(blocking=False)
+        if not acquired:
+            LOG.error("Critical: Could not acquire lock even after stealing.")
+            return False, None
 
     LOG.info("Async lock acquired — starting renewal task")
 
@@ -915,7 +920,10 @@ async def run_bot():
         # Cancel renewal task
         if renewal_task:
             renewal_task.cancel()
-
+            try:
+               await renewal_task # wait for cancellation to finish
+        except asyncio.CancelledError:
+            pass
         # Release Redis lock
         if lock:
             try:
