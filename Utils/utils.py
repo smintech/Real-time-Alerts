@@ -871,35 +871,79 @@ def _detect_block(soup: BeautifulSoup) -> Optional[str]:
         return "blocked_by_cloudflare"
     return None
 
-def _parse_fuelpricewatch(html: str) -> Dict[str, Any]:
+def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/") -> Dict[str, Any]:
+    """
+    Parse fuel price from FuelPriceWatch live app page.
+    Now returns the source as the actual URL for clickable links in reports.
+    """
     soup = BeautifulSoup(html, "lxml")
-    page_text = soup.get_text(" ", strip=True)
+    # Use newline separator to preserve structure while collapsing extra whitespace
+    page_text = soup.get_text("\n", strip=True)
 
-    patterns = [
-        r"Average\s+Petrol\s+Price.{0,200}?₦?\s*([\d,]{3,6}(?:\.\d{1,2})?)",
-        r"Average\s+Petrol\s+Price.*?([\d,]{3,6}(?:\.\d{1,2})?)",
-        r"Petrol.{0,200}?₦\s*([\d,]{3,6}(?:\.\d{1,2})?)",
-        r"₦\s*([\d,]{3,6}(?:\.\d{1,2})?)\s*(?:Petrol|PMS|today)",
+    # Primary patterns – tuned for the page layout
+    price_patterns = [
+        r"Average\s+Petrol\s+Price\s*₦?\s*([0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)",
+        r"Average\s+Petrol\s+Price.{0,300}₦\s*([0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)",
+        r"₦\s*([0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)\s*Average\s+Petrol\s+Price",
+        r"₦\s*([0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)\s*(?:PMS|Petrol)",
     ]
 
-    for pat in patterns:
+    v = None
+    context = page_text
+    for pat in price_patterns:
         m = re.search(pat, page_text, re.I | re.DOTALL)
         if m:
-            v = _parse_price_string(m.group(1))
+            price_str = m.group(1).replace(",", "")  # remove thousands separator
+            v = _parse_price_string(price_str)
             if v and 600 <= v <= 1500:
-                context = page_text[m.start()-200:m.end()+200]
-                ch = re.search(r"([+-]₦?[\d,]+\.?\d*)", context, re.I)
-                change = ch.group(1).strip() if ch else "N/A"
-                LOG.info("Playwright success (live app): ₦%.2f", v)
-                return {
-                    "source": "FuelPriceWatch (live app via Playwright)",
-                    "price_raw": v,
-                    "price_str": _format_naira(v),
-                    "change_today": change,
-                    "last_updated": "Live data",
-                }
+                # Extract wider context for change detection
+                start = max(0, m.start() - 400)
+                end = m.end() + 400
+                context = page_text[start:end]
+                break
 
-    return {"error": "no_price"}
+    if v is None:
+        return {"error": "no_price"}
+
+    # Extract both percentage and absolute changes
+    perc_change = "N/A"
+    abs_change = "N/A"
+
+    # Find all +/- indicators in context
+    change_matches = re.findall(r"([+-]\s*[\d\.]+\s*%|[+-]?\s*₦?\s*[\d\.,]+\.?\d*)", context, re.I)
+    for match in change_matches:
+        cleaned = match.strip()
+        if "%" in cleaned:
+            perc_change = cleaned
+        elif "₦" in cleaned or cleaned.startswith(("+", "-")):
+            abs_change = cleaned
+
+    # Extra fallback searches
+    if perc_change == "N/A":
+        perc_m = re.search(r"([+-]\s*[\d\.]+\s*%)", context, re.I)
+        if perc_m:
+            perc_change = perc_m.group(1).strip()
+
+    if abs_change == "N/A":
+        abs_m = re.search(r"([+-]\s*₦\s*[\d\.,]+\.?\d*)", context, re.I)
+        if abs_m:
+            abs_change = abs_m.group(1).strip()
+
+    price_formatted = f"₦{v:,.2f}"
+
+    LOG.info(
+        "FuelPriceWatch parsed → %s | Percent: %s | Absolute: %s",
+        price_formatted, perc_change, abs_change
+    )
+
+    return {
+        "source": url,  # ← Now the actual clickable URL!
+        "price_raw": v,
+        "price_str": price_formatted,
+        "change_percent": perc_change,
+        "change_absolute": abs_change,
+        "last_updated": "Live data",
+    }
 
 def _parse_total(html: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html, "lxml")
@@ -940,40 +984,58 @@ FUEL_SITE_SOURCES = [
 
 async def scrape_fuel_prices() -> Dict[str, Any]:
     app_url = "https://app.fuelpricewatch.com/"
-    html = await _fetch_rendered_html(app_url)
+    
+    try:
+        # Primary method: Try the live rendered app first (most up-to-date)
+        html = await _fetch_rendered_html(app_url)
+        result = _parse_fuelpricewatch(html, url=app_url)
+        
+        if result.get("price_raw") is not None:
+            # Success! Return immediately — no need for fallback
+            return {
+                "avg_petrol": result["price_str"],
+                "avg_raw": result["price_raw"],
+                "change_percent": result.get("change_percent", "N/A"),
+                "change_absolute": result.get("change_absolute", "N/A"),
+                "last_updated": result.get("last_updated", "Live data"),
+                "sources": [result],
+                "debug": {"method": "live_app_playwright"}
+            }
+            
+    except Exception as e:
+        LOG.exception(f"Live app scrape failed: {e}")
+        LOG.warning("Playwright app failed - falling back to static index")
 
-    result = _parse_fuelpricewatch(html)
-    if result.get("price_raw") is not None:
-        return {
-            "avg_petrol": result["price_str"],
-            "avg_raw": result["price_raw"],
-            "change_today": result.get("change_today", "N/A"),
-            "last_updated": result.get("last_updated", "Live data"),
-        }
-
-    # Optional: static index fallback (cloudscraper)
-    LOG.warning("Playwright app failed - using index fallback")
-    # ... your old _fetch_html + parse code here ...
+    # Fallback: Only reached if primary method failed
     index_url = "https://www.fuelpricewatch.com/fuel-price-index-nigeria"
     try:
-        index_html = _fetch_html(index_url)  # your existing cloudscraper function
-        index_result = _parse_fuelpricewatch(index_html.replace("app.fuelpricewatch.com", "index"))  # reuse parser
-        if index_result.get("price_raw"):
+        index_html = _fetch_html(index_url)  # cloudscraper
+        # Note: We pass the original app_url so the source link remains clickable
+        # (even though this is the index page, the data is the same)
+        index_result = _parse_fuelpricewatch(index_html, url=app_url)
+        
+        if index_result.get("price_raw") is not None:
             return {
                 "avg_petrol": index_result["price_str"],
-                "change_today": index_result.get("change_today", "N/A"),
-                "last_updated": "Index snapshot (may be outdated)",
                 "avg_raw": index_result["price_raw"],
+                "change_percent": index_result.get("change_percent", "N/A"),
+                "change_absolute": index_result.get("change_absolute", "N/A"),
+                "last_updated": "Index snapshot (may be outdated)",
                 "sources": [index_result],
                 "debug": {"method": "static_index_fallback"}
             }
-    except Exception:
-        pass
+            
+    except Exception as e:
+        LOG.exception(f"Index fallback failed: {e}")
 
+    # Ultimate failure case
     return {
         "avg_petrol": "N/A",
-        "change_today": "N/A",
+        "change_percent": "N/A",
+        "change_absolute": "N/A",
         "last_updated": "N/A",
         "avg_raw": None,
-        "error": "all_methods_failed"
+        "error": "all_methods_failed",
+        "sources": [],
+        "debug": {"method": "failed"}
     }
