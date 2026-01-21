@@ -63,40 +63,25 @@ async def safe_send(bot: Bot, targets: int | List[int], text: str, **kwargs) -> 
             results.append((target, False, str(e)))
     return results
 
-def _fetch_rendered_html(url: str) -> str:
+async def _fetch_rendered_html(url: str) -> str:
     """
-    Use Selenium to render the page (executes JS) and return fully loaded HTML.
-    This works on Render native Python runtime if you add Chrome install to build command.
+    Render JS-heavy page with Playwright (downloads Chromium automatically on first run).
     """
-    options = Options()
-    options.add_argument("--headless=new")
-    options.add_argument("--no-sandbox")
-    options.add_argument("--disable-dev-shm-usage")
-    options.add_argument("--disable-gpu")
-    options.add_argument("--window-size=1280,1080")
-    options.binary_location = "/usr/bin/chromium"
-    options.add_argument("--disable-extensions")
-    options.add_argument("--disable-infobars")
-    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
-
-    # webdriver-manager auto-downloads matching chromedriver
-    service = Service(ChromeDriverManager().install())
-    
-    driver = webdriver.Chrome(service=service, options=options)
     try:
-        driver.get(url)
-        # Wait for the market overview section or any price indicator to appear
-        WebDriverWait(driver, 30).until(
-            EC.presence_of_element_located((By.XPATH, "//*[contains(text(), 'Average Petrol Price') or contains(text(), '₦')]"))
-        )
-        # Extra buffer for full render
-        time.sleep(6)
-        return driver.page_source
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page()
+            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            # Wait for price section to load
+            await page.wait_for_selector("text=Average Petrol Price", timeout=30000)
+            # Extra wait for stability
+            await asyncio.sleep(5)
+            content = await page.content()
+            await browser.close()
+            return content
     except Exception as e:
-        LOG.error(f"Selenium render failed for {url}: {e}")
+        LOG.error(f"Playwright render failed for {url}: {e}")
         return ""
-    finally:
-        driver.quit()
 
 # ---------------------------
 # Retry decorator (robust for network/cloudflare issues)
@@ -893,14 +878,9 @@ def _detect_block(soup: BeautifulSoup) -> Optional[str]:
     return None
 
 def _parse_fuelpricewatch(html: str) -> Dict[str, Any]:
-    """
-    Parse the rendered HTML from the app page (live data).
-    Falls back to index if render fails.
-    """
     soup = BeautifulSoup(html, "lxml")
     page_text = soup.get_text(" ", strip=True)
 
-    # Priority: live app page patterns
     patterns = [
         r"Average\s+Petrol\s+Price.{0,200}?₦?\s*([\d,]{3,6}(?:\.\d{1,2})?)",
         r"Average\s+Petrol\s+Price.*?([\d,]{3,6}(?:\.\d{1,2})?)",
@@ -913,28 +893,19 @@ def _parse_fuelpricewatch(html: str) -> Dict[str, Any]:
         if m:
             v = _parse_price_string(m.group(1))
             if v and 600 <= v <= 1500:
-                # Extract change if possible
                 context = page_text[m.start()-200:m.end()+200]
                 ch = re.search(r"([+-]₦?[\d,]+\.?\d*)", context, re.I)
                 change = ch.group(1).strip() if ch else "N/A"
-
-                LOG.info("Live app page success: ₦%.2f", v)
+                LOG.info("Playwright success (live app): ₦%.2f", v)
                 return {
-                    "source": "FuelPriceWatch (live app)",
+                    "source": "FuelPriceWatch (live app via Playwright)",
                     "price_raw": v,
                     "price_str": _format_naira(v),
                     "change_today": change,
                     "last_updated": "Live data",
-                    "raw": {"pattern": pat}
                 }
 
-    return {
-        "source": "FuelPriceWatch",
-        "error": "no_price_in_rendered_html",
-        "price_raw": None,
-        "price_str": None,
-        "raw": {"page_snippet": page_text[:800]}
-    }
+    return {"error": "no_price"}
 
 def _parse_total(html: str) -> Dict[str, Any]:
     soup = BeautifulSoup(html, "lxml")
@@ -973,26 +944,22 @@ FUEL_SITE_SOURCES = [
     #{"url": "https://www.totalenergies.com.ng/en", "parser": _parse_total},
 ]
 
-async def scrape_fuel_prices(site_sources: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
+async def scrape_fuel_prices() -> Dict[str, Any]:
     app_url = "https://app.fuelpricewatch.com/"
-    
-    # Primary: render the live app page with Selenium
-    html = _fetch_rendered_html(app_url)
-    
+    html = await _fetch_rendered_html(app_url)
+
     result = _parse_fuelpricewatch(html)
-    
     if result.get("price_raw") is not None:
         return {
             "avg_petrol": result["price_str"],
+            "avg_raw": result["price_raw"],
             "change_today": result.get("change_today", "N/A"),
             "last_updated": result.get("last_updated", "Live data"),
-            "avg_raw": result["price_raw"],
-            "sources": [result],
-            "debug": {"method": "selenium_live_app"}
         }
 
-    # Last resort: fall back to static index (your old cloudscraper method)
-    LOG.warning("Selenium live app failed - using static index fallback")
+    # Optional: static index fallback (cloudscraper)
+    LOG.warning("Playwright app failed - using index fallback")
+    # ... your old _fetch_html + parse code here ...
     index_url = "https://www.fuelpricewatch.com/fuel-price-index-nigeria"
     try:
         index_html = _fetch_html(index_url)  # your existing cloudscraper function
