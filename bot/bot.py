@@ -36,6 +36,7 @@ from Utils.utils import (
     normalize_product_key,
     _get_domain_from_url,
     scrape_fuel_prices,
+    _format_naira,
 )
 from bot.persistence import (
     load_last_snapshot,
@@ -656,19 +657,15 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
             scraper_fn = globals()["scrape_fuel_prices_many"]
         elif "scrape_fuel_prices" in globals() and callable(globals().get("scrape_fuel_prices")):
             scraper_fn = globals()["scrape_fuel_prices"]
-        elif "scrape_fuel_prices_" in globals() and callable(globals().get("scrape_fuel_prices_")):
-            scraper_fn = globals()["scrape_fuel_prices_"]
 
         if scraper_fn is None:
-            LOG.error("No fuel scraper function found (expected scrape_fuel_prices or scrape_fuel_prices_many)")
+            LOG.error("No fuel scraper function found")
             return
 
-        # call the async scraper function (it should return a dict)
         if asyncio.iscoroutinefunction(scraper_fn):
             data = await scraper_fn()
             log_fuel_scraper_data(data, test_mode=TEST_MODE)
         else:
-            # if it's sync, run in executor to avoid blocking loop
             loop = asyncio.get_event_loop()
             data = await loop.run_in_executor(None, scraper_fn)
             log_fuel_scraper_data(data, test_mode=TEST_MODE)
@@ -680,116 +677,120 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
         LOG.warning("No data returned from scraper — skipping post")
         return
 
-    # Normalize data to expected fields for formatting
-    # Support both shapes:
-    #  - multi-source: {"avg_formatted": "₦123,456", "sources": [...], "avg_raw": 123456.0, ...}
-    #  - utils.scrape_fuel_prices: {"avg_petrol": "₦123,456", "avg_raw": 123456.0, "sources": [...], ...}
-    avg_formatted = None
-    change_today = None
-    last_updated = None
-    sources = []
+    # === Normalize to latest utils.scrape_fuel_prices shape ===
+    avg_formatted = data.get("avg_petrol")
+    avg_raw = data.get("avg_raw")
+    change_absolute = data.get("change_absolute", "N/A")
+    change_percent = data.get("change_percent", "N/A")
+    last_updated_text = data.get("last_updated", "Live data")
+    sources = data.get("sources", [])
 
-    # Multi-source or new naming
-    if "avg_formatted" in data:
-        avg_formatted = data.get("avg_formatted") or None
-        # prefer data["sources"] for detailed reporting
-        sources = data.get("sources") or []
-        change_today = data.get("change_today") or None
-        last_updated = data.get("last_updated") or data.get("timestamp") or None
-    # utils.scrape_fuel_prices style (observed)
-    elif "avg_petrol" in data:
-        avg_formatted = data.get("avg_petrol")
-        change_today = data.get("change_today") or None
-        last_updated = data.get("last_updated") or data.get("timestamp") or None
-        # ensure we have sources as list if scraper provided them
-        sources = data.get("sources") or []
-    else:
-        # attempt a best-effort extraction from other common keys
-        avg_formatted = data.get("avg_formatted") or data.get("avg_petrol") or data.get("avg") or data.get("average") or None
-        change_today = data.get("change_today") or None
-        last_updated = data.get("last_updated") or data.get("timestamp") or None
-        sources = data.get("sources") or data.get("details") or []
-
-    # final sanity: some scrapers return formatted/numeric mixed values
+    # Fallback formatting if avg is numeric only
     if isinstance(avg_formatted, (int, float)):
-        try:
-            avg_formatted = _format_naira(float(avg_formatted))
-        except Exception:
-            avg_formatted = f"₦{int(avg_formatted):,}"
+        avg_formatted = _format_naira(float(avg_formatted))
 
-    if not avg_formatted or str(avg_formatted).upper() == "N/A":
-        LOG.warning("Scraper returned no average petrol price — skipping post")
-        # In TEST_MODE, provide debug payload to help local testing by posting anyway
-        if TEST_MODE:
-            LOG.debug("TEST_MODE: posting debug message even though avg_formatted is missing")
-            avg_formatted = data.get("avg_petrol") or "N/A"
-        else:
+    if not avg_formatted or str(avg_formatted).strip().upper() in {"", "N/A", "NONE"}:
+        LOG.warning("No valid average price — skipping post")
+        if not TEST_MODE:
             return
 
-    # Build sources lines and compute confidence
+    # === Build change text & emoji ===
+    change_parts = []
+    if change_absolute and change_absolute != "N/A":
+        change_parts.append(change_absolute)
+    if change_percent and change_percent != "N/A":
+        change_parts.append(f"({change_percent} from last period)")
+
+    change_text = " ".join(change_parts) if change_parts else "No change data"
+
+    # Dynamic emoji
+    change_emoji = "📊"
+    if change_absolute and change_absolute != "N/A":
+        if change_absolute.strip().startswith("+"):
+            change_emoji = "📈"
+        elif change_absolute.strip().startswith("-"):
+            change_emoji = "📉"
+
+    # === Sources processing ===
     reported = 0
-    total = max(1, len(sources))
+    total_sources = max(1, len(sources))
     sources_lines = []
 
     for s in sources:
         if not isinstance(s, dict):
-            # If the item is a simple string, show it
             if isinstance(s, str):
                 sources_lines.append(f"• {s}")
             continue
 
-        src_name = s.get("source") or _get_domain_from_url(s.get("url") or "") or "source"
-        price_str = s.get("price_str") or s.get("price_raw") or s.get("price") or None
-        err = s.get("error")
-        url = s.get("url") or ""
+        url = s.get("source", "")  # URL string
+        if not url:
+            continue
 
-        # Normalize numeric price to formatted string for display
+        # Friendly name
+        if "app.fuelpricewatch.com" in url:
+            src_name = "FuelPriceWatch Live App"
+        else:
+            src_name = "FuelPriceWatch"
+
+        price_str = s.get("price_str")
+        err = s.get("error")
+
+        # Normalize price display
         if isinstance(price_str, (int, float)):
-            try:
-                price_str = _format_naira(float(price_str))
-            except Exception:
-                price_str = f"₦{int(price_str):,}"
+            price_str = _format_naira(float(price_str))
+
+        # Per-source changes
+        src_change_parts = []
+        if s.get("change_percent") and s.get("change_percent") != "N/A":
+            src_change_parts.append(s["change_percent"])
+        if s.get("change_absolute") and s.get("change_absolute") != "N/A":
+            src_change_parts.append(s["change_absolute"])
+        src_change = f" {' '.join(src_change_parts)}" if src_change_parts else ""
 
         if price_str and not err:
             reported += 1
-            sources_lines.append(f"• {src_name} — {price_str} — <a href=\"{_safe_url(url)}\">link</a>")
+            sources_lines.append(
+                f"• <a href=\"{_safe_url(url)}\">{src_name}</a> — {price_str}{src_change}"
+            )
         else:
             err_label = err or "no data"
-            sources_lines.append(f"• {src_name} — {err_label} — <a href=\"{_safe_url(url)}\">link</a>")
+            sources_lines.append(
+                f"• <a href=\"{_safe_url(url)}\">{src_name}</a> — {err_label}"
+            )
 
-    confidence = f"{reported}/{total}"
+    confidence = f"{reported}/{total_sources}"
 
-    # If there were no structured sources, try to fall back to a single top-level source field
+    # Fallback if no structured sources
     if not sources_lines:
-        top_src = data.get("source") or "FuelPriceWatch"
-        top_price = data.get("price_str") or data.get("price_raw") or data.get("price") or avg_formatted
-        if isinstance(top_price, (int, float)):
-            try:
-                top_price = _format_naira(float(top_price))
-            except Exception:
-                top_price = f"₦{int(top_price):,}"
-        sources_lines = [f"• {top_src} — {top_price}"]
+        fallback_url = "https://app.fuelpricewatch.com/"
+        sources_lines = [
+            f"• <a href=\"{_safe_url(fallback_url)}\">FuelPriceWatch</a> — {avg_formatted}"
+        ]
+        confidence = "1/1"
 
-    # Determine change and last updated text
-    change_text = change_today or data.get("change_today") or "No change"
-    last_updated_text = last_updated or data.get("timestamp") or now.strftime("%b %d, %H:%M")
-
-    # Build message (HTML)
+    # === Build final message ===
     message_lines = [
         "🌅 <b>Fuel Price Report — Nigeria</b>",
-        f"📅 {now.strftime('%b %d, %Y')} — <i>Morning update</i>",
+        f"📅 {now.strftime('%B %d, %Y')} — <i>Morning update</i>",
         "━━━━━━━━━━━━━━━━━━",
-        f"⛽ <b>National Avg (PMS):</b> <b>{avg_formatted}</b>",
-        f"📉 <b>Change today:</b> {change_text}",
+        f"⛽ <b>National Avg (PMS):</b> {avg_formatted}",
+        f"{change_emoji} <b>Change today:</b> {change_text}",
         f"🕒 <b>Last updated:</b> {last_updated_text}",
         f"🔎 <b>Confidence:</b> {confidence} sources reported",
         "",
-        "🏷️ <b>Sources</b>"
+        "🏷️ <b>Sources</b>",
     ]
     message_lines.extend(sources_lines)
-    message_lines.append("")
-    message_lines.append("━━━━━━━━━━━━━━━━━━")
-    message_lines.append("<i>Tip:</i> tap a source to view the bulletin. 🔗")
+    message_lines.extend([
+        "",
+        "━━━━━━━━━━━━━━━━━━",
+        "<blockquote>"
+        "Disclaimer: This is the <b>national average</b> PMS price reported by official sources. "
+        "Actual pump prices may vary significantly by state, city, and station."
+        "</blockquote>",
+        "",
+        "<i>Tip: tap a source name to view the live bulletin.</i> 🔗",
+    ])
 
     message = "\n".join(message_lines)
 
@@ -800,17 +801,14 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
             CHANNEL_DEAL_CHAT_ID,
             text=message,
             parse_mode="HTML",
-            disable_web_page_preview=True
+            disable_web_page_preview=True,
         )
     except Exception:
         LOG.exception("Failed to safe_send fuel update")
         sent_results = []
 
-    # Persist snapshot only if at least one send succeeded (skip saving in TEST_MODE if you want)
-    try:
-        any_success = any(isinstance(res, (list, tuple)) and res[1] for res in sent_results)
-    except Exception:
-        any_success = False
+    # Persist snapshot on success
+    any_success = any(res[1] for res in sent_results if isinstance(res, (list, tuple)) and len(res) > 1)
 
     if any_success and not TEST_MODE:
         try:
@@ -821,16 +819,16 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
                     "last_posted_price": avg_formatted,
                     "sources_confidence": confidence,
                 },
-                expires_hours=48
+                expires_hours=48,
             )
             LOG.info("Fuel update posted and snapshot saved.")
         except Exception:
-            LOG.exception("Failed to save fuel snapshot after posting")
+            LOG.exception("Failed to save fuel snapshot")
     else:
         if TEST_MODE:
             LOG.debug("TEST_MODE: skipping snapshot save")
         else:
-            LOG.warning("No successful sends recorded; snapshot not updated.")
+            LOG.warning("No successful sends; snapshot not saved.")
 
 async def check_trials(context: ContextTypes.DEFAULT_TYPE):
     """Validate trials and downgrade users whose trial expired."""
