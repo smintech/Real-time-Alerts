@@ -854,15 +854,7 @@ def _detect_block(soup: BeautifulSoup) -> Optional[str]:
 def _parse_fuelpricewatch(html: str) -> Dict[str, Any]:
     """
     Robust parser for FuelPriceWatch SPA + index page + hidden JSON/XHR endpoints.
-    Returns a dict:
-    {
-      "source": "FuelPriceWatch",
-      "price_raw": float|None,
-      "price_str": str|None,
-      "change_today": str|None,
-      "last_updated": str|None,
-      "raw": { ... debug info ... }
-    }
+    Prioritizes the main app page (live average), uses index page only as last fallback.
     """
     soup = BeautifulSoup(html, "lxml")
 
@@ -885,357 +877,198 @@ def _parse_fuelpricewatch(html: str) -> Dict[str, Any]:
     last_updated = None
     debug = {"tried_index": False, "next_data_found": False, "xhr_tried": [], "regex_candidates": [], "dom_candidates": []}
 
-    # ---------- 1) Try server-rendered index page (fast fallback) ----------
-    try:
-        debug["tried_index"] = True
-        idx_html = None
-        try:
-            idx_html = _fetch_html("https://www.fuelpricewatch.com/fuel-price-index-nigeria")
-        except Exception:
-            # Some deployments may use www vs app; try alternate path
-            try:
-                idx_html = _fetch_html("https://www.fuelpricewatch.com/")
-            except Exception:
-                idx_html = None
-
-        if idx_html:
-            idx_text = BeautifulSoup(idx_html, "lxml").get_text(" ", strip=True)
-            # attempt robust patterns for "Petrol (PMS)" or "PMS"
-            m = re.search(r"Petrol\s*\(PMS\).{0,120}?(?:₦|NGN|N)?\s*([\d,]+\.?\d*)", idx_text, flags=re.I)
-            if not m:
-                m = re.search(r"(?:Average\s*)?(?:PMS|Petrol)[^\d]{0,30}(?:₦|NGN|N)?\s*([\d,]+\.?\d*)", idx_text, flags=re.I)
-            if m:
-                v = _parse_price_string(m.group(1))
-                if v and 600 <= v <= 1500:  # Added sanity range to avoid outdated values like ₦617
-                    return {
-                        "source": "FuelPriceWatch (index page)",
-                        "price_raw": v,
-                        "price_str": _format_naira(v),
-                        "change_today": None,
-                        "last_updated": None,
-                        "raw": {"from": "index_page", "pattern": m.group(0)[:200]}
-                    }
-    except Exception:
-        # non-fatal: continue to SPA logic
-        LOG.debug("Index page attempt failed", exc_info=True)
-
-    # ---------- Helpers ----------
-    def find_numbers_in_json(obj, path=""):
-        """Recursively search JSON for numeric values near petrol/pms/price keywords."""
-        found = []
-        if isinstance(obj, dict):
-            for k, v in obj.items():
-                kl = str(k).lower()
-                new_path = f"{path}/{k}"
-                # If key contains a hint, try parsing directly
-                if any(tok in kl for tok in ("petrol", "pms", "pmsprice", "petrolprice", "price", "average", "pms_price")):
-                    if isinstance(v, (int, float)):
-                        found.append((new_path, float(v)))
-                    elif isinstance(v, str):
-                        p = _parse_price_string(v)
-                        if p:
-                            found.append((new_path, p))
-                # If value is string and contains hint words, scan numbers inside it
-                if isinstance(v, str) and re.search(r"(petrol|pms|price|average)", v, flags=re.I):
-                    for m in re.findall(r"[\d,]{2,}\.?\d*", v):
-                        p = _parse_price_string(m)
-                        if p:
-                            found.append((new_path, p))
-                # Recurse
-                found.extend(find_numbers_in_json(v, new_path))
-        elif isinstance(obj, list):
-            for i, item in enumerate(obj):
-                found.extend(find_numbers_in_json(item, f"{path}[{i}]"))
-        return found
-
-    # ---------- 2) Try __NEXT_DATA__ hydration JSON ----------
-    try:
-        next_data_el = soup.find("script", id="__NEXT_DATA__")
-        if next_data_el and next_data_el.string:
-            debug["next_data_found"] = True
-            try:
-                nd = json.loads(next_data_el.string)
-                found = find_numbers_in_json(nd)
-                for pth, val in found:
-                    # prefer plausible fuel-range candidates or scaled numbers
-                    try:
-                        v = float(val)
-                    except Exception:
-                        continue
-                    if 10 <= v <= 5000:
-                        price_candidates.append(v)
-                        price_sources.append(f"__NEXT_DATA__:{pth}")
-                    else:
-                        # try scale/100 if the value looks like cents or integer without decimal
-                        if 5000 < v <= 500000 and 10 <= (v / 100) <= 5000:
-                            price_candidates.append(round(v / 100, 2))
-                            price_sources.append(f"__NEXT_DATA__:{pth}:scaled/100")
-            except Exception:
-                LOG.debug("Failed to parse __NEXT_DATA__ JSON", exc_info=True)
-    except Exception:
-        pass
-
-    # ---------- 3) Search page for obvious XHR/JSON endpoints and call them ----------
-    try:
-        scripts_text = " ".join([s.string or "" for s in soup.find_all("script") if s.string])
-        # regex for absolute endpoints
-        for m in re.findall(r"https?://[^\s'\"<>]+(?:/api|/prices|/data|/v1|/v2)[^\s'\"<>]*", scripts_text, flags=re.I):
-            if m in debug["xhr_tried"]:
-                continue
-            debug["xhr_tried"].append(m)
-            try:
-                # prefer JSON endpoints
-                hdrs = {"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/json"}
-                resp = requests.get(m, headers=hdrs, timeout=8)
-                if resp.status_code == 200:
-                    try:
-                        j = resp.json()
-                        found = find_numbers_in_json(j)
-                        for pth, val in found:
-                            try:
-                                v = float(val)
-                            except Exception:
-                                continue
-                            if 10 <= v <= 5000:
-                                price_candidates.append(v)
-                                price_sources.append(f"xhr_json:{m}:{pth}")
-                            elif 5000 < v <= 500000 and 10 <= (v / 100) <= 5000:
-                                price_candidates.append(round(v / 100, 2))
-                                price_sources.append(f"xhr_json:{m}:{pth}:scaled/100")
-                    except ValueError:
-                        # not JSON, try parse for a naira-like token
-                        txt = resp.text
-                        mm = re.search(r"(?:₦|NGN|N)\s*([\d,]+\.?\d*)", txt)
-                        if mm:
-                            p = _parse_price_string(mm.group(1))
-                            if p:
-                                price_candidates.append(p)
-                                price_sources.append(f"xhr_text:{m}")
-            except Exception:
-                LOG.debug("XHR attempt failed for %s", m, exc_info=True)
-        # also look for relative paths like "/api/..." and try to build absolute from the main host
-        rels = set(re.findall(r"(?:(?:/api|/prices|/data|/v1|/v2)[^\s'\"<>]*)", scripts_text, flags=re.I))
-        base_url = None
-        try:
-            base_url = f"https://{_get_domain_from_url(soup.base["href"]) if soup.base and soup.base.get('href') else ''}"
-        except Exception:
-            base_url = None
-        if not base_url:
-            base_url = "https://app.fuelpricewatch.com"
-        for rel in rels:
-            full = rel if rel.startswith("http") else urljoin(base_url, rel)
-            if full in debug["xhr_tried"]:
-                continue
-            debug["xhr_tried"].append(full)
-            try:
-                hdrs = {"User-Agent": "Mozilla/5.0", "Accept": "application/json, text/json"}
-                resp = requests.get(full, headers=hdrs, timeout=8)
-                if resp.status_code == 200:
-                    try:
-                        j = resp.json()
-                        found = find_numbers_in_json(j)
-                        for pth, val in found:
-                            try:
-                                v = float(val)
-                            except Exception:
-                                continue
-                            if 10 <= v <= 5000:
-                                price_candidates.append(v)
-                                price_sources.append(f"xhr_json:{full}:{pth}")
-                            elif 5000 < v <= 500000 and 10 <= (v / 100) <= 5000:
-                                price_candidates.append(round(v / 100, 2))
-                                price_sources.append(f"xhr_json:{full}:{pth}:scaled/100")
-                    except ValueError:
-                        mm = re.search(r"(?:₦|NGN|N)\s*([\d,]+\.?\d*)", resp.text)
-                        if mm:
-                            p = _parse_price_string(mm.group(1))
-                            if p:
-                                price_candidates.append(p)
-                                price_sources.append(f"xhr_text:{full}")
-            except Exception:
-                LOG.debug("XHR attempt failed for %s", full, exc_info=True)
-    except Exception:
-        LOG.debug("XHR detection/attempt failed", exc_info=True)
-
-    # ---------- 4) DOM/text regex strategies on the provided HTML (fallback) ----------
     page_text = soup.get_text(" ", strip=True)
 
-    # Priority extraction for prominent average price (matches current site display: "Average Petrol Price ₦868.29")
+    # ────────────────────────────────────────────────
+    # 1. Priority keyword matches on main (app) page – most up-to-date
+    # ────────────────────────────────────────────────
     priority_patterns = [
-        r"Average\s+Petrol\s+Price[\s:–\-]*₦?\s*([\d,]+\.?\d*)",
-        r"National\s+Average\s+(?:PMS|Petrol)[\s:–\-]*₦?\s*([\d,]+\.?\d*)",
-        r"Average\s+PMS[\s:–\-]*₦?\s*([\d,]+\.?\d*)",
-        r"PMS\s+Average\s+Price[\s:–\-]*₦?\s*([\d,]+\.?\d*)",
-        r"Average\s+Price[\s:–\-]*₦?\s*([\d,]+\.?\d*)",  # broader but still keyword-tied
+        r"Average\s+Petrol\s+Price\s*₦?\s*([\d,]{3,6}(?:\.\d{1,2})?)",
+        r"Average\s+Petrol\s+Price.*?₦?([\d,]{3,6}(?:\.\d{1,2})?)",
+        r"(?:Average\s+)?(?:PMS|Petrol)\s*(?:Price|Avg)?\s*[:\-–]?\s*₦?\s*([\d,]{3,6}(?:\.\d{1,2})?)",
+        r"₦\s*([\d,]{3,6}(?:\.\d{1,2})?)\s*(?:today|\+|−|-|\%)",
     ]
+
     for pat in priority_patterns:
-        for m in re.findall(pat, page_text, flags=re.I):
+        for m in re.findall(pat, page_text, re.I):
             v = _parse_price_string(m)
-            if v and 600 <= v <= 1500:  # Tight 2026+ range – rejects old/low values like ₦300 or ₦617
-                # Grab nearby change (e.g., "+₦5.00")
+            if v and 600 <= v <= 1500:
+                # Try to get nearby change
                 match_pos = page_text.find(m)
-                context_start = max(0, match_pos - 100)
-                context = page_text[context_start:match_pos + len(m) + 200]
-                ch_m = re.search(r"([+-]?\s*₦?\s*[\d,]+\.?\d*)", context, flags=re.I)
+                context = page_text[max(0, match_pos - 150):match_pos + len(m) + 250]
+                ch_m = re.search(r"([+-]?\s*₦?[\d,]+\.?\d*)\s*(?:today|from last period)", context, re.I)
                 ch = ch_m.group(1).strip() if ch_m else None
-                
-                # Grab last updated time (e.g., "07:26 AM")
-                date_match = re.search(r"Last\s+Updated[\s:–\-]*([0-9:]+\s*(?:AM|PM)?)", page_text, flags=re.I)
-                upd = date_match.group(1).strip() if date_match else None
-                
+
+                # Last updated
+                date_m = re.search(r"Last\s+Updated[\s:–\-]*([0-9: ]+(?:AM|PM)?)", page_text, re.I)
+                upd = date_m.group(1).strip() if date_m else None
+
+                LOG.info("Priority pattern hit (app page): ₦%.2f from %s", v, pat)
                 return {
-                    "source": "FuelPriceWatch (priority average match)",
+                    "source": "FuelPriceWatch (app page priority)",
                     "price_raw": v,
                     "price_str": _format_naira(v),
                     "change_today": ch or "N/A",
                     "last_updated": upd or "Live data",
-                    "raw": {"priority_pattern": pat, "match_text": m, "context_snippet": context[:200]}
+                    "raw": {"pattern": pat, "match": m, "context": context[:250]}
                 }
 
-    # Fallback regex patterns (safer – removed the super-loose naked number pattern)
+    # ────────────────────────────────────────────────
+    # 2. __NEXT_DATA__ structured extraction (targeted)
+    # ────────────────────────────────────────────────
+    try:
+        next_data_el = soup.find("script", id="__NEXT_DATA__")
+        if next_data_el and next_data_el.string:
+            debug["next_data_found"] = True
+            nd = json.loads(next_data_el.string)
+
+            # Probe common paths
+            paths_to_check = [
+                "pageProps.marketOverview.averagePetrolPrice",
+                "pageProps.marketOverview.petrol.average",
+                "pageProps.averagePrices.pms",
+                "pageProps.data.petrolPrice",
+                "pageProps.initialState.market.petrolAverage",
+                "props.pageProps.marketOverview.averagePetrol",
+            ]
+
+            for path in paths_to_check:
+                keys = path.split(".")
+                val = nd
+                for k in keys:
+                    if isinstance(val, dict):
+                        val = val.get(k)
+                    else:
+                        val = None
+                        break
+                if val is not None:
+                    if isinstance(val, (int, float)):
+                        price_candidates.append(float(val))
+                        price_sources.append(f"__NEXT_DATA__/{path}")
+                    elif isinstance(val, str):
+                        p = _parse_price_string(val)
+                        if p and 600 <= p <= 1500:
+                            price_candidates.append(p)
+                            price_sources.append(f"__NEXT_DATA__/{path}")
+    except Exception as e:
+        LOG.debug("Failed to parse __NEXT_DATA__", exc_info=True)
+
+    # ────────────────────────────────────────────────
+    # 3. Fallback regex + DOM on app page
+    # ────────────────────────────────────────────────
     regex_patterns = [
-        r"(?:Average\s*(?:PMS|Petrol|Petrol\s*\(PMS\)|PMS Price|Petrol Price)[\s:\-–]*)?(?:₦|NGN|N)?\s*([\d,]+\.?\d*)",
-        r"(?:PMS|Petrol|Average PMS|Average Petrol)[^\d]{0,30}((?:₦|NGN|N)?\s*[\d,]+\.?\d*)",
-        r"(?:₦|NGN|N)\s*([\d,]{2,}\.?\d*)",
+        r"(?:Average\s*(?:PMS|Petrol|Petrol\s*\(PMS\)))[\s:–\-]*₦?\s*([\d,]{3,6}(?:\.\d{1,2})?)",
+        r"(?:PMS|Petrol)\s+Price\s*[:\-–]?\s*₦?\s*([\d,]{3,6}(?:\.\d{1,2})?)",
+        r"₦\s*([\d,]{3,6}(?:\.\d{1,2})?)",
     ]
+
     for pat in regex_patterns:
-        for m in re.findall(pat, page_text, flags=re.I):
+        for m in re.findall(pat, page_text, re.I):
             p = _parse_price_string(m)
-            if p:
+            if p and 600 <= p <= 1500:
                 price_candidates.append(p)
                 price_sources.append(f"regex:{pat}")
-                debug["regex_candidates"].append((pat, m))
 
-    # DOM-specific common selectors (attempt)
     dom_selectors = [
-        "div.average-price", ".average-price", ".avg-petrol", "#avg-petrol",
-        ".pms-price", ".petrol-price", ".price .value", ".price-value", ".price--value"
+        "[class*='average-price']", "[class*='avg-petrol']", "[class*='pms-price']",
+        ".price-value", ".market-overview .value", "[data-testid*='price']"
     ]
     for sel in dom_selectors:
-        try:
-            el = soup.select_one(sel)
-            if el:
-                txt = el.get_text(" ", strip=True)
-                p = _parse_price_string(txt)
-                if p:
-                    price_candidates.append(p)
-                    price_sources.append(f"dom:{sel}")
-                    debug["dom_candidates"].append((sel, txt[:120]))
-        except Exception:
-            continue
+        els = soup.select(sel)
+        for el in els:
+            txt = el.get_text(" ", strip=True)
+            p = _parse_price_string(txt)
+            if p and 600 <= p <= 1500:
+                price_candidates.append(p)
+                price_sources.append(f"dom:{sel}")
 
-    # ---------- 5) Extract change_today and last_updated if present ----------
-    try:
-        ch = re.search(r"([+-]?\s*(?:₦|NGN|N)?\s*[\d,]+\.?\d*)\s*(?:today|since\s+yesterday)", page_text, flags=re.I)
-        if ch:
-            change_today = ch.group(1).strip()
-    except Exception:
-        pass
-
-    try:
-        date_cand = re.search(r"(?:Last Updated|as at|updated)\s*[:\-–]?\s*([0-3]?\d(?:\s+\w+)?(?:\s+\d{4})?(?:\s+\d{1,2}:\d{2}\s*(?:AM|PM)?)?)", page_text, flags=re.I)
-        if date_cand:
-            last_updated = date_cand.group(1).strip()
-    except Exception:
-        pass
-
-    # ---------- 6) Sanitize & deduplicate price candidates ----------
-    sanitized: List[float] = []
+    # ────────────────────────────────────────────────
+    # 4. Choose best candidate from app page attempts
+    # ────────────────────────────────────────────────
+    sanitized = []
     for c in price_candidates:
-        try:
-            c = float(c)
-        except Exception:
-            continue
-        if 600 <= c <= 1500:  # Tightened range for fallbacks too
+        if 600 <= c <= 1500:
             sanitized.append(round(c, 2))
-            continue
-        # if extremely large, try dividing by 100 (common concatenation)
-        if 5000 < c <= 500000 and 600 <= (c / 100) <= 1500:
+        elif 5000 < c <= 150000 and 600 <= (c / 100) <= 1500:
             sanitized.append(round(c / 100, 2))
-            continue
-        # attempt split for concatenated token
-        try:
-            split_try = _split_concatenated_numeric_token(str(int(c)))
-            if split_try and 600 <= min(split_try) <= 1500:
-                sanitized.append(round(min(split_try), 2))
-        except Exception:
-            continue
 
-    # remove duplicates but keep order
-    seen = set()
-    final_candidates = []
-    for v in sanitized:
-        if v not in seen:
-            seen.add(v)
-            final_candidates.append(v)
-
-    chosen = None
-    chosen_source = None
-    if final_candidates:
-        # choose most frequent value (in original sanitized list) else median
-        freq = {}
-        for v in sanitized:
-            freq[v] = freq.get(v, 0) + 1
-        # pick value with highest freq; tie-breaker: closest to mean
-        mean_val = sum(sanitized) / len(sanitized) if sanitized else None
-        best = max(freq.items(), key=lambda kv: (kv[1], -abs(kv[0] - (mean_val or kv[0]))))[0]
-        chosen = float(best)
-        # find a source for chosen (first occurrence)
+    if sanitized:
+        from collections import Counter
+        most_common = Counter(sanitized).most_common(1)
+        chosen = most_common[0][0] if most_common else sanitized[0]
+        # Find source
+        chosen_source = "unknown"
         for i, v in enumerate(price_candidates):
-            try:
-                if round(float(v), 2) == round(chosen, 2):
-                    chosen_source = price_sources[i] if i < len(price_sources) else None
-                    break
-            except Exception:
-                continue
+            if round(v, 2) == chosen or round(v / 100, 2) == chosen:
+                chosen_source = price_sources[i] if i < len(price_sources) else "sanitized_fallback"
+                break
 
-    # final sanity attempt: if no candidate found, try simple near-keyword extraction (last resort)
-    if not chosen:
-        try:
-            m = re.search(r"(?:Petrol|PMS)[^\d]{0,120}(?:₦|NGN|N)?\s*([\d,]+\.?\d*)", page_text, flags=re.I)
-            if m:
-                v = _parse_price_string(m.group(1))
-                if v and 600 <= v <= 1500:
-                    chosen = v
-                    chosen_source = "fallback:near_keyword_regex"
-        except Exception:
-            pass
-
-    # final formatting / debug return
-    if not chosen:
-        LOG.info("Fuel parser couldn't find petrol price; debug=%s", debug)
+        LOG.info("App page success: ₦%.2f from %s", chosen, chosen_source)
         return {
-            "source": "FuelPriceWatch",
-            "error": "no_price_found",
-            "price_raw": None,
-            "price_str": None,
-            "last_updated": last_updated,
+            "source": "FuelPriceWatch (app page)",
+            "price_raw": chosen,
+            "price_str": _format_naira(chosen),
             "change_today": change_today or "N/A",
+            "last_updated": last_updated or "Live data",
             "raw": {
-                "debug": debug,
+                "chosen_source": chosen_source,
                 "candidates": price_candidates,
-                "sanitized": final_candidates,
-                "regex_samples": debug.get("regex_candidates", [])[:6],
-                "dom_samples": debug.get("dom_candidates", [])[:6],
+                "sanitized": sanitized
             }
         }
 
-    # minor final correction: if chosen looks like integer massively > expected, scale down
-    if chosen > 1500 and 600 <= (chosen / 100) <= 1500:
-        chosen = round(chosen / 100, 2)
+    # ────────────────────────────────────────────────
+    # 5. LAST RESORT: Index page fallback (outdated but better than nothing)
+    # ────────────────────────────────────────────────
+    try:
+        debug["tried_index"] = True
+        idx_urls = [
+            "https://www.fuelpricewatch.com/fuel-price-index-nigeria",
+        ]
+        for idx_url in idx_urls:
+            try:
+                idx_html = _fetch_html(idx_url)
+                idx_soup = BeautifulSoup(idx_html, "lxml")
+                idx_text = idx_soup.get_text(" ", strip=True)
 
+                m = re.search(r"Petrol\s*\(PMS\)\s*₦?([\d,]+\.?\d*)", idx_text, re.I)
+                if m:
+                    v = _parse_price_string(m.group(1))
+                    if v and 500 <= v <= 1500:
+                        ch_m = re.search(r"([+-](?:\d+(?:\.\d+)?))\s*from yesterday", idx_text, re.I)
+                        ch = f"{ch_m.group(1)} from yesterday" if ch_m else None
+                        date_m = re.search(r"Last updated:\s*([^)]+?)(?=\s|$)", idx_text, re.I)
+                        upd = date_m.group(1).strip() if date_m else None
+
+                        LOG.info("Index fallback used (outdated): ₦%.2f", v)
+                        return {
+                            "source": "FuelPriceWatch Index (last resort fallback)",
+                            "price_raw": v,
+                            "price_str": _format_naira(v),
+                            "change_today": ch or "N/A",
+                            "last_updated": upd or "Live data",
+                            "raw": {"from": "index_page", "url": idx_url}
+                        }
+            except Exception as e:
+                LOG.debug(f"Index fetch/parse failed for {idx_url}: {e}")
+                continue
+    except Exception:
+        LOG.debug("Index fallback section failed", exc_info=True)
+
+    # ────────────────────────────────────────────────
+    # Final failure
+    # ────────────────────────────────────────────────
+    LOG.warning("No valid petrol price found anywhere - page snippet: %s", page_text[:800].replace('\n', ' '))
     return {
         "source": "FuelPriceWatch",
-        "price_raw": chosen,
-        "price_str": _format_naira(chosen),
+        "error": "no_price_found",
+        "price_raw": None,
+        "price_str": None,
+        "last_updated": last_updated,
         "change_today": change_today or "N/A",
-        "last_updated": last_updated or "Live data",
         "raw": {
-            "chosen_source": chosen_source,
-            "candidates": price_candidates,
-            "sanitized": final_candidates,
-            "xhr_attempts": debug.get("xhr_tried", [])[:8],
-            "snippet_len": len(html)
+            "debug": debug,
+            "page_snippet": page_text[:800]
         }
     }
 
