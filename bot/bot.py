@@ -981,7 +981,7 @@ async def run_bot():
             )
             application.job_queue.run_repeating(
                 callback=check_and_post_fuel_prices,
-                interval=120,
+                interval=600,
                 #time=dt_time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
                 name="check_fuel_prices",
                 first=10,
