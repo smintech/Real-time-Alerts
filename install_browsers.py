@@ -1,18 +1,16 @@
-# install_browsers.py - Updated for current Playwright (2026)
-import os
+# install_browsers.py - Final version for Render native Python (no deps, pure browser download)
 import subprocess
 import sys
 
 def main():
-    print("Starting Playwright browser download via CLI...")
+    print("Installing Playwright Chromium browser only (no system deps - safe for Render)")
+    cmd = [sys.executable, "-m", "playwright", "install", "chromium"]
     try:
-        # Use the Playwright CLI to install only Chromium
-        cmd = [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"]
         result = subprocess.run(cmd, check=True, capture_output=True, text=True)
-        print("Chromium installed successfully!")
+        print("Playwright Chromium installed successfully!")
         print(result.stdout)
     except subprocess.CalledProcessError as e:
-        print("Failed to install Chromium")
+        print("Installation failed")
         print(e.stderr)
         sys.exit(1)
     except Exception as e:
