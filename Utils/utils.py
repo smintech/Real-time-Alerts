@@ -2,6 +2,13 @@
 from telegram.error import TelegramError  # For safe_send
 from telegram import Bot  # Type hint for safe_send
 import os
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from selenium.webdriver.common.by import By
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from webdriver_manager.chrome import ChromeDriverManager
 import time
 import logging
 import json
@@ -56,6 +63,39 @@ async def safe_send(bot: Bot, targets: int | List[int], text: str, **kwargs) -> 
             results.append((target, False, str(e)))
     return results
 
+def _fetch_rendered_html(url: str) -> str:
+    """
+    Use Selenium to render the page (executes JS) and return fully loaded HTML.
+    This works on Render native Python runtime if you add Chrome install to build command.
+    """
+    options = Options()
+    options.add_argument("--headless=new")
+    options.add_argument("--no-sandbox")
+    options.add_argument("--disable-dev-shm-usage")
+    options.add_argument("--disable-gpu")
+    options.add_argument("--window-size=1280,1080")
+    options.add_argument("--disable-extensions")
+    options.add_argument("--disable-infobars")
+    options.add_argument("user-agent=Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36")
+
+    # webdriver-manager auto-downloads matching chromedriver
+    service = Service(ChromeDriverManager().install())
+    
+    driver = webdriver.Chrome(service=service, options=options)
+    try:
+        driver.get(url)
+        # Wait for the market overview section or any price indicator to appear
+        WebDriverWait(driver, 30).until(
+            EC.presence_of_element_located((By.XPATH, "//*[contains(text(), 'Average Petrol Price') or contains(text(), '₦')]"))
+        )
+        # Extra buffer for full render
+        time.sleep(6)
+        return driver.page_source
+    except Exception as e:
+        LOG.error(f"Selenium render failed for {url}: {e}")
+        return ""
+    finally:
+        driver.quit()
 
 # ---------------------------
 # Retry decorator (robust for network/cloudflare issues)
@@ -853,223 +893,46 @@ def _detect_block(soup: BeautifulSoup) -> Optional[str]:
 
 def _parse_fuelpricewatch(html: str) -> Dict[str, Any]:
     """
-    Robust parser for FuelPriceWatch SPA + index page + hidden JSON/XHR endpoints.
-    Prioritizes the main app page (live average), uses index page only as last fallback.
+    Parse the rendered HTML from the app page (live data).
+    Falls back to index if render fails.
     """
     soup = BeautifulSoup(html, "lxml")
-
-    # quick block detection
-    block = _detect_block(soup)
-    if block:
-        return {
-            "source": "FuelPriceWatch",
-            "error": block,
-            "price_raw": None,
-            "price_str": None,
-            "last_updated": None,
-            "change_today": None,
-            "raw": None
-        }
-
-    price_candidates: List[float] = []
-    price_sources: List[str] = []
-    change_today = None
-    last_updated = None
-    debug = {"tried_index": False, "next_data_found": False, "xhr_tried": [], "regex_candidates": [], "dom_candidates": []}
-
     page_text = soup.get_text(" ", strip=True)
 
-    # ────────────────────────────────────────────────
-    # 1. Priority keyword matches on main (app) page – most up-to-date
-    # ────────────────────────────────────────────────
-    priority_patterns = [
-        r"Average\s+Petrol\s+Price\s*₦?\s*([\d,]{3,6}(?:\.\d{1,2})?)",
-        r"Average\s+Petrol\s+Price.*?₦?([\d,]{3,6}(?:\.\d{1,2})?)",
-        r"(?:Average\s+)?(?:PMS|Petrol)\s*(?:Price|Avg)?\s*[:\-–]?\s*₦?\s*([\d,]{3,6}(?:\.\d{1,2})?)",
-        r"₦\s*([\d,]{3,6}(?:\.\d{1,2})?)\s*(?:today|\+|−|-|\%)",
+    # Priority: live app page patterns
+    patterns = [
+        r"Average\s+Petrol\s+Price.{0,200}?₦?\s*([\d,]{3,6}(?:\.\d{1,2})?)",
+        r"Average\s+Petrol\s+Price.*?([\d,]{3,6}(?:\.\d{1,2})?)",
+        r"Petrol.{0,200}?₦\s*([\d,]{3,6}(?:\.\d{1,2})?)",
+        r"₦\s*([\d,]{3,6}(?:\.\d{1,2})?)\s*(?:Petrol|PMS|today)",
     ]
 
-    for pat in priority_patterns:
-        for m in re.findall(pat, page_text, re.I):
-            v = _parse_price_string(m)
+    for pat in patterns:
+        m = re.search(pat, page_text, re.I | re.DOTALL)
+        if m:
+            v = _parse_price_string(m.group(1))
             if v and 600 <= v <= 1500:
-                # Try to get nearby change
-                match_pos = page_text.find(m)
-                context = page_text[max(0, match_pos - 150):match_pos + len(m) + 250]
-                ch_m = re.search(r"([+-]?\s*₦?[\d,]+\.?\d*)\s*(?:today|from last period)", context, re.I)
-                ch = ch_m.group(1).strip() if ch_m else None
+                # Extract change if possible
+                context = page_text[m.start()-200:m.end()+200]
+                ch = re.search(r"([+-]₦?[\d,]+\.?\d*)", context, re.I)
+                change = ch.group(1).strip() if ch else "N/A"
 
-                # Last updated
-                date_m = re.search(r"Last\s+Updated[\s:–\-]*([0-9: ]+(?:AM|PM)?)", page_text, re.I)
-                upd = date_m.group(1).strip() if date_m else None
-
-                LOG.info("Priority pattern hit (app page): ₦%.2f from %s", v, pat)
+                LOG.info("Live app page success: ₦%.2f", v)
                 return {
-                    "source": "FuelPriceWatch (app page priority)",
+                    "source": "FuelPriceWatch (live app)",
                     "price_raw": v,
                     "price_str": _format_naira(v),
-                    "change_today": ch or "N/A",
-                    "last_updated": upd or "Live data",
-                    "raw": {"pattern": pat, "match": m, "context": context[:250]}
+                    "change_today": change,
+                    "last_updated": "Live data",
+                    "raw": {"pattern": pat}
                 }
 
-    # ────────────────────────────────────────────────
-    # 2. __NEXT_DATA__ structured extraction (targeted)
-    # ────────────────────────────────────────────────
-    try:
-        next_data_el = soup.find("script", id="__NEXT_DATA__")
-        if next_data_el and next_data_el.string:
-            debug["next_data_found"] = True
-            nd = json.loads(next_data_el.string)
-
-            # Probe common paths
-            paths_to_check = [
-                "pageProps.marketOverview.averagePetrolPrice",
-                "pageProps.marketOverview.petrol.average",
-                "pageProps.averagePrices.pms",
-                "pageProps.data.petrolPrice",
-                "pageProps.initialState.market.petrolAverage",
-                "props.pageProps.marketOverview.averagePetrol",
-            ]
-
-            for path in paths_to_check:
-                keys = path.split(".")
-                val = nd
-                for k in keys:
-                    if isinstance(val, dict):
-                        val = val.get(k)
-                    else:
-                        val = None
-                        break
-                if val is not None:
-                    if isinstance(val, (int, float)):
-                        price_candidates.append(float(val))
-                        price_sources.append(f"__NEXT_DATA__/{path}")
-                    elif isinstance(val, str):
-                        p = _parse_price_string(val)
-                        if p and 600 <= p <= 1500:
-                            price_candidates.append(p)
-                            price_sources.append(f"__NEXT_DATA__/{path}")
-    except Exception as e:
-        LOG.debug("Failed to parse __NEXT_DATA__", exc_info=True)
-
-    # ────────────────────────────────────────────────
-    # 3. Fallback regex + DOM on app page
-    # ────────────────────────────────────────────────
-    regex_patterns = [
-        r"(?:Average\s*(?:PMS|Petrol|Petrol\s*\(PMS\)))[\s:–\-]*₦?\s*([\d,]{3,6}(?:\.\d{1,2})?)",
-        r"(?:PMS|Petrol)\s+Price\s*[:\-–]?\s*₦?\s*([\d,]{3,6}(?:\.\d{1,2})?)",
-        r"₦\s*([\d,]{3,6}(?:\.\d{1,2})?)",
-    ]
-
-    for pat in regex_patterns:
-        for m in re.findall(pat, page_text, re.I):
-            p = _parse_price_string(m)
-            if p and 600 <= p <= 1500:
-                price_candidates.append(p)
-                price_sources.append(f"regex:{pat}")
-
-    dom_selectors = [
-        "[class*='average-price']", "[class*='avg-petrol']", "[class*='pms-price']",
-        ".price-value", ".market-overview .value", "[data-testid*='price']"
-    ]
-    for sel in dom_selectors:
-        els = soup.select(sel)
-        for el in els:
-            txt = el.get_text(" ", strip=True)
-            p = _parse_price_string(txt)
-            if p and 600 <= p <= 1500:
-                price_candidates.append(p)
-                price_sources.append(f"dom:{sel}")
-
-    # ────────────────────────────────────────────────
-    # 4. Choose best candidate from app page attempts
-    # ────────────────────────────────────────────────
-    sanitized = []
-    for c in price_candidates:
-        if 600 <= c <= 1500:
-            sanitized.append(round(c, 2))
-        elif 5000 < c <= 150000 and 600 <= (c / 100) <= 1500:
-            sanitized.append(round(c / 100, 2))
-
-    if sanitized:
-        from collections import Counter
-        most_common = Counter(sanitized).most_common(1)
-        chosen = most_common[0][0] if most_common else sanitized[0]
-        # Find source
-        chosen_source = "unknown"
-        for i, v in enumerate(price_candidates):
-            if round(v, 2) == chosen or round(v / 100, 2) == chosen:
-                chosen_source = price_sources[i] if i < len(price_sources) else "sanitized_fallback"
-                break
-
-        LOG.info("App page success: ₦%.2f from %s", chosen, chosen_source)
-        return {
-            "source": "FuelPriceWatch (app page)",
-            "price_raw": chosen,
-            "price_str": _format_naira(chosen),
-            "change_today": change_today or "N/A",
-            "last_updated": last_updated or "Live data",
-            "raw": {
-                "chosen_source": chosen_source,
-                "candidates": price_candidates,
-                "sanitized": sanitized
-            }
-        }
-
-    # ────────────────────────────────────────────────
-    # 5. LAST RESORT: Index page fallback (outdated but better than nothing)
-    # ────────────────────────────────────────────────
-    try:
-        debug["tried_index"] = True
-        idx_urls = [
-            "https://www.fuelpricewatch.com/fuel-price-index-nigeria",
-        ]
-        for idx_url in idx_urls:
-            try:
-                idx_html = _fetch_html(idx_url)
-                idx_soup = BeautifulSoup(idx_html, "lxml")
-                idx_text = idx_soup.get_text(" ", strip=True)
-
-                m = re.search(r"Petrol\s*\(PMS\)\s*₦?([\d,]+\.?\d*)", idx_text, re.I)
-                if m:
-                    v = _parse_price_string(m.group(1))
-                    if v and 500 <= v <= 1500:
-                        ch_m = re.search(r"([+-](?:\d+(?:\.\d+)?))\s*from yesterday", idx_text, re.I)
-                        ch = f"{ch_m.group(1)} from yesterday" if ch_m else None
-                        date_m = re.search(r"Last updated:\s*([^)]+?)(?=\s|$)", idx_text, re.I)
-                        upd = date_m.group(1).strip() if date_m else None
-
-                        LOG.info("Index fallback used (outdated): ₦%.2f", v)
-                        return {
-                            "source": "FuelPriceWatch Index (last resort fallback)",
-                            "price_raw": v,
-                            "price_str": _format_naira(v),
-                            "change_today": ch or "N/A",
-                            "last_updated": upd or "Live data",
-                            "raw": {"from": "index_page", "url": idx_url}
-                        }
-            except Exception as e:
-                LOG.debug(f"Index fetch/parse failed for {idx_url}: {e}")
-                continue
-    except Exception:
-        LOG.debug("Index fallback section failed", exc_info=True)
-
-    # ────────────────────────────────────────────────
-    # Final failure
-    # ────────────────────────────────────────────────
-    LOG.warning("No valid petrol price found anywhere - page snippet: %s", page_text[:800].replace('\n', ' '))
     return {
         "source": "FuelPriceWatch",
-        "error": "no_price_found",
+        "error": "no_price_in_rendered_html",
         "price_raw": None,
         "price_str": None,
-        "last_updated": last_updated,
-        "change_today": change_today or "N/A",
-        "raw": {
-            "debug": debug,
-            "page_snippet": page_text[:800]
-        }
+        "raw": {"page_snippet": page_text[:800]}
     }
 
 def _parse_total(html: str) -> Dict[str, Any]:
@@ -1110,137 +973,45 @@ FUEL_SITE_SOURCES = [
 ]
 
 async def scrape_fuel_prices(site_sources: Optional[List[Dict[str, Any]]] = None) -> Dict[str, Any]:
-    """
-    Async wrapper that fetches multiple fuel price sources using the sync _fetch_html
-    function inside an executor. Adds validation/salvage logic but does NOT use Playwright.
-    Returns a dict similar to before plus improved debug info.
-    """
-    from datetime import datetime
+    app_url = "https://app.fuelpricewatch.com/"
+    
+    # Primary: render the live app page with Selenium
+    html = _fetch_rendered_html(app_url)
+    
+    result = _parse_fuelpricewatch(html)
+    
+    if result.get("price_raw") is not None:
+        return {
+            "avg_petrol": result["price_str"],
+            "change_today": result.get("change_today", "N/A"),
+            "last_updated": result.get("last_updated", "Live data"),
+            "avg_raw": result["price_raw"],
+            "sources": [result],
+            "debug": {"method": "selenium_live_app"}
+        }
 
-    loop = asyncio.get_event_loop()
-    sources_cfg = site_sources or FUEL_SITE_SOURCES
-
-    async def _fetch_and_parse(source_cfg: Dict[str, Any]) -> Dict[str, Any]:
-        url = source_cfg["url"]
-        parser = source_cfg["parser"]
-        try:
-            html = await loop.run_in_executor(None, _fetch_html, url)
-        except Exception as e:
-            LOG.exception("Fuel site fetch failed for %s", url)
-            return {"url": url, "error": f"fetch_error: {e}", "price_raw": None, "price_str": None, "source": getattr(parser, "__name__", "unknown"), "raw": None}
-
-        try:
-            parsed = parser(html)
-            parsed["url"] = url
-            parsed["raw"] = parsed.get("raw") or {"snippet_len": len(html)}
-            return parsed
-        except Exception as e:
-            LOG.exception("Fuel site parse failed for %s", url)
-            return {"url": url, "error": f"parse_error: {e}", "price_raw": None, "price_str": None, "source": getattr(parser, "__name__", "unknown"), "raw": None}
-
-    tasks = [_fetch_and_parse(cfg) for cfg in sources_cfg]
-    results = await asyncio.gather(*tasks, return_exceptions=False)
-
-    nums: List[float] = []
-    change_today = "N/A"
-    last_updated = "N/A"
-
-    # collect raw values & debug
-    debug = {"per_source": [], "salvage_attempts": []}
-
-    for r in results:
-        pr = r.get("price_raw")
-        debug["per_source"].append({
-            "url": r.get("url"),
-            "source": r.get("source") or r.get("url"),
-            "price_raw": pr,
-            "price_str": r.get("price_str"),
-            "error": r.get("error"),
-            "raw": r.get("raw")
-        })
-        if pr is not None:
-            try:
-                nums.append(float(pr))
-            except Exception:
-                pass
-        # Prefer change from the first successful source
-        if change_today == "N/A" and r.get("change_today"):
-            change_today = r["change_today"]
-        if last_updated == "N/A" and r.get("last_updated"):
-            last_updated = r["last_updated"]
-
-    avg_raw = sum(nums) / len(nums) if nums else None
-
-    # ---------- VALIDATION & SALVAGE ----------
-    # Tune these bounds to your country's typical fuel range
-    MIN_PLAUSIBLE = 500.0   # conservative lower bound (₦)
-    MAX_PLAUSIBLE = 1000.0  # realistic upper bound (₦)
-
-    def _is_plausible(v: Optional[float]) -> bool:
-        try:
-            return v is not None and MIN_PLAUSIBLE <= float(v) <= MAX_PLAUSIBLE
-        except Exception:
-            return False
-
-    # If avg_raw is missing or outside plausible bounds, attempt salvage
-    if not _is_plausible(avg_raw):
-        LOG.warning("avg_raw=%s outside plausible range [%s,%s] — attempting salvage", avg_raw, MIN_PLAUSIBLE, MAX_PLAUSIBLE)
-        debug["salvage_attempts"].append(f"initial_avg:{avg_raw}")
-
-        # 1) Use only per-source candidates that are plausible
-        plausible_candidates = []
-        for r in results:
-            try:
-                pr = r.get("price_raw")
-                if pr is None:
-                    continue
-                prf = float(pr)
-                if _is_plausible(prf):
-                    plausible_candidates.append(prf)
-            except Exception:
-                continue
-
-        if plausible_candidates:
-            avg_raw = sum(plausible_candidates) / len(plausible_candidates)
-            debug["salvage_attempts"].append({"method": "use_plausible_sources", "candidates": plausible_candidates, "new_avg": avg_raw})
-            LOG.info("Salvaged avg using plausible per-source values: %s", avg_raw)
-        else:
-            # 2) Try scaled-down candidates (common concatenation: 88394 -> 883.94 or integer tokens)
-            scaled_candidates = []
-            for r in results:
-                pr = r.get("price_raw")
-                if pr is None:
-                    continue
-                try:
-                    prf = float(pr)
-                except Exception:
-                    continue
-                # if candidate is huge, try dividing by 100
-                if prf > MAX_PLAUSIBLE and 10 <= (prf / 100) <= MAX_PLAUSIBLE:
-                    scaled_candidates.append(round(prf / 100, 2))
-                # also attempt split concatenation token if pr looks integer-like and long
-                elif prf >= 10000:
-                    split_try = _split_concatenated_numeric_token(str(int(prf)))
-                    if split_try:
-                        scaled_candidates.append(min(split_try))
-            if scaled_candidates:
-                avg_raw = sum(scaled_candidates) / len(scaled_candidates)
-                debug["salvage_attempts"].append({"method": "scaled_candidates", "candidates": scaled_candidates, "new_avg": avg_raw})
-                LOG.info("Salvaged avg using scaled/split candidates: %s", avg_raw)
-            else:
-                # 3) No further automated salvage available (Playwright intentionally removed)
-                debug["salvage_attempts"].append({"method": "none", "reason": "no plausible or scaled candidates"})
-                LOG.warning("Could not salvage avg_raw from candidates; leaving avg_raw as %s", avg_raw)
-
-    # final formatting
-    avg_formatted = _format_naira(avg_raw) if avg_raw else "N/A"
+    # Last resort: fall back to static index (your old cloudscraper method)
+    LOG.warning("Selenium live app failed - using static index fallback")
+    index_url = "https://www.fuelpricewatch.com/fuel-price-index-nigeria"
+    try:
+        index_html = _fetch_html(index_url)  # your existing cloudscraper function
+        index_result = _parse_fuelpricewatch(index_html.replace("app.fuelpricewatch.com", "index"))  # reuse parser
+        if index_result.get("price_raw"):
+            return {
+                "avg_petrol": index_result["price_str"],
+                "change_today": index_result.get("change_today", "N/A"),
+                "last_updated": "Index snapshot (may be outdated)",
+                "avg_raw": index_result["price_raw"],
+                "sources": [index_result],
+                "debug": {"method": "static_index_fallback"}
+            }
+    except Exception:
+        pass
 
     return {
-        "avg_petrol": avg_formatted,
-        "change_today": change_today,
-        "last_updated": last_updated or "Live data",
-        "avg_raw": avg_raw,
-        "sources": results,
-        "debug": debug,
-        "timestamp": datetime.now().isoformat()
+        "avg_petrol": "N/A",
+        "change_today": "N/A",
+        "last_updated": "N/A",
+        "avg_raw": None,
+        "error": "all_methods_failed"
     }
