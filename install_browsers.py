@@ -1,16 +1,23 @@
-# install_browsers.py - Run this during build to pre-download Playwright browsers
+# install_browsers.py - Updated for current Playwright (2026)
 import os
-from playwright.sync_api import sync_playwright
+import subprocess
+import sys
 
 def main():
-    print("Starting Playwright browser download...")
-    with sync_playwright() as p:
-        print("Downloading Chromium...")
-        p.chromium.download_browser_if_needed()
-        print("Chromium download complete!")
-        # Optional: also download firefox/webkit if you ever need them
-        # p.firefox.download_browser_if_needed()
-        # p.webkit.download_browser_if_needed()
+    print("Starting Playwright browser download via CLI...")
+    try:
+        # Use the Playwright CLI to install only Chromium
+        cmd = [sys.executable, "-m", "playwright", "install", "--with-deps", "chromium"]
+        result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+        print("Chromium installed successfully!")
+        print(result.stdout)
+    except subprocess.CalledProcessError as e:
+        print("Failed to install Chromium")
+        print(e.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"Unexpected error: {e}")
+        sys.exit(1)
 
 if __name__ == "__main__":
     main()
