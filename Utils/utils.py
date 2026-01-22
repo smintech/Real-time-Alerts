@@ -877,13 +877,13 @@ def _detect_block(soup: BeautifulSoup) -> Optional[str]:
 def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/") -> Dict[str, Any]:
     """
     Parse fuel price from FuelPriceWatch live app page.
-    Now returns the source as the actual URL for clickable links in reports.
+    Improved change detection: uses label-specific regex ("today" for absolute, "from last period" for percent)
+    to avoid picking changes from Diesel/Kerosene sections.
     """
     soup = BeautifulSoup(html, "lxml")
-    # Use newline separator to preserve structure while collapsing extra whitespace
     page_text = soup.get_text("\n", strip=True)
 
-    # Primary patterns – tuned for the page layout
+    # Price extraction (unchanged - reliable)
     price_patterns = [
         r"Average\s+Petrol\s+Price\s*₦?\s*([0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)",
         r"Average\s+Petrol\s+Price.{0,300}₦\s*([0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)",
@@ -892,47 +892,49 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
     ]
 
     v = None
-    context = page_text
     for pat in price_patterns:
         m = re.search(pat, page_text, re.I | re.DOTALL)
         if m:
-            price_str = m.group(1).replace(",", "")  # remove thousands separator
+            price_str = m.group(1).replace(",", "")
             v = _parse_price_string(price_str)
             if v and 600 <= v <= 1500:
-                # Extract wider context for change detection
-                start = max(0, m.start() - 400)
-                end = m.end() + 400
-                context = page_text[start:end]
                 break
 
     if v is None:
         return {"error": "no_price"}
 
-    # Extract both percentage and absolute changes
+    price_formatted = f"₦{v:,.2f}"
+
+    # === IMPROVED CHANGE EXTRACTION ===
     perc_change = "N/A"
     abs_change = "N/A"
 
-    # Find all +/- indicators in context
-    change_matches = re.findall(r"([+-]\s*[\d\.]+\s*%|[+-]?\s*₦?\s*[\d\.,]+\.?\d*)", context, re.I)
-    for match in change_matches:
-        cleaned = match.strip()
-        if "%" in cleaned:
-            perc_change = cleaned
-        elif "₦" in cleaned or cleaned.startswith(("+", "-")):
-            abs_change = cleaned
+    # Specific: percent with "from last period" label (only matches Petrol section)
+    perc_m = re.search(r"([+-]\s*[\d\.]+\s*%)\s*from last period", page_text, re.I)
+    if perc_m:
+        perc_change = perc_m.group(1).strip()
 
-    # Extra fallback searches
-    if perc_change == "N/A":
-        perc_m = re.search(r"([+-]\s*[\d\.]+\s*%)", context, re.I)
-        if perc_m:
-            perc_change = perc_m.group(1).strip()
+    # Specific: absolute with "today" label (only matches Petrol section)
+    abs_m = re.search(r"([+-]\s*₦\s*[\d\.,]+\.?\d*)\s*today", page_text, re.I)
+    if abs_m:
+        abs_change = abs_m.group(1).strip()
 
-    if abs_change == "N/A":
-        abs_m = re.search(r"([+-]\s*₦\s*[\d\.,]+\.?\d*)", context, re.I)
-        if abs_m:
-            abs_change = abs_m.group(1).strip()
+    # Fallback: if labels missing (unlikely), use old context-based method
+    if perc_change == "N/A" or abs_change == "N/A":
+        # Find context around price for fallback
+        price_match = re.search(r"Average\s+Petrol\s+Price", page_text, re.I)
+        if price_match:
+            start = max(0, price_match.start() - 300)
+            end = price_match.end() + 500
+            context = page_text[start:end]
 
-    price_formatted = f"₦{v:,.2f}"
+            change_matches = re.findall(r"([+-]\s*[\d\.]+\s*%|[+-]?\s*₦?\s*[\d\.,]+\.?\d*)", context, re.I)
+            for match in change_matches:
+                cleaned = match.strip()
+                if "%" in cleaned and perc_change == "N/A":
+                    perc_change = cleaned
+                elif "₦" in cleaned or cleaned.startswith(("+", "-")) and abs_change == "N/A":
+                    abs_change = cleaned
 
     LOG.info(
         "FuelPriceWatch parsed → %s | Percent: %s | Absolute: %s",
@@ -940,7 +942,7 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
     )
 
     return {
-        "source": url,  # ← Now the actual clickable URL!
+        "source": url,
         "price_raw": v,
         "price_str": price_formatted,
         "change_percent": perc_change,
@@ -1045,7 +1047,7 @@ async def scrape_fuel_prices() -> Dict[str, Any]:
 
 def scrape_lpg_prices() -> Dict[str, Any]:
     """
-    Scrape current LPG depot prices from lpginnigeria.com/chart (SSR site).
+    Scrape current LPG depot prices from lpginnigeria.com/chart (now Markdown-based table).
     Calculates:
       - Average depot price per 20MT (excluding 0/invalid)
       - Depot price per kg
@@ -1068,7 +1070,7 @@ def scrape_lpg_prices() -> Dict[str, Any]:
     soup = BeautifulSoup(html, "lxml")
     page_text = soup.get_text("\n", strip=True)
 
-    # Detect block (reuse existing helper if needed)
+    # Detect block
     block = _detect_block(soup)
     if block:
         LOG.warning(f"LPG chart blocked: {block}")
@@ -1081,55 +1083,52 @@ def scrape_lpg_prices() -> Dict[str, Any]:
             "source": "https://lpginnigeria.com/chart",
         }
 
-    # Find the table - it's the only <table> on the page
-    table = soup.find("table")
-    if not table:
-        LOG.warning("LPG price table not found")
-        return {
-            "error": "no_table",
-            "avg_depot_20mt": "N/A",
-            "avg_depot_per_kg": "N/A",
-            "retail_estimate_lagos": "N/A",
-            "last_updated": "N/A",
-            "source": "https://lpginnigeria.com/chart",
-        }
-
-    # Extract rows
+    # === NEW: Parse Markdown table from page text ===
     depots = []
-    valid_prices = []  # Prices per 20MT > 0
+    valid_prices = []
 
-    tbody = table.find("tbody")
-    if not tbody:
-        tbody = table  # fallback if no tbody
+    lines = [line.strip() for line in page_text.split("\n") if line.strip()]
+    in_table = False
 
-    for row in tbody.find_all("tr"):
-        cells = row.find_all("td")
-        if len(cells) != 4:
-            continue  # skip malformed rows
+    for line in lines:
+        if line.startswith("| Depot |") or "Depot" in line and "Prices" in line and "Diff." in line:
+            in_table = True
+            continue
+        if not in_table:
+            continue
+        if line.startswith("| ---"):  # Markdown separator row
+            continue
+        if line.startswith("|"):
+            # Split and clean parts (Markdown rows have empty first/last from leading/trailing |)
+            parts = [p.strip() for p in line.split("|") if p.strip()]
+            if len(parts) >= 3:  # At least depot, price, diff
+                depot_name = parts[0]
+                price_str = parts[1].replace(",", "").replace(" ", "")
+                diff_str = parts[2] if len(parts) > 2 else ""
+                diff_pct_str = parts[3] if len(parts) > 3 else ""
 
-        depot_name = cells[0].get_text(strip=True)
-        price_str = cells[1].get_text(strip=True).replace(",", "").strip()
-        diff_str = cells[2].get_text(strip=True)
-        diff_pct_str = cells[3].get_text(strip=True)
+                try:
+                    price = float(price_str) if price_str.isdigit() or (price_str.startswith("-") and price_str[1:].isdigit()) else 0.0
+                except Exception:
+                    price = 0.0
 
-        try:
-            price = float(price_str) if price_str.isdigit() else 0.0
-        except Exception:
-            price = 0.0
+                depots.append({
+                    "depot": depot_name,
+                    "price_20mt": price,
+                    "price_str": _format_naira(price) if price > 0 else "N/A",
+                    "diff": diff_str,
+                    "diff_pct": diff_pct_str,
+                })
 
-        depots.append({
-            "depot": depot_name,
-            "price_20mt": price,
-            "price_str": _format_naira(price) if price > 0 else "N/A",
-            "diff": diff_str,
-            "diff_pct": diff_pct_str,
-        })
+                if price > 0 and price < 50_000_000 and "Infinity" not in diff_pct_str:
+                    valid_prices.append(price)
 
-        if price > 0 and price < 50_000_000:  # sane upper limit to exclude errors
-            valid_prices.append(price)
+        # Optional: stop if we hit another section (e.g., next header)
+        elif in_table and ("|" not in line):
+            break  # End of table if non-Markdown line
 
     if not valid_prices:
-        LOG.warning("No valid depot prices found")
+        LOG.warning("No valid depot prices found after Markdown parsing")
         return {
             "error": "no_valid_prices",
             "avg_depot_20mt": "N/A",
@@ -1140,7 +1139,7 @@ def scrape_lpg_prices() -> Dict[str, Any]:
             "depots": depots,
         }
 
-    # Calculations
+    # Calculations (unchanged)
     avg_20mt = sum(valid_prices) / len(valid_prices)
     per_kg = avg_20mt / 20_000  # 20MT = 20,000 kg
 
@@ -1149,18 +1148,17 @@ def scrape_lpg_prices() -> Dict[str, Any]:
     retail_low = per_kg + margin_low
     retail_high = per_kg + margin_high
 
-    # Formatting
     avg_20mt_str = f"₦{int(round(avg_20mt)):,}"
     per_kg_str = f"₦{per_kg:,.2f}"
     retail_range_str = f"₦{int(round(retail_low)):,} – ₦{int(round(retail_high)):,} per kg"
 
-    # Extract date - look for pattern like "Thursday, 22nd January 2026"
+    # Date extraction (your existing regex should still work)
     date_match = re.search(r"(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+\d{1,2}(st|nd|rd|th)?\s+\w+\s+\d{4}", page_text)
     last_updated = date_match.group(0) if date_match else "Today"
 
     LOG.info(
-        "LPG scraped → Avg 20MT: %s | Per kg: %s | Lagos retail est: %s | Date: %s",
-        avg_20mt_str, per_kg_str, retail_range_str, last_updated
+        "LPG scraped → Avg 20MT: %s | Per kg: %s | Lagos retail est: %s | Date: %s | Valid depots: %d",
+        avg_20mt_str, per_kg_str, retail_range_str, last_updated, len(valid_prices)
     )
 
     return {
@@ -1173,7 +1171,7 @@ def scrape_lpg_prices() -> Dict[str, Any]:
         "avg_raw_20mt": round(avg_20mt),
         "last_updated": last_updated,
         "source": "https://lpginnigeria.com/chart",
-        "depots": depots,  # optional detailed list for debugging/advanced reports
+        "depots": depots,
         "valid_depots_count": len(valid_prices),
         "note": "Lagos retail estimate calculated as: average depot price per kg + ₦400–600/kg typical markup (for transport, bottling, dealer margin, etc.)",
     }
