@@ -99,7 +99,10 @@ def retry(max_attempts: int = 4, backoff: float = 2.0):
         return wrapper
     return decorator
 
-
+@retry(max_attempts=4, backoff=2.0)
+def _fetch_lpg_html() -> str:
+    url = "https://lpginnigeria.com/chart"
+    return _fetch_html(url)  # Reuses existing cloudscraper with retry
 # ---------------------------
 # Helpers
 # ---------------------------
@@ -1038,4 +1041,139 @@ async def scrape_fuel_prices() -> Dict[str, Any]:
         "error": "all_methods_failed",
         "sources": [],
         "debug": {"method": "failed"}
+    }
+
+def scrape_lpg_prices() -> Dict[str, Any]:
+    """
+    Scrape current LPG depot prices from lpginnigeria.com/chart (SSR site).
+    Calculates:
+      - Average depot price per 20MT (excluding 0/invalid)
+      - Depot price per kg
+      - Estimated Lagos retail range (+ ₦400–600/kg margin)
+    Returns structured dict compatible with report formatting.
+    """
+    try:
+        html = _fetch_lpg_html()
+    except Exception as e:
+        LOG.error(f"Failed to fetch LPG chart: {e}")
+        return {
+            "error": "fetch_failed",
+            "avg_depot_20mt": "N/A",
+            "avg_depot_per_kg": "N/A",
+            "retail_estimate_lagos": "N/A",
+            "last_updated": "N/A",
+            "source": "https://lpginnigeria.com/chart",
+        }
+
+    soup = BeautifulSoup(html, "lxml")
+    page_text = soup.get_text("\n", strip=True)
+
+    # Detect block (reuse existing helper if needed)
+    block = _detect_block(soup)
+    if block:
+        LOG.warning(f"LPG chart blocked: {block}")
+        return {
+            "error": block,
+            "avg_depot_20mt": "N/A",
+            "avg_depot_per_kg": "N/A",
+            "retail_estimate_lagos": "N/A",
+            "last_updated": "N/A",
+            "source": "https://lpginnigeria.com/chart",
+        }
+
+    # Find the table - it's the only <table> on the page
+    table = soup.find("table")
+    if not table:
+        LOG.warning("LPG price table not found")
+        return {
+            "error": "no_table",
+            "avg_depot_20mt": "N/A",
+            "avg_depot_per_kg": "N/A",
+            "retail_estimate_lagos": "N/A",
+            "last_updated": "N/A",
+            "source": "https://lpginnigeria.com/chart",
+        }
+
+    # Extract rows
+    depots = []
+    valid_prices = []  # Prices per 20MT > 0
+
+    tbody = table.find("tbody")
+    if not tbody:
+        tbody = table  # fallback if no tbody
+
+    for row in tbody.find_all("tr"):
+        cells = row.find_all("td")
+        if len(cells) != 4:
+            continue  # skip malformed rows
+
+        depot_name = cells[0].get_text(strip=True)
+        price_str = cells[1].get_text(strip=True).replace(",", "").strip()
+        diff_str = cells[2].get_text(strip=True)
+        diff_pct_str = cells[3].get_text(strip=True)
+
+        try:
+            price = float(price_str) if price_str.isdigit() else 0.0
+        except Exception:
+            price = 0.0
+
+        depots.append({
+            "depot": depot_name,
+            "price_20mt": price,
+            "price_str": _format_naira(price) if price > 0 else "N/A",
+            "diff": diff_str,
+            "diff_pct": diff_pct_str,
+        })
+
+        if price > 0 and price < 50_000_000:  # sane upper limit to exclude errors
+            valid_prices.append(price)
+
+    if not valid_prices:
+        LOG.warning("No valid depot prices found")
+        return {
+            "error": "no_valid_prices",
+            "avg_depot_20mt": "N/A",
+            "avg_depot_per_kg": "N/A",
+            "retail_estimate_lagos": "N/A",
+            "last_updated": "N/A",
+            "source": "https://lpginnigeria.com/chart",
+            "depots": depots,
+        }
+
+    # Calculations
+    avg_20mt = sum(valid_prices) / len(valid_prices)
+    per_kg = avg_20mt / 20_000  # 20MT = 20,000 kg
+
+    margin_low = 400
+    margin_high = 600
+    retail_low = per_kg + margin_low
+    retail_high = per_kg + margin_high
+
+    # Formatting
+    avg_20mt_str = f"₦{int(round(avg_20mt)):,}"
+    per_kg_str = f"₦{per_kg:,.2f}"
+    retail_range_str = f"₦{int(round(retail_low)):,} – ₦{int(round(retail_high)):,} per kg"
+
+    # Extract date - look for pattern like "Thursday, 22nd January 2026"
+    date_match = re.search(r"(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+\d{1,2}(st|nd|rd|th)?\s+\w+\s+\d{4}", page_text)
+    last_updated = date_match.group(0) if date_match else "Today"
+
+    LOG.info(
+        "LPG scraped → Avg 20MT: %s | Per kg: %s | Lagos retail est: %s | Date: %s",
+        avg_20mt_str, per_kg_str, retail_range_str, last_updated
+    )
+
+    return {
+        "avg_depot_20mt": avg_20mt_str,
+        "avg_depot_per_kg": per_kg_str,
+        "retail_estimate_lagos": retail_range_str,
+        "retail_range_low": int(round(retail_low)),
+        "retail_range_high": int(round(retail_high)),
+        "depot_per_kg_raw": round(per_kg, 2),
+        "avg_raw_20mt": round(avg_20mt),
+        "last_updated": last_updated,
+        "source": "https://lpginnigeria.com/chart",
+        "depots": depots,  # optional detailed list for debugging/advanced reports
+        "valid_depots_count": len(valid_prices),
+        "note": "Lagos retail estimate calculated as: average depot price per kg + ₦400–600/kg typical markup (for transport, bottling, dealer margin, etc.)",
     }
