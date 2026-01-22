@@ -1048,7 +1048,8 @@ async def scrape_fuel_prices() -> Dict[str, Any]:
 def scrape_lpg_prices() -> Dict[str, Any]:
     """
     Scrape current LPG depot prices from lpginnigeria.com/chart (Markdown-based table).
-    Handles common formatting issues like NBSP (\xa0), commas, and extra spaces.
+    Integrates robust parsing: tries HTML table first, then regex fallback for Markdown/text.
+    Calculates average depot price per 20MT (excluding 0/invalid), per kg, and Lagos retail estimate.
     """
     try:
         html = _fetch_lpg_html()
@@ -1079,68 +1080,77 @@ def scrape_lpg_prices() -> Dict[str, Any]:
             "source": "https://lpginnigeria.com/chart",
         }
 
-    # === ROBUST PARSING: Process ALL valid table rows (no fragile in_table/break) ===
+    # Extract Date (Robust regex handling day name, brackets, commas)
+    date_match = re.search(r"(?:\[)?(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)?(?:\])?,\s*\d{1,2}(st|nd|rd|th)?\s+\w+\s*,\s*\d{4}", page_text, re.IGNORECASE)
+    last_updated = date_match.group(0).strip("[] ,") if date_match else "Today"
+
+    # Parse Data: Try HTML table first, then fallback to regex on page_text (for Markdown)
     depots = []
     valid_prices = []
 
-    lines = [line for line in page_text.split("\n") if line.strip()]
+    # Attempt HTML Table Parsing (if site reverts to <table>)
+    target_table = None
+    for table in soup.find_all("table"):
+        header_text = table.get_text().lower()
+        if "depot" in header_text and "price" in header_text:
+            target_table = table
+            break
 
-    for line in lines:
-        if not line.startswith("|"):
-            continue
+    if target_table:
+        for row in target_table.find_all("tr")[1:]:  # Skip header
+            cols = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
+            if len(cols) >= 4:  # Expect depot, price, diff, diff%
+                depot_name = cols[0]
+                price_raw = cols[1]
+                diff_str = cols[2]
+                diff_pct_str = cols[3]
 
-        # Skip header and separator rows
-        if "Depot" in line and "Prices" in line:  # Header
-            continue
-        if line.startswith("| ---") or line.strip().startswith("|---"):
-            continue
+                price = _parse_price_string(price_raw) or 0.0
 
-        # Extract cells: everything between |s (ignore leading/trailing |)
-        cells = [cell.strip() for cell in line.split("|")[1:-1] if cell.strip()]
-        if len(cells) != 4:
-            continue  # Malformed row
+                depots.append({
+                    "depot": depot_name,
+                    "price_20mt": price,
+                    "price_str": _format_naira(price) if price > 0 else "N/A",
+                    "diff": diff_str,
+                    "diff_pct": diff_pct_str,
+                })
 
-        depot_name = cells[0]
-        price_raw = cells[1]
-        diff_str = cells[2]
-        diff_pct_str = cells[3]
+                if price > 10_000_000 and price < 50_000_000 and "infinity" not in diff_pct_str.lower():
+                    valid_prices.append(price)
 
-        # Aggressive price cleanup: remove ALL non-digits (handles commas, spaces, \xa0 NBSP, etc.)
-        price_str_clean = re.sub(r"[^\d]", "", price_raw)
-        try:
-            price = float(price_str_clean) if price_str_clean else 0.0
-        except Exception:
-            price = 0.0
+    # Regex Fallback (for current Markdown format)
+    if not valid_prices:
+        # Matches rows like "Depot Name 16,900,000 +200,000 +1.20%"
+        row_matches = re.findall(r"([A-Z][A-Za-z\s\(\)&]+)\s+(\d{1,2}(?:,\d{3})*)\s+([+-]?\d{1,3}(?:,\d{3})*)\s+([+-]?\d+\.\d+%|Infinity%)", page_text)
+        for depot_name, price_str, diff_str, diff_pct_str in row_matches:
+            price = _parse_price_string(price_str) or 0.0
 
-        depots.append({
-            "depot": depot_name,
-            "price_20mt": price,
-            "price_str": _format_naira(price) if price > 0 else "N/A",
-            "diff": diff_str,
-            "diff_pct": diff_pct_str,
-        })
+            depots.append({
+                "depot": depot_name.strip(),
+                "price_20mt": price,
+                "price_str": _format_naira(price) if price > 0 else "N/A",
+                "diff": diff_str,
+                "diff_pct": diff_pct_str,
+            })
 
-        # Skip invalid: 0, unreasonably high, or Infinity in %
-        if (price > 100_000  # Minimum sane price
-            and price < 50_000_000
-            and "infinity" not in diff_pct_str.lower()):
-            valid_prices.append(price)
+            if price > 10_000_000 and price < 50_000_000 and "infinity" not in diff_pct_str.lower():
+                valid_prices.append(price)
 
     if not valid_prices:
-        LOG.warning(f"No valid depot prices found (parsed {len(depots)} rows, check for formatting changes)")
+        LOG.warning("No valid depot prices found after table and regex parsing")
         return {
             "error": "no_valid_prices",
             "avg_depot_20mt": "N/A",
             "avg_depot_per_kg": "N/A",
             "retail_estimate_lagos": "N/A",
-            "last_updated": "N/A",
+            "last_updated": last_updated,
             "source": "https://lpginnigeria.com/chart",
-            "depots": depots,  # For debugging
+            "depots": depots,
         }
 
     # Calculations
     avg_20mt = sum(valid_prices) / len(valid_prices)
-    per_kg = avg_20mt / 20_000
+    per_kg = avg_20mt / 20_000  # 20MT = 20,000 kg
 
     margin_low = 400
     margin_high = 600
@@ -1151,12 +1161,8 @@ def scrape_lpg_prices() -> Dict[str, Any]:
     per_kg_str = f"₦{per_kg:,.2f}"
     retail_range_str = f"₦{int(round(retail_low)):,} – ₦{int(round(retail_high)):,} per kg"
 
-    # Robust date extraction (handles "Thursday, 22nd January, 2026" or variations)
-    date_match = re.search(r"(\w+,\s*)?\d{1,2}(st|nd|rd|th)?\s+\w+\s+\d{4}", page_text, re.IGNORECASE)
-    last_updated = date_match.group(0).strip(", []") if date_match else "Today"
-
     LOG.info(
-        "LPG scraped successfully → Avg 20MT: %s | Per kg: %s | Lagos retail est: %s | Date: %s | Valid depots: %d",
+        "LPG scraped → Avg 20MT: %s | Per kg: %s | Lagos retail est: %s | Date: %s | Valid depots: %d",
         avg_20mt_str, per_kg_str, retail_range_str, last_updated, len(valid_prices)
     )
 
