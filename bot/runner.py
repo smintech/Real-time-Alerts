@@ -5,7 +5,7 @@ import time
 import logging
 import asyncio
 from datetime import datetime, timezone
-
+from playwright.async_api import async_playwright
 import uvicorn
 from fastapi import FastAPI, HTTPException, Body
 
@@ -31,6 +31,7 @@ from Utils.utils import (
 # -----------------------
 # Logging
 # -----------------------
+LOG = logging.getLogger(__name__)
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
 logging.basicConfig(
     level=LOG_LEVEL,
@@ -131,6 +132,24 @@ from bot.bot import run_bot # Async version with nest_asyncio
 # -----------------------
 # Startup / Shutdown
 # -----------------------
+
+async def debug_playwright_env():
+    path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH", "NOT SET")
+    LOG.info(f"--- Playwright Debug ---")
+    LOG.info(f"PLAYWRIGHT_BROWSERS_PATH: {path}")
+    
+    if os.path.exists(path):
+        contents = os.listdir(path)
+        LOG.info(f"Contents of {path}: {contents}")
+    else:
+        LOG.error(f"Directory {path} DOES NOT EXIST inside the container!")
+    LOG.info(f"-------------------------")
+
+# If using FastAPI, call it in the lifespan or startup event
+@app.on_event("startup")
+async def startup_event():
+    await debug_playwright_env()
+
 @app.on_event("startup")
 async def on_startup():
     logger.info("FastAPI startup — preparing DB")
