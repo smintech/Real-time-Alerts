@@ -615,8 +615,8 @@ def log_fuel_scraper_data(data: Any, *, test_mode: bool = False) -> None:
 async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
     """
     Daily fuel & LPG update job - posts only if petrol OR LPG price changed since last post.
-    Uses persistent snapshots to track last posted prices and prevent duplicates.
-    When TEST_MODE is truthy, skip time-window, snapshot throttling, and change checks (always attempt/post).
+    Uses persistent channel_snapshots (reuses existing 'last_posted_price' for petrol + 'raw' JSON for LPG previous).
+    When TEST_MODE is truthy, skip time-window, recency, and change checks (always attempt/post).
     """
     now = datetime.now(TIMEZONE)
     FUEL_TRACKING_KEY = "https://fuelpricewatch.com/nigeria"
@@ -629,19 +629,34 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
     else:
         LOG.debug("TEST_MODE enabled: skipping time window check")
 
-    # Load last snapshot
+    # Load last snapshot (uses existing load_channel_snapshot)
     snapshot = None
     if not TEST_MODE:
         try:
             snapshot = await load_channel_snapshot(FUEL_TRACKING_KEY)
         except Exception:
-            LOG.exception("Failed to load snapshot")
-            snapshot = None
-    else:
-        LOG.debug("TEST_MODE enabled: skipping snapshot load/check")
+            LOG.exception("Failed to load channel snapshot")
 
-    last_petrol_price = snapshot.get("last_posted_petrol") if snapshot else None
-    last_lpg_price = snapshot.get("last_posted_lpg_per_kg") if snapshot else None  # using depot per kg as stable key
+        # Recency check: prevent duplicate posts within ~20 hours
+        if snapshot and snapshot.get("last_posted_at"):
+            try:
+                last_run = datetime.fromisoformat(snapshot["last_posted_at"])
+                if (now - last_run).total_seconds() < 72_000:
+                    LOG.info("Fuel update already sent recently at %s — skipping", last_run.isoformat())
+                    return
+            except Exception:
+                LOG.warning("Could not parse last_posted_at; proceeding")
+    else:
+        LOG.debug("TEST_MODE enabled: skipping snapshot recency check")
+
+    # Extract previous prices from snapshot (compatible with existing schema)
+    previous_petrol_raw = snapshot.get("last_posted_price") if snapshot else None
+    previous_lpg_raw = None
+    if snapshot and snapshot.get("raw"):
+        try:
+            previous_lpg_raw = snapshot["raw"].get("previous_lpg_per_kg")
+        except Exception:
+            pass
 
     # === Scrape Petrol (PMS) ===
     petrol_data = None
@@ -678,7 +693,7 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
     # Normalize petrol
     petrol_avg_formatted = None
     petrol_avg_raw = None
-    petrol_changed = True  # default to post if no previous
+    petrol_changed = True
 
     if petrol_data:
         petrol_avg_formatted = petrol_data.get("avg_petrol")
@@ -689,8 +704,8 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
         if not petrol_avg_formatted or str(petrol_avg_formatted).strip().upper() in {"", "N/A", "NONE"}:
             petrol_avg_formatted = None
 
-        if not TEST_MODE and last_petrol_price is not None and petrol_avg_raw is not None:
-            petrol_changed = abs(petrol_avg_raw - last_petrol_price) >= 0.01  # any change
+        if not TEST_MODE and previous_petrol_raw is not None and petrol_avg_raw is not None:
+            petrol_changed = abs(petrol_avg_raw - previous_petrol_raw) >= 0.01
 
     # Normalize LPG
     lpg_retail_range = None
@@ -701,32 +716,31 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
         lpg_retail_range = lpg_data["retail_estimate_lagos"]
         lpg_depot_per_kg_raw = lpg_data.get("depot_per_kg_raw")
 
-        if not TEST_MODE and last_lpg_price is not None and lpg_depot_per_kg_raw is not None:
-            lpg_changed = abs(lpg_depot_per_kg_raw - last_lpg_price) >= 0.01
+        if not TEST_MODE and previous_lpg_raw is not None and lpg_depot_per_kg_raw is not None:
+            lpg_changed = abs(lpg_depot_per_kg_raw - previous_lpg_raw) >= 0.01
 
-    # Decide whether to post
-    should_post = TEST_MODE or petrol_changed or lpg_changed or (petrol_avg_formatted is None and lpg_retail_range is None)
+    # Decide whether to post: if either price changed (or TEST_MODE or first run)
+    should_post = TEST_MODE or petrol_changed or lpg_changed or (previous_petrol_raw is None and previous_lpg_raw is None)
 
     if not should_post:
         LOG.info(
-            "No price change detected (Petrol: %.2f vs last %.2f | LPG: %.2f vs last %.2f) — skipping post",
-            petrol_avg_raw or 0, last_petrol_price or 0,
-            lpg_depot_per_kg_raw or 0, last_lpg_price or 0
+            "No price change detected (Petrol: %.2f vs prev %.2f | LPG: %.2f vs prev %.2f) — skipping post",
+            petrol_avg_raw or 0, previous_petrol_raw or 0,
+            lpg_depot_per_kg_raw or 0, previous_lpg_raw or 0
         )
         return
 
     LOG.info("Price change detected — proceeding to post update")
 
-    # === Build message (only include sections with data) ===
+    # === Build message ===
     message_lines = [
         "🌅 <b>Daily Fuel Price Report — Nigeria</b>",
         f"📅 {now.strftime('%B %d, %Y')} — <i>Morning update</i>",
         "━━━━━━━━━━━━━━━━━━",
     ]
 
-    # Petrol section
+    # Petrol section (if data available)
     if petrol_avg_formatted:
-        # Change text & emoji (reuse your existing logic)
         change_parts = []
         change_absolute = petrol_data.get("change_absolute", "N/A")
         change_percent = petrol_data.get("change_percent", "N/A")
@@ -744,12 +758,11 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
 
         last_updated_petrol = petrol_data.get("last_updated", "Live data")
 
-        # Sources (reuse your existing processing)
+        # Sources processing
         sources = petrol_data.get("sources", [])
         reported = 0
         total_sources = max(1, len(sources))
         sources_lines = []
-
         for s in sources:
             if not isinstance(s, dict):
                 if isinstance(s, str):
@@ -799,12 +812,12 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
             "",
         ])
 
-    # LPG section
+    # LPG section (if data available)
     if lpg_retail_range:
         lpg_depot_avg = lpg_data.get("avg_depot_20mt", "N/A")
         lpg_depot_per_kg = lpg_data.get("avg_depot_per_kg", "N/A")
         lpg_last_updated = lpg_data.get("last_updated", "Today")
-        lpg_note = lpg_data.get("note", "Lagos retail estimate = average depot price per kg + ₦400–600/kg typical markup")
+        lpg_note = lpg_data.get("note", "How we estimate Lagos retail: We take the average depot price per kg from major depots, then add ₦400–600/kg for typical additional costs (transport to stations, bottling/filling, dealer profit, and minor fees).")
 
         message_lines.extend([
             "🔥 <b>LPG (Cooking Gas) — Lagos Retail Estimate</b>",
@@ -821,9 +834,6 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
             f"<i>{lpg_note}</i>",
             "",
         ])
-
-    if not message_lines[-1]:  # remove trailing empty lines
-        message_lines = [line for line in message_lines if line.strip()]
 
     message_lines.extend([
         "━━━━━━━━━━━━━━━━━━",
@@ -849,23 +859,30 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
 
     if any_success and not TEST_MODE:
         try:
-            snapshot_data = {
+            # Prepare snapshot dict compatible with existing save_channel_snapshot
+            snapshot_to_save = {
                 "last_posted_at": now.isoformat(),
+                "last_posted_price": petrol_avg_raw,  # Reuses existing column for petrol
+            }
+
+            # Merge LPG previous into raw JSONB
+            existing_raw = snapshot.get("raw", {}) if snapshot else {}
+            new_raw = {
+                **existing_raw,
+                "previous_lpg_per_kg": lpg_depot_per_kg_raw,
                 "sources_confidence": confidence if petrol_avg_formatted else "N/A",
             }
-            if petrol_avg_raw is not None:
-                snapshot_data["last_posted_petrol"] = petrol_avg_raw
-            if lpg_depot_per_kg_raw is not None:
-                snapshot_data["last_posted_lpg_per_kg"] = lpg_depot_per_kg_raw
+            snapshot_to_save["raw"] = new_raw  # Will be JSON dumped in DB function
 
             await save_channel_snapshot(
                 FUEL_TRACKING_KEY,
-                snapshot_data,
-                expires_hours=72,  # longer retention
+                snapshot_to_save,
+                expires_hours=72,
             )
-            LOG.info("Update posted and snapshot saved (petrol: %.2f, lpg: %.2f)", petrol_avg_raw or 0, lpg_depot_per_kg_raw or 0)
+            LOG.info("Update posted and snapshot saved (petrol: %.2f → last_posted_price, lpg: %.2f → raw.previous_lpg_per_kg)",
+                     petrol_avg_raw or 0, lpg_depot_per_kg_raw or 0)
         except Exception:
-            LOG.exception("Failed to save snapshot")
+            LOG.exception("Failed to save channel snapshot")
     else:
         if TEST_MODE:
             LOG.debug("TEST_MODE: skipping snapshot save")
