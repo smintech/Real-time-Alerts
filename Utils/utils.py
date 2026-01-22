@@ -1047,12 +1047,8 @@ async def scrape_fuel_prices() -> Dict[str, Any]:
 
 def scrape_lpg_prices() -> Dict[str, Any]:
     """
-    Scrape current LPG depot prices from lpginnigeria.com/chart (now Markdown-based table).
-    Calculates:
-      - Average depot price per 20MT (excluding 0/invalid)
-      - Depot price per kg
-      - Estimated Lagos retail range (+ ₦400–600/kg margin)
-    Returns structured dict compatible with report formatting.
+    Scrape current LPG depot prices from lpginnigeria.com/chart (Markdown-based table).
+    Handles common formatting issues like NBSP (\xa0), commas, and extra spaces.
     """
     try:
         html = _fetch_lpg_html()
@@ -1083,52 +1079,55 @@ def scrape_lpg_prices() -> Dict[str, Any]:
             "source": "https://lpginnigeria.com/chart",
         }
 
-    # === NEW: Parse Markdown table from page text ===
+    # === ROBUST PARSING: Process ALL valid table rows (no fragile in_table/break) ===
     depots = []
     valid_prices = []
 
-    lines = [line.strip() for line in page_text.split("\n") if line.strip()]
-    in_table = False
+    lines = [line for line in page_text.split("\n") if line.strip()]
 
     for line in lines:
-        if line.startswith("| Depot |") or "Depot" in line and "Prices" in line and "Diff." in line:
-            in_table = True
+        if not line.startswith("|"):
             continue
-        if not in_table:
+
+        # Skip header and separator rows
+        if "Depot" in line and "Prices" in line:  # Header
             continue
-        if line.startswith("| ---"):  # Markdown separator row
+        if line.startswith("| ---") or line.strip().startswith("|---"):
             continue
-        if line.startswith("|"):
-            # Split and clean parts (Markdown rows have empty first/last from leading/trailing |)
-            parts = [p.strip() for p in line.split("|") if p.strip()]
-            if len(parts) >= 3:  # At least depot, price, diff
-                depot_name = parts[0]
-                price_str = parts[1].replace(",", "").replace(" ", "")
-                diff_str = parts[2] if len(parts) > 2 else ""
-                diff_pct_str = parts[3] if len(parts) > 3 else ""
 
-                try:
-                    price = float(price_str) if price_str.isdigit() or (price_str.startswith("-") and price_str[1:].isdigit()) else 0.0
-                except Exception:
-                    price = 0.0
+        # Extract cells: everything between |s (ignore leading/trailing |)
+        cells = [cell.strip() for cell in line.split("|")[1:-1] if cell.strip()]
+        if len(cells) != 4:
+            continue  # Malformed row
 
-                depots.append({
-                    "depot": depot_name,
-                    "price_20mt": price,
-                    "price_str": _format_naira(price) if price > 0 else "N/A",
-                    "diff": diff_str,
-                    "diff_pct": diff_pct_str,
-                })
+        depot_name = cells[0]
+        price_raw = cells[1]
+        diff_str = cells[2]
+        diff_pct_str = cells[3]
 
-                if price > 0 and price < 50_000_000 and "Infinity" not in diff_pct_str:
-                    valid_prices.append(price)
+        # Aggressive price cleanup: remove ALL non-digits (handles commas, spaces, \xa0 NBSP, etc.)
+        price_str_clean = re.sub(r"[^\d]", "", price_raw)
+        try:
+            price = float(price_str_clean) if price_str_clean else 0.0
+        except Exception:
+            price = 0.0
 
-        # Optional: stop if we hit another section (e.g., next header)
-        elif in_table and ("|" not in line):
-            break  # End of table if non-Markdown line
+        depots.append({
+            "depot": depot_name,
+            "price_20mt": price,
+            "price_str": _format_naira(price) if price > 0 else "N/A",
+            "diff": diff_str,
+            "diff_pct": diff_pct_str,
+        })
+
+        # Skip invalid: 0, unreasonably high, or Infinity in %
+        if (price > 100_000  # Minimum sane price
+            and price < 50_000_000
+            and "infinity" not in diff_pct_str.lower()):
+            valid_prices.append(price)
 
     if not valid_prices:
-        LOG.warning("No valid depot prices found after Markdown parsing")
+        LOG.warning(f"No valid depot prices found (parsed {len(depots)} rows, check for formatting changes)")
         return {
             "error": "no_valid_prices",
             "avg_depot_20mt": "N/A",
@@ -1136,12 +1135,12 @@ def scrape_lpg_prices() -> Dict[str, Any]:
             "retail_estimate_lagos": "N/A",
             "last_updated": "N/A",
             "source": "https://lpginnigeria.com/chart",
-            "depots": depots,
+            "depots": depots,  # For debugging
         }
 
-    # Calculations (unchanged)
+    # Calculations
     avg_20mt = sum(valid_prices) / len(valid_prices)
-    per_kg = avg_20mt / 20_000  # 20MT = 20,000 kg
+    per_kg = avg_20mt / 20_000
 
     margin_low = 400
     margin_high = 600
@@ -1152,12 +1151,12 @@ def scrape_lpg_prices() -> Dict[str, Any]:
     per_kg_str = f"₦{per_kg:,.2f}"
     retail_range_str = f"₦{int(round(retail_low)):,} – ₦{int(round(retail_high)):,} per kg"
 
-    # Date extraction (your existing regex should still work)
-    date_match = re.search(r"(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),?\s+\d{1,2}(st|nd|rd|th)?\s+\w+\s+\d{4}", page_text)
-    last_updated = date_match.group(0) if date_match else "Today"
+    # Robust date extraction (handles "Thursday, 22nd January, 2026" or variations)
+    date_match = re.search(r"(\w+,\s*)?\d{1,2}(st|nd|rd|th)?\s+\w+\s+\d{4}", page_text, re.IGNORECASE)
+    last_updated = date_match.group(0).strip(", []") if date_match else "Today"
 
     LOG.info(
-        "LPG scraped → Avg 20MT: %s | Per kg: %s | Lagos retail est: %s | Date: %s | Valid depots: %d",
+        "LPG scraped successfully → Avg 20MT: %s | Per kg: %s | Lagos retail est: %s | Date: %s | Valid depots: %d",
         avg_20mt_str, per_kg_str, retail_range_str, last_updated, len(valid_prices)
     )
 
