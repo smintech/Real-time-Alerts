@@ -1036,12 +1036,12 @@ async def run_bot():
                 first=10,
                 name="channel_deals"
             )
-            application.job_queue.run_repeating(
+            application.job_queue.run_daily(
                 callback=check_and_post_fuel_prices,
-                interval=600,
-                #time=dt_time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
+                #interval=600,
+                time=dt_time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
                 name="check_fuel_prices",
-                first=10,
+                #first=10,
             )
             application.job_queue.run_repeating(
                 callback=check_trials,
