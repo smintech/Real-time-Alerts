@@ -1,5 +1,7 @@
 FROM mcr.microsoft.com/playwright/python:v1.57.0-noble
 
+ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+
 WORKDIR /app
 
 COPY requirements.txt .
