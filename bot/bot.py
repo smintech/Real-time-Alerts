@@ -37,6 +37,7 @@ from Utils.utils import (
     _get_domain_from_url,
     scrape_fuel_prices,
     _format_naira,
+    scrape_lpg_prices,
 )
 from bot.persistence import (
     load_last_snapshot,
@@ -613,9 +614,9 @@ def log_fuel_scraper_data(data: Any, *, test_mode: bool = False) -> None:
 
 async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
     """
-    Daily fuel update job - uses persistent snapshots to ensure once-per-day posting.
-    Prefers a multi-source scraper (scrape_fuel_prices_many) but falls back to scrape_fuel_prices().
-    When TEST_MODE is truthy, skip the time-window and snapshot throttling rules (always attempt).
+    Daily fuel & LPG update job - posts only if petrol OR LPG price changed since last post.
+    Uses persistent snapshots to track last posted prices and prevent duplicates.
+    When TEST_MODE is truthy, skip time-window, snapshot throttling, and change checks (always attempt/post).
     """
     now = datetime.now(TIMEZONE)
     FUEL_TRACKING_KEY = "https://fuelpricewatch.com/nigeria"
@@ -628,29 +629,22 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
     else:
         LOG.debug("TEST_MODE enabled: skipping time window check")
 
-    # Load last snapshot and short-circuit if already posted recently (skip in TEST_MODE)
+    # Load last snapshot
     snapshot = None
     if not TEST_MODE:
         try:
             snapshot = await load_channel_snapshot(FUEL_TRACKING_KEY)
         except Exception:
-            LOG.exception("Failed to load fuel snapshot")
+            LOG.exception("Failed to load snapshot")
             snapshot = None
-
-        if snapshot and snapshot.get("last_posted_at"):
-            try:
-                last_run = datetime.fromisoformat(snapshot["last_posted_at"])
-                # 72,000 seconds ~ 20 hours -> prevents duplicate same-day posts
-                if (now - last_run).total_seconds() < 72_000:
-                    LOG.info("Fuel update already sent recently at %s — skipping", last_run.isoformat())
-                    return
-            except Exception:
-                LOG.warning("Could not parse last_posted_at; proceeding to scrape")
     else:
-        LOG.debug("TEST_MODE enabled: skipping snapshot recency check")
+        LOG.debug("TEST_MODE enabled: skipping snapshot load/check")
 
-    # Scrape data (prefer multi-source entrypoint if available)
-    data = None
+    last_petrol_price = snapshot.get("last_posted_petrol") if snapshot else None
+    last_lpg_price = snapshot.get("last_posted_lpg_per_kg") if snapshot else None  # using depot per kg as stable key
+
+    # === Scrape Petrol (PMS) ===
+    petrol_data = None
     try:
         scraper_fn = None
         if "scrape_fuel_prices_many" in globals() and callable(globals().get("scrape_fuel_prices_many")):
@@ -658,143 +652,187 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
         elif "scrape_fuel_prices" in globals() and callable(globals().get("scrape_fuel_prices")):
             scraper_fn = globals()["scrape_fuel_prices"]
 
-        if scraper_fn is None:
-            LOG.error("No fuel scraper function found")
-            return
-
-        if asyncio.iscoroutinefunction(scraper_fn):
-            data = await scraper_fn()
-            log_fuel_scraper_data(data, test_mode=TEST_MODE)
-        else:
-            loop = asyncio.get_event_loop()
-            data = await loop.run_in_executor(None, scraper_fn)
-            log_fuel_scraper_data(data, test_mode=TEST_MODE)
+        if scraper_fn:
+            if asyncio.iscoroutinefunction(scraper_fn):
+                petrol_data = await scraper_fn()
+            else:
+                loop = asyncio.get_event_loop()
+                petrol_data = await loop.run_in_executor(None, scraper_fn)
+            log_fuel_scraper_data(petrol_data, test_mode=TEST_MODE)
     except Exception:
-        LOG.exception("Error during fuel price scraping")
+        LOG.exception("Error scraping petrol prices")
+
+    # === Scrape LPG ===
+    lpg_data = None
+    try:
+        loop = asyncio.get_event_loop()
+        lpg_data = await loop.run_in_executor(None, scrape_lpg_prices)
+        LOG.info("LPG scrape completed: %s", lpg_data.get("retail_estimate_lagos", "N/A"))
+    except Exception:
+        LOG.exception("Error scraping LPG prices")
+
+    if not petrol_data and not lpg_data:
+        LOG.warning("Both scrapers failed — skipping post")
         return
 
-    if not data or not isinstance(data, dict):
-        LOG.warning("No data returned from scraper — skipping post")
+    # Normalize petrol
+    petrol_avg_formatted = None
+    petrol_avg_raw = None
+    petrol_changed = True  # default to post if no previous
+
+    if petrol_data:
+        petrol_avg_formatted = petrol_data.get("avg_petrol")
+        petrol_avg_raw = petrol_data.get("avg_raw")
+        if isinstance(petrol_avg_formatted, (int, float)):
+            petrol_avg_formatted = _format_naira(float(petrol_avg_formatted))
+
+        if not petrol_avg_formatted or str(petrol_avg_formatted).strip().upper() in {"", "N/A", "NONE"}:
+            petrol_avg_formatted = None
+
+        if not TEST_MODE and last_petrol_price is not None and petrol_avg_raw is not None:
+            petrol_changed = abs(petrol_avg_raw - last_petrol_price) >= 0.01  # any change
+
+    # Normalize LPG
+    lpg_retail_range = None
+    lpg_depot_per_kg_raw = None
+    lpg_changed = True
+
+    if lpg_data and lpg_data.get("retail_estimate_lagos") != "N/A":
+        lpg_retail_range = lpg_data["retail_estimate_lagos"]
+        lpg_depot_per_kg_raw = lpg_data.get("depot_per_kg_raw")
+
+        if not TEST_MODE and last_lpg_price is not None and lpg_depot_per_kg_raw is not None:
+            lpg_changed = abs(lpg_depot_per_kg_raw - last_lpg_price) >= 0.01
+
+    # Decide whether to post
+    should_post = TEST_MODE or petrol_changed or lpg_changed or (petrol_avg_formatted is None and lpg_retail_range is None)
+
+    if not should_post:
+        LOG.info(
+            "No price change detected (Petrol: %.2f vs last %.2f | LPG: %.2f vs last %.2f) — skipping post",
+            petrol_avg_raw or 0, last_petrol_price or 0,
+            lpg_depot_per_kg_raw or 0, last_lpg_price or 0
+        )
         return
 
-    # === Normalize to latest utils.scrape_fuel_prices shape ===
-    avg_formatted = data.get("avg_petrol")
-    avg_raw = data.get("avg_raw")
-    change_absolute = data.get("change_absolute", "N/A")
-    change_percent = data.get("change_percent", "N/A")
-    last_updated_text = data.get("last_updated", "Live data")
-    sources = data.get("sources", [])
+    LOG.info("Price change detected — proceeding to post update")
 
-    # Fallback formatting if avg is numeric only
-    if isinstance(avg_formatted, (int, float)):
-        avg_formatted = _format_naira(float(avg_formatted))
-
-    if not avg_formatted or str(avg_formatted).strip().upper() in {"", "N/A", "NONE"}:
-        LOG.warning("No valid average price — skipping post")
-        if not TEST_MODE:
-            return
-
-    # === Build change text & emoji ===
-    change_parts = []
-    if change_absolute and change_absolute != "N/A":
-        change_parts.append(change_absolute)
-    if change_percent and change_percent != "N/A":
-        change_parts.append(f"({change_percent} from last period)")
-
-    change_text = " ".join(change_parts) if change_parts else "No change data"
-
-    # Dynamic emoji
-    change_emoji = "📊"
-    if change_absolute and change_absolute != "N/A":
-        if change_absolute.strip().startswith("+"):
-            change_emoji = "📈"
-        elif change_absolute.strip().startswith("-"):
-            change_emoji = "📉"
-
-    # === Sources processing ===
-    reported = 0
-    total_sources = max(1, len(sources))
-    sources_lines = []
-
-    for s in sources:
-        if not isinstance(s, dict):
-            if isinstance(s, str):
-                sources_lines.append(f"• {s}")
-            continue
-
-        url = s.get("source", "")  # URL string
-        if not url:
-            continue
-
-        # Friendly name
-        if "app.fuelpricewatch.com" in url:
-            src_name = "FuelPriceWatch Live App"
-        else:
-            src_name = "FuelPriceWatch"
-
-        price_str = s.get("price_str")
-        err = s.get("error")
-
-        # Normalize price display
-        if isinstance(price_str, (int, float)):
-            price_str = _format_naira(float(price_str))
-
-        # Per-source changes
-        src_change_parts = []
-        if s.get("change_percent") and s.get("change_percent") != "N/A":
-            src_change_parts.append(s["change_percent"])
-        if s.get("change_absolute") and s.get("change_absolute") != "N/A":
-            src_change_parts.append(s["change_absolute"])
-        src_change = f" {' '.join(src_change_parts)}" if src_change_parts else ""
-
-        if price_str and not err:
-            reported += 1
-            sources_lines.append(
-                f"• <a href=\"{_safe_url(url)}\">{src_name}</a> — {price_str}{src_change}"
-            )
-        else:
-            err_label = err or "no data"
-            sources_lines.append(
-                f"• <a href=\"{_safe_url(url)}\">{src_name}</a> — {err_label}"
-            )
-
-    confidence = f"{reported}/{total_sources}"
-
-    # Fallback if no structured sources
-    if not sources_lines:
-        fallback_url = "https://app.fuelpricewatch.com/"
-        sources_lines = [
-            f"• <a href=\"{_safe_url(fallback_url)}\">FuelPriceWatch</a> — {avg_formatted}"
-        ]
-        confidence = "1/1"
-
-    # === Build final message ===
+    # === Build message (only include sections with data) ===
     message_lines = [
-        "🌅 <b>Fuel Price Report — Nigeria</b>",
+        "🌅 <b>Daily Fuel Price Report — Nigeria</b>",
         f"📅 {now.strftime('%B %d, %Y')} — <i>Morning update</i>",
         "━━━━━━━━━━━━━━━━━━",
-        f"⛽ <b>National Avg (PMS):</b> {avg_formatted}",
-        f"{change_emoji} <b>Change today:</b> {change_text}",
-        f"🕒 <b>Last updated:</b> {last_updated_text}",
-        f"🔎 <b>Confidence:</b> {confidence} sources reported",
-        "",
-        "🏷️ <b>Sources</b>",
     ]
-    message_lines.extend(sources_lines)
+
+    # Petrol section
+    if petrol_avg_formatted:
+        # Change text & emoji (reuse your existing logic)
+        change_parts = []
+        change_absolute = petrol_data.get("change_absolute", "N/A")
+        change_percent = petrol_data.get("change_percent", "N/A")
+        if change_absolute and change_absolute != "N/A":
+            change_parts.append(change_absolute)
+        if change_percent and change_percent != "N/A":
+            change_parts.append(f"({change_percent} from last period)")
+        change_text = " ".join(change_parts) if change_parts else "No change data"
+
+        change_emoji = "📊"
+        if change_absolute != "N/A" and change_absolute.strip().startswith("+"):
+            change_emoji = "📈"
+        elif change_absolute != "N/A" and change_absolute.strip().startswith("-"):
+            change_emoji = "📉"
+
+        last_updated_petrol = petrol_data.get("last_updated", "Live data")
+
+        # Sources (reuse your existing processing)
+        sources = petrol_data.get("sources", [])
+        reported = 0
+        total_sources = max(1, len(sources))
+        sources_lines = []
+
+        for s in sources:
+            if not isinstance(s, dict):
+                if isinstance(s, str):
+                    sources_lines.append(f"• {s}")
+                continue
+            url = s.get("source", "")
+            if not url:
+                continue
+            src_name = "FuelPriceWatch Live App" if "app.fuelpricewatch.com" in url else "FuelPriceWatch"
+            price_str = s.get("price_str")
+            if isinstance(price_str, (int, float)):
+                price_str = _format_naira(float(price_str))
+            err = s.get("error")
+            src_change = ""
+            if s.get("change_percent") and s.get("change_percent") != "N/A":
+                src_change += f" {s['change_percent']}"
+            if s.get("change_absolute") and s.get("change_absolute") != "N/A":
+                src_change += f" {s['change_absolute']}"
+            if price_str and not err:
+                reported += 1
+                sources_lines.append(f"• <a href=\"{_safe_url(url)}\">{src_name}</a> — {price_str}{src_change}")
+            else:
+                err_label = err or "no data"
+                sources_lines.append(f"• <a href=\"{_safe_url(url)}\">{src_name}</a> — {err_label}")
+
+        confidence = f"{reported}/{total_sources}"
+        if not sources_lines:
+            sources_lines = [f"• <a href=\"https://app.fuelpricewatch.com/\">FuelPriceWatch</a> — {petrol_avg_formatted}"]
+            confidence = "1/1"
+
+        message_lines.extend([
+            "⛽ <b>Petrol (PMS) — National Average</b>",
+            f"   <b>Price:</b> {petrol_avg_formatted}",
+            f"   {change_emoji} <b>Change today:</b> {change_text}",
+            f"   🕒 <b>Last updated:</b> {last_updated_petrol}",
+            f"   🔎 <b>Confidence:</b> {confidence}",
+            "",
+            "   🏷️ <b>Sources</b>",
+        ])
+        message_lines.extend([f"   {line}" for line in sources_lines])
+        message_lines.extend([
+            "",
+            "<blockquote>",
+            "Disclaimer: This is the <b>national average</b> PMS price reported by official sources. "
+            "Actual pump prices may vary significantly by state, city, and station.",
+            "</blockquote>",
+            "",
+        ])
+
+    # LPG section
+    if lpg_retail_range:
+        lpg_depot_avg = lpg_data.get("avg_depot_20mt", "N/A")
+        lpg_depot_per_kg = lpg_data.get("avg_depot_per_kg", "N/A")
+        lpg_last_updated = lpg_data.get("last_updated", "Today")
+        lpg_note = lpg_data.get("note", "Lagos retail estimate = average depot price per kg + ₦400–600/kg typical markup")
+
+        message_lines.extend([
+            "🔥 <b>LPG (Cooking Gas) — Lagos Retail Estimate</b>",
+            f"   📊 <b>Depot average (20MT):</b> {lpg_depot_avg}",
+            f"      <b>Per kg at depot:</b> {lpg_depot_per_kg}",
+            f"   🏙️ <b>Estimated retail:</b> {lpg_retail_range} per kg",
+            f"   🕒 <b>Data from:</b> {lpg_last_updated} — <a href=\"https://lpginnigeria.com/chart\">lpginnigeria.com/chart</a>",
+            "",
+            "<blockquote>",
+            "Disclaimer: This is an <b>estimated Lagos retail price</b> based on current depot averages + typical ₦400–600/kg markup "
+            "(transport, bottling, dealer margin, etc.). Actual prices vary by station and location.",
+            "</blockquote>",
+            "",
+            f"<i>{lpg_note}</i>",
+            "",
+        ])
+
+    if not message_lines[-1]:  # remove trailing empty lines
+        message_lines = [line for line in message_lines if line.strip()]
+
     message_lines.extend([
-        "",
         "━━━━━━━━━━━━━━━━━━",
-        "<blockquote>"
-        "Disclaimer: This is the <b>national average</b> PMS price reported by official sources. "
-        "Actual pump prices may vary significantly by state, city, and station."
-        "</blockquote>",
-        "",
-        "<i>Tip: tap a source name to view the live bulletin.</i> 🔗",
+        "<i>Tip: tap source links for live bulletins.</i> 🔗",
     ])
 
     message = "\n".join(message_lines)
 
-    # Send to channel(s)
+    # Send
     try:
         sent_results = await safe_send(
             context.bot,
@@ -804,31 +842,35 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
             disable_web_page_preview=True,
         )
     except Exception:
-        LOG.exception("Failed to safe_send fuel update")
+        LOG.exception("Failed to send update")
         sent_results = []
 
-    # Persist snapshot on success
     any_success = any(res[1] for res in sent_results if isinstance(res, (list, tuple)) and len(res) > 1)
 
     if any_success and not TEST_MODE:
         try:
+            snapshot_data = {
+                "last_posted_at": now.isoformat(),
+                "sources_confidence": confidence if petrol_avg_formatted else "N/A",
+            }
+            if petrol_avg_raw is not None:
+                snapshot_data["last_posted_petrol"] = petrol_avg_raw
+            if lpg_depot_per_kg_raw is not None:
+                snapshot_data["last_posted_lpg_per_kg"] = lpg_depot_per_kg_raw
+
             await save_channel_snapshot(
                 FUEL_TRACKING_KEY,
-                {
-                    "last_posted_at": now.isoformat(),
-                    "last_posted_price": avg_formatted,
-                    "sources_confidence": confidence,
-                },
-                expires_hours=48,
+                snapshot_data,
+                expires_hours=72,  # longer retention
             )
-            LOG.info("Fuel update posted and snapshot saved.")
+            LOG.info("Update posted and snapshot saved (petrol: %.2f, lpg: %.2f)", petrol_avg_raw or 0, lpg_depot_per_kg_raw or 0)
         except Exception:
-            LOG.exception("Failed to save fuel snapshot")
+            LOG.exception("Failed to save snapshot")
     else:
         if TEST_MODE:
             LOG.debug("TEST_MODE: skipping snapshot save")
         else:
-            LOG.warning("No successful sends; snapshot not saved.")
+            LOG.warning("No successful sends; snapshot not updated.")
 
 async def check_trials(context: ContextTypes.DEFAULT_TYPE):
     """Validate trials and downgrade users whose trial expired."""
