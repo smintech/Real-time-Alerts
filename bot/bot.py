@@ -823,8 +823,8 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
             "🔥 <b>LPG (Cooking Gas) — Lagos Retail Estimate</b>",
             f"   📊 <b>Depot average (20MT):</b> {lpg_depot_avg}",
             f"      <b>Per kg at depot:</b> {lpg_depot_per_kg}",
-            f"   🏙️ <b>Estimated retail:</b> {lpg_retail_range} per kg",
-            f"   🕒 <b>Data from:</b> {lpg_last_updated} — <a href=\"https://lpginnigeria.com/chart\">lpginnigeria.com/chart</a>",
+            f"   🏙️ <b>Estimated retail:</b> {lpg_retail_range}",
+            f"   🕒 <b>Data from:</b> {lpg_last_updated} — <a href=\"https://lpginnigeria.com/chart\">LPG NIGERIA CHART 📊</a>",
             "",
             "<blockquote>",
             "Disclaimer: This is an <b>estimated Lagos retail price</b> based on current depot averages + typical ₦400–600/kg markup "
