@@ -9,6 +9,7 @@ from telegram.ext import Application, ContextTypes
 import os
 import redis
 import sys
+import hashlib
 import redis.asyncio as redis_async
 from Utils.config import TELEGRAM_TOKEN, DB_URL
 from bot.commands import get_application_handlers, user_watches, user_settings, user_subscriptions
@@ -39,6 +40,8 @@ from Utils.utils import (
     scrape_fuel_prices,
     _format_naira,
     scrape_lpg_prices,
+    _fetch_html,
+    _extract_snippets_from_html,
 )
 from bot.persistence import (
     load_last_snapshot,
@@ -57,6 +60,8 @@ LOG = logging.getLogger(__name__)
 application: Application | None = None  # global if needed elsewhere
 nest_asyncio.apply()
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() in ("1", "true", "yes")
+SCHOOL_FORCE_POST = os.getenv("SCHOOL_UPDATES_FORCE", "false").lower() in ("1", "true", "yes") 
+SCHOOL_UPDATES_KEY = "nigeria_school_updates_report"
 
 async def safe_send(bot, chat_id: int | list[int], text: str, **kwargs):
     """
@@ -81,6 +86,9 @@ async def safe_send(bot, chat_id: int | list[int], text: str, **kwargs):
             results.append((target, False, str(exc)))
     return results
 
+def _hash_report_content(report_text: str) -> str:
+    """Simple SHA256 hash of the report content for change detection."""
+    return hashlib.sha256(report_text.encode("utf-8")).hexdigest()
 
 async def handle_watch_failure(context: ContextTypes.DEFAULT_TYPE, user_id: int, watch: dict, exc=None, reason=None):
     """Centralized failure handling with backoff + pause."""
@@ -950,6 +958,108 @@ def get_nigeria_school_updates_report(sources: Optional[List[Dict[str,str]]] = N
 
     return "\n".join(report_lines)
 
+
+async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Job: Generate school updates report and post only if content changed since last post.
+    Uses channel_snapshot persistence (reuses existing functions).
+    In TEST_MODE or SCHOOL_FORCE_POST: always generate and post (useful for debugging).
+    """
+    global TEST_MODE
+    force_mode = TEST_MODE or SCHOOL_FORCE_POST
+
+    if not AUTO_POST_TO_CHANNEL or not CHANNEL_DEAL_CHAT_ID:
+        LOG.info("Channel posting disabled — skipping school updates")
+        return
+
+    now = datetime.now(TIMEZONE)
+
+    # Load last snapshot
+    snapshot = None
+    try:
+        snapshot = await load_channel_snapshot(SCHOOL_UPDATES_KEY)
+    except Exception:
+        LOG.exception("Failed to load school updates snapshot")
+
+    previous_hash = snapshot.get("content_hash") if snapshot else None
+    last_posted_at = snapshot.get("last_posted_at") if snapshot else None
+
+    # Optional recency guard (avoid posting too frequently even if content changed rapidly)
+    if not force_mode and last_posted_at:
+        try:
+            last_dt = datetime.fromisoformat(last_posted_at)
+            hours_since = (now - last_dt).total_seconds() / 3600
+            if hours_since < 4:  # Minimum 4 hours between posts
+                LOG.info("School updates posted recently (%s hours ago) — skipping", round(hours_since, 1))
+                return
+        except Exception:
+            LOG.warning("Could not parse last_posted_at for school updates")
+
+    # Generate fresh report
+    try:
+        new_report = get_nigeria_school_updates_report()
+    except Exception as e:
+        LOG.exception("Failed to generate school updates report: %s", e)
+        return
+
+    if not new_report.strip():
+        LOG.warning("Generated empty school report — skipping post")
+        return
+
+    # Compute hash for change detection
+    new_hash = _hash_report_content(new_report)
+
+    # Decide whether to post
+    content_changed = (previous_hash is None or new_hash != previous_hash)
+    should_post = force_mode or content_changed
+
+    if not should_post:
+        LOG.info("No change in school updates content (hash match) — skipping post")
+        return
+
+    LOG.info("School updates changed or force mode — posting new report")
+
+    # Build message (add emoji header)
+    message = (
+        "📢 <b>Latest Nigeria School Updates</b>\n"
+        "━━━━━━━━━━━━━━━━━━\n\n" +
+        new_report +
+        "\n\n🔔 Powered by live official sources"
+    )
+
+    # Send to channel
+    try:
+        results = await safe_send(
+            context.bot,
+            CHANNEL_DEAL_CHAT_ID,
+            text=message,
+            parse_mode="HTML",
+            disable_web_page_preview=True,
+        )
+    except Exception:
+        LOG.exception("Failed to send school updates")
+        results = []
+
+    any_success = any(r[1] for r in results if isinstance(r, (list, tuple)) and len(r) > 1)
+
+    if any_success:
+        try:
+            await save_channel_snapshot(
+                SCHOOL_UPDATES_KEY,
+                {
+                    "last_posted_at": now.isoformat(),
+                    "content_hash": new_hash,
+                    "last_report_preview": new_report[:500],  # Optional short preview
+                },
+                expires_hours=168,  # 7 days
+            )
+            LOG.info("School updates posted and snapshot saved (new hash: %s)", new_hash[:12])
+        except Exception:
+            LOG.exception("Failed to save school updates snapshot")
+    else:
+        LOG.warning("School updates send failed — snapshot not updated")
+
+
 async def check_trials(context: ContextTypes.DEFAULT_TYPE):
     """Validate trials and downgrade users whose trial expired."""
     bot = context.bot
@@ -1110,7 +1220,13 @@ async def run_bot():
                 first=3600,
                 name="trial_checker"
             )
-
+            application.job_queue.run_repeating(
+                callback=check_and_post_school_updates,
+                #time=dt_time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
+                interval=120,  # Convert hours to seconds
+                first=10,  # Start 1 minute after bot launch
+                name="school_updates_poster"
+            )
         # Clean webhook if exists
         try:
             await application.bot.delete_webhook(drop_pending_updates=True)
