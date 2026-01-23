@@ -23,6 +23,9 @@ from bot.settings import (
     HIGH_DEAL_THRESHOLD,
     MEDIUM_DEAL_THRESHOLD,
     LOW_DEAL_THRESHOLD,
+    _DATE_PATTERNS,
+    _SCHOOL_KEYWORDS_RE,
+    _DATE_RE,
 )
 
 LOG = logging.getLogger(__name__)
@@ -1180,3 +1183,135 @@ def scrape_lpg_prices() -> Dict[str, Any]:
         "valid_depots_count": len(valid_prices),
         "note": "Lagos retail estimate calculated as: average depot price per kg + ₦400–600/kg typical markup (for transport, bottling, dealer margin, etc.)",
     }
+
+def _extract_snippets_from_html(html: str, base_url: str) -> List[Dict[str, Any]]:
+    """
+    Enhanced BeautifulSoup-based extractor optimized for Nigerian education sites.
+    Prioritizes:
+      - News/Announcement sections
+      - Headings containing keywords
+      - Links to circulars/notices
+      - Dated paragraphs/context
+    """
+    if not html:
+        return []
+
+    soup = BeautifulSoup(html, "lxml")
+    items: List[Dict[str, Any]] = []
+    seen = set()
+
+    # 1. Target common news/announcement containers first (site-specific heuristics)
+    news_selectors = [
+        "section#news", "div.news", ".latest-news", ".announcement", 
+        "div#latest-news", ".news-item", ".post", ".card", 
+        "ul.news-list", "div.row.news", "div.col-md-8", "main", "article"
+    ]
+    news_container = None
+    for sel in news_selectors:
+        candidates = soup.select(sel)
+        if candidates:
+            news_container = candidates[0]  # Take first match
+            break
+
+    target_soup = news_container or soup  # Fallback to full page
+
+    # 2. Extract dated headings (h1-h4) with keywords
+    for heading in target_soup.find_all(["h1", "h2", "h3", "h4"]):
+        text = heading.get_text(" ", strip=True)
+        if not text or len(text) < 10:
+            continue
+        if not _SCHOOL_KEYWORDS_RE.search(text):
+            continue
+
+        key = text[:150]
+        if key in seen:
+            continue
+        seen.add(key)
+
+        # Extract nearby date
+        date = None
+        context = heading.find_next_sibling(["p", "div"])
+        if context:
+            date_match = _DATE_RE.search(context.get_text())
+            if date_match:
+                date = date_match.group(0)
+
+        # Extract link if heading is wrapped in <a>
+        link = None
+        if heading.parent.name == "a" and heading.parent.get("href"):
+            link = urljoin(base_url, heading.parent["href"])
+
+        items.append({
+            "title": text,
+            "snippet": context.get_text(" ", strip=True)[:300] if context else "",
+            "date": date,
+            "link": link,
+            "origin": "heading"
+        })
+
+    # 3. Extract prominent links (circulars, PDFs, notices)
+    for a in target_soup.find_all("a", href=True):
+        link_text = a.get_text(" ", strip=True)
+        href = a.get("href", "").lower()
+
+        if len(link_text) < 8:
+            continue
+
+        # High-priority if link text or href contains keywords or file extensions
+        if (_SCHOOL_KEYWORDS_RE.search(link_text) or 
+            _SCHOOL_KEYWORDS_RE.search(href) or 
+            href.endswith((".pdf", ".doc", ".docx"))):
+            
+            full_link = urljoin(base_url, a["href"])
+            key = f"{link_text[:100]}{full_link[:100]}"
+            if key in seen:
+                continue
+            seen.add(key)
+
+            # Try to find date near the link
+            date = None
+            sibling = a.find_parent(["p", "div", "li"])
+            if sibling:
+                date_match = _DATE_RE.search(sibling.get_text())
+                if date_match:
+                    date = date_match.group(0)
+
+            items.append({
+                "title": link_text,
+                "link": full_link,
+                "snippet": "",
+                "date": date,
+                "origin": "link"
+            })
+
+    # 4. Fallback: Scan paragraphs for keyword + date combinations
+    for p in target_soup.find_all("p"):
+        text = p.get_text(" ", strip=True)
+        if len(text) < 30 or not _SCHOOL_KEYWORDS_RE.search(text):
+            continue
+
+        date_match = _DATE_RE.search(text)
+        date = date_match.group(0) if date_match else None
+
+        key = text[:150]
+        if key in seen:
+            continue
+        seen.add(key)
+
+        items.append({
+            "title": text[:200],
+            "snippet": text[:400],
+            "date": date,
+            "origin": "paragraph"
+        })
+
+    # Dedupe and limit
+    unique_items = []
+    seen_keys = set()
+    for item in items:
+        key = item.get("title", "")[:100] + (item.get("link") or "")[:100]
+        if key not in seen_keys:
+            seen_keys.add(key)
+            unique_items.append(item)
+
+    return unique_items[:10]  # Limit per source
