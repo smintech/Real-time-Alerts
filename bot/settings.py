@@ -1,5 +1,6 @@
 import pytz
 import os
+import re
 # Nigeria timezone (West Africa Time - no DST)
 TIMEZONE = pytz.timezone('Africa/Lagos')  # Standard and preferred name
 
@@ -107,3 +108,26 @@ PAID_TIERS = {
     }
 }
 DEFAULT_FREE_LIMIT = MAX_WATCHES_FREE
+
+DEFAULT_SCHOOL_SOURCES = [
+    {"name": "Federal Ministry of Education", "url": "https://education.gov.ng/"},
+    {"name": "Lagos State (OEQA)", "url": "https://oeqalagos.com/"},
+    {"name": "FCT UBEB", "url": "https://fcteducationboard.gov.ng/"},
+    {"name": "JAMB", "url": "https://www.jamb.gov.ng/"},
+    {"name": "WAEC Nigeria", "url": "https://www.waecnigeria.org/"},
+    {"name": "NECO", "url": "https://www.neco.gov.ng/"},
+]
+
+_SCHOOL_KEYWORDS_RE = re.compile(
+    r"\b(resum(?:ption|ed|e)|reschedule|academic\s+calendar|holiday|exam(?:ination)?|postpon|cancel|strike|suspend|closure|announcement|notice|circular|scholarship|admission|registration|result|mock)\b",
+    flags=re.I
+)
+
+_DATE_PATTERNS = [
+    r"\b\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s*,?\s*\d{4}\b",
+    r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?,?\s*\d{4}\b",
+    r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
+    r"\b\d{4}-\d{2}-\d{2}\b",
+]
+
+_DATE_RE = re.compile("|".join(_DATE_PATTERNS), flags=re.I)
