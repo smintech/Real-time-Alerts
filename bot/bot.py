@@ -27,6 +27,7 @@ from bot.settings import (
     CATEGORIES,
     MAX_WATCHES_FREE,
     PAID_TIERS,
+    DEFAULT_SCHOOL_SOURCES,
 )
 
 from Utils.utils import (
@@ -888,6 +889,66 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
             LOG.debug("TEST_MODE: skipping snapshot save")
         else:
             LOG.warning("No successful sends; snapshot not updated.")
+
+def get_nigeria_school_updates_report(sources: Optional[List[Dict[str,str]]] = None) -> str:
+    """
+    Updated version: Pure BeautifulSoup parsing (no Playwright dependency).
+    More accurate for Nigerian education sites with news sections.
+    """
+    srcs = sources or DEFAULT_SCHOOL_SOURCES
+    now = _dt.now().strftime('%b %d, %Y — %H:%M')
+    
+    report_lines = [
+        "📚 <b>Nigeria School Updates Report</b>",
+        f"<i>Generated: {now} (WAT)</i>",
+        "━━━━━━━━━━━━━━━━━━",
+        "",
+    ]
+
+    total_found = 0
+
+    for src in srcs:
+        name = src.get("name", "Unknown Source")
+        url = src.get("url", "")
+        if not url:
+            continue
+
+        try:
+            html = _fetch_html(url)
+        except Exception as e:
+            LOG.warning(f"Failed to fetch {name}: {e}")
+            report_lines.append(f"<b>{name}</b> — <a href=\"{url}\">{url}</a>")
+            report_lines.append("• Failed to load page")
+            report_lines.append("")
+            continue
+
+        items = _extract_snippets_from_html(html, url)
+
+        report_lines.append(f"<b>{name}</b> — <a href=\"{url}\">{url}</a>")
+        
+        if not items:
+            report_lines.append("• No recent updates detected")
+        else:
+            for item in items:
+                line = "• "
+                if item.get("title"):
+                    line += f"<b>{item['title']}</b>"
+                if item.get("date"):
+                    line += f" — <i>{item['date']}</i>"
+                if item.get("link"):
+                    line += f" → <a href=\"{item['link']}\">View Details</a>"
+                if item.get("snippet") and not item.get("title"):
+                    line += f" {item['snippet']}"
+                report_lines.append(line)
+            total_found += len(items)
+
+        report_lines.append("")  # Spacer
+
+    report_lines.append("━━━━━━━━━━━━━━━━━━")
+    report_lines.append(f"<b>Total updates found:</b> {total_found}")
+    report_lines.append("<i>Tip: Always verify on official sites before acting.</i>")
+
+    return "\n".join(report_lines)
 
 async def check_trials(context: ContextTypes.DEFAULT_TYPE):
     """Validate trials and downgrade users whose trial expired."""
