@@ -90,6 +90,10 @@ def _hash_report_content(report_text: str) -> str:
     """Simple SHA256 hash of the report content for change detection."""
     return hashlib.sha256(report_text.encode("utf-8")).hexdigest()
 
+def _slugify(text: str) -> str:
+    """Simple slugify for snapshot keys."""
+    return re.sub(r'[^a-z0-9_]', '', text.lower().replace(' ', '_').replace('-', '_'))
+
 async def handle_watch_failure(context: ContextTypes.DEFAULT_TYPE, user_id: int, watch: dict, exc=None, reason=None):
     """Centralized failure handling with backoff + pause."""
     watch.setdefault("fail_count", 0)
@@ -898,190 +902,205 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
         else:
             LOG.warning("No successful sends; snapshot not updated.")
 
-def get_nigeria_school_updates_report(sources: list[dict] = None) -> str:
+def generate_source_report(
+    name: str,
+    items: List[Dict[str, Any]],
+    gen_time: str,
+    main_url: str,
+) -> str:
     """
-    Generates a formatted HTML report using the improved extractor.
+    Generates a clean HTML message for a single source.
     """
-    srcs = sources or DEFAULT_SCHOOL_SOURCES
-    # Ensure TIMEZONE is defined in your global scope, or import it
-    now = datetime.now(TIMEZONE).strftime('%b %d, %Y — %H:%M')
-    
-    report_lines = [
-        "📚 <b>Nigeria School Updates Report</b>",
-        f"<i>Generated: {now} (WAT)</i>",
+    lines = [
+        f"<b>{name}</b>",
+        f"<i>Generated: {gen_time} (WAT)</i>",
         "━━━━━━━━━━━━━━━━━━",
         "",
     ]
 
-    total_found = 0
+    if not items:
+        lines.append("<i>No recent updates detected</i>")
+    else:
+        for item in items:
+            title_line = f"• <b>{item['title']}</b>"
+            if item.get("date"):
+                title_line += f" — <i>{item['date']}</i>"
+            lines.append(title_line)
 
-    for src in srcs:
-        name = src.get("name", "Unknown Source")
-        url = src.get("url", "")
-        if not url:
-            continue
-
-        try:
-            # Assuming _fetch_html is your existing function
-            html = _fetch_html(url)
-        except Exception as e:
-            # LOG.warning(f"Failed to fetch {name}: {e}")
-            report_lines.append(f"<b>{name}</b>")
-            report_lines.append(f"└─ <i>Failed to load page</i>")
-            report_lines.append("")
-            continue
-
-        items = _extract_snippets_from_html(html, url)
-
-        report_lines.append(f"<b>{name}</b>")
-        
-        if not items:
-            report_lines.append("└─ <i>No recent updates detected</i>")
-        else:
-            for item in items:
-                # 1. Title Line
-                title_line = f"• <b>{item['title']}</b>"
-                if item.get("date"):
-                    title_line += f" — <i>{item['date']}</i>"
-                report_lines.append(title_line)
-
-                # 2. Detail/Snippet Line
-                # We combine the snippet and the link
-                snippet_text = item.get("snippet", "").strip()
+            snippet_text = item.get("snippet", "").strip()
+            if item.get("pdf"):
+                size_str = f" ({item.get('pdf_size_kb')} KB)" if item.get("pdf_size_kb") else ""
+                link_text = f"<a href=\"{item.get('pdf_url') or item['link']}\">Download PDF{size_str}</a>"
+                if not snippet_text:
+                    snippet_text = "PDF Document"
+            else:
                 link_text = f"<a href=\"{item['link']}\">View Details</a>"
-                
-                if snippet_text:
-                    # Clean up snippet if it accidentally contains the "Read more" text
-                    snippet_text = snippet_text.replace("Read More", "").replace("View Details", "")
-                    report_lines.append(f"  └─ {snippet_text} → {link_text}")
-                else:
-                    report_lines.append(f"  └─ {link_text}")
-            
-            total_found += len(items)
 
-        report_lines.append("")  # Spacer between sources
+            snippet_text = snippet_text.replace("Read More", "").replace("View Details", "").strip()
 
-    report_lines.append("━━━━━━━━━━━━━━━━━━")
-    report_lines.append(f"<b>Total updates found:</b> {total_found}")
-    report_lines.append("<i>Tip: Always verify on official sites before acting.</i>")
+            if snippet_text:
+                lines.append(f"  └─ {snippet_text} → {link_text}")
+            else:
+                lines.append(f"  └─ {link_text}")
 
-    return "\n".join(report_lines)
+        lines.append("")
+        lines.append(f"<b>Updates found: {len(items)}</b>")
+
+    lines.append("")
+    lines.append(f"🔗 <a href=\"{main_url}\">Visit {name} website</a>")
+    lines.append("")
+    lines.append("<i>Always verify on the official website before acting.</i>")
+
+    return "\n".join(lines)
 
 async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     """
-    Job: Generate school updates report and post only if content changed since last post.
-    Updated behavior:
-      - When TEST_MODE or SCHOOL_FORCE_POST is True => bypass all gating and send on every job run.
-      - If force_mode is False => original gating (AUTO_POST_TO_CHANNEL, recency, hash) still applies.
+    Job: Scrapes school sources (grouped), extracts updates per source,
+    and posts separate messages for sources with new/changed content.
+    Respects MAX_CHANNEL_POSTS_PER_RUN and sends one message per source.
     """
     global TEST_MODE
     force_mode = bool(TEST_MODE or SCHOOL_FORCE_POST)
 
-    # If force_mode active we will bypass the channel-posting guard and other gates.
-    if force_mode:
-        LOG.info(
-            "Force mode active (TEST_MODE=%s, SCHOOL_FORCE_POST=%s) — bypassing gating and posting on every run",
-            TEST_MODE,
-            SCHOOL_FORCE_POST,
-        )
-    else:
-        # preserve original guard when not forced
-        if not AUTO_POST_TO_CHANNEL or not CHANNEL_DEAL_CHAT_ID:
-            LOG.info("Channel posting disabled — skipping school updates")
-            return
+    LOG.info("--- SCHOOL UPDATES JOB STARTED ---")
 
+    if not AUTO_POST_TO_CHANNEL or not CHANNEL_DEAL_CHAT_ID:
+        LOG.info("Channel posting disabled — skipping school updates")
+        return
+
+    max_posts = MAX_CHANNEL_POSTS_PER_RUN or 5
+    send_delay = 15
+    eligible_candidates = []
     now = datetime.now(TIMEZONE)
+    now_iso = now.isoformat()
+    gen_time_str = now.strftime('%b %d, %Y — %H:%M')
 
-    # Load last snapshot
-    snapshot = None
-    try:
-        snapshot = await load_channel_snapshot(SCHOOL_UPDATES_KEY)
-    except Exception:
-        LOG.exception("Failed to load school updates snapshot")
+    # --- PHASE 1: SCRAPE & EXTRACT PER GROUP ---
+    for group_key, urls in DEFAULT_SCHOOL_SOURCES.items():
+        if not urls:
+            continue
 
-    previous_hash = snapshot.get("content_hash") if snapshot else None
-    last_posted_at = snapshot.get("last_posted_at") if snapshot else None
+        items: List[Dict[str, Any]] = []
+        seen = set()  # dedupe across all URLs in the group
 
-    # Optional recency guard (avoid posting too frequently even if content changed rapidly)
-    # Skip recency guard entirely when force_mode True.
-    if not force_mode and last_posted_at:
+        for url in urls:
+            try:
+                html = await asyncio.get_event_loop().run_in_executor(None, _fetch_html, url)
+                if not html:
+                    continue
+                soup = BeautifulSoup(html, "lxml")
+                source_items = extract_anchors_from_soup(soup, url, seen=seen)
+                items.extend(source_items)
+            except Exception as e:
+                LOG.warning("Scrape/extract failed for %s (%s): %s", url, group_key, e)
+
+        if not items:
+            LOG.info("No items extracted for group '%s'", group_key)
+            continue
+
+        # Limit per source + sort (dates first, then longer snippets)
+        items = items[:20]
+        items.sort(key=lambda x: (x.get('date') is None, -len(x.get('snippet') or "")))
+
+        # Generate report text for this source
+        main_url = urls[0]  # primary URL for footer link
+        report_text = generate_source_report(group_key, items, gen_time_str, main_url)
+
+        # Hash for change detection
+        current_hash = _hash_report_content(report_text)
+
+        # Per-source snapshot key
+        snapshot_key = f"school_updates_{_slugify(group_key)}"
+        snapshot = None
         try:
-            last_dt = datetime.fromisoformat(last_posted_at)
-            hours_since = (now - last_dt).total_seconds() / 3600
-            if hours_since < 4:  # Minimum 4 hours between posts
-                LOG.info("School updates posted recently (%s hours ago) — skipping", round(hours_since, 1))
-                return
+            snapshot = await load_channel_snapshot(snapshot_key)
         except Exception:
-            LOG.warning("Could not parse last_posted_at for school updates")
+            LOG.exception("Failed loading snapshot for %s", snapshot_key)
 
-    # Generate fresh report
-    try:
-        new_report = get_nigeria_school_updates_report()
-    except Exception as e:
-        LOG.exception("Failed to generate school updates report: %s", e)
-        return
+        previous_hash = snapshot.get("content_hash") if snapshot else None
+        last_posted_at_str = snapshot.get("last_posted_at") if snapshot else None
 
-    if not new_report.strip():
-        LOG.warning("Generated empty school report — skipping post")
-        return
+        is_new = previous_hash is None
+        content_changed = current_hash != previous_hash
 
-    # Compute hash for change detection
-    new_hash = _hash_report_content(new_report)
+        # Recency check (per source)
+        recency_ok = True
+        if not force_mode and last_posted_at_str:
+            try:
+                last_dt = datetime.fromisoformat(last_posted_at_str)
+                hours_since = (now - last_dt).total_seconds() / 3600
+                if hours_since < 4:  # minimum 4 hours between posts for same source
+                    recency_ok = False
+                    LOG.info("Skipping %s — posted %.1f hours ago", group_key, hours_since)
+            except Exception:
+                pass
 
-    # Decide whether to post
-    # When force_mode is True we always set should_post=True (send every run).
-    content_changed = (previous_hash is None or new_hash != previous_hash)
-    should_post = force_mode or content_changed
+        # Eligibility
+        should_post = force_mode or (len(items) > 0 and (is_new or content_changed) and recency_ok)
 
-    if not should_post:
-        LOG.info("No change in school updates content (hash match) — skipping post")
-        return
-
-    LOG.info("School updates changed or force mode — preparing to post new report")
-
-    # Build message (add emoji header)
-    message = (
-        "📢 <b>Latest Nigeria School Updates</b>\n"
-        "━━━━━━━━━━━━━━━━━━\n\n" +
-        new_report +
-        "\n\n🔔 Powered by live official sources"
-    )
-
-    # NOTE: TEST_MODE no longer prevents sending; TEST_MODE only toggles force_mode earlier.
-    # If you prefer TEST_MODE to still be a pure dry-run (no send / no snapshot save),
-    # revert the block below to the previous behavior.
-    try:
-        results = await safe_send(
-            context.bot,
-            CHANNEL_DEAL_CHAT_ID,
-            text=message,
-            parse_mode="HTML",
-            disable_web_page_preview=True,
-        )
-    except Exception:
-        LOG.exception("Failed to send school updates")
-        results = []
-
-    any_success = any(r[1] for r in results if isinstance(r, (list, tuple)) and len(r) > 1)
-
-    if any_success:
-        try:
-            # Save snapshot after successful send (keeps history and prevents duplicate posts
-            # when not forced). We save even in TEST_MODE under the current implementation.
-            await save_channel_snapshot(
-                SCHOOL_UPDATES_KEY,
-                {
-                    "last_posted_at": now.isoformat(),
-                    "content_hash": new_hash,
-                    "last_report_preview": new_report[:500],  # Optional short preview
+        if should_post:
+            eligible_candidates.append({
+                "group_key": group_key,
+                "report_text": report_text,
+                "stats": {
+                    "item_count": len(items),
+                    "is_new": is_new,
+                    "content_changed": content_changed,
                 },
-                expires_hours=168,  # 7 days
-            )
-            LOG.info("School updates posted and snapshot saved (new hash: %s)", new_hash[:12])
-        except Exception:
-            LOG.exception("Failed to save school updates snapshot")
-    else:
-        LOG.warning("School updates send failed — snapshot not updated")
+                "snapshot_key": snapshot_key,
+                "current_hash": current_hash,
+            })
+
+    # --- PHASE 2: PRIORITIZE & POST ---
+    if not eligible_candidates:
+        LOG.info("No eligible school sources to post.")
+        return
+
+    # Prioritize: most updates first
+    eligible_candidates.sort(key=lambda x: -x["stats"]["item_count"])
+
+    to_post = eligible_candidates[:max_posts]
+
+    posted_count = 0
+    targets = CHANNEL_DEAL_CHAT_ID if isinstance(CHANNEL_DEAL_CHAT_ID, list) else [CHANNEL_DEAL_CHAT_ID]
+
+    for item in to_post:
+        emoji = "🆕" if item["stats"]["is_new"] else "🔄"
+        message = f"{emoji} <b>School Updates</b>\n━━━━━━━━━━━━━━━━━━\n\n{item['report_text']}"
+
+        sent_successfully = False
+        for chat_id in targets:
+            try:
+                await context.bot.send_message(
+                    chat_id=chat_id,
+                    text=message,
+                    parse_mode="HTML",
+                    disable_web_page_preview=True,
+                )
+                sent_successfully = True
+                LOG.info("Posted updates for '%s' to %s", item["group_key"], chat_id)
+            except Exception as e:
+                LOG.error("Failed posting '%s' to %s: %s", item["group_key"], chat_id, e)
+
+        if sent_successfully:
+            try:
+                await save_channel_snapshot(
+                    item["snapshot_key"],
+                    {
+                        "last_posted_at": now_iso,
+                        "content_hash": item["current_hash"],
+                        "item_count": item["stats"]["item_count"],
+                    },
+                    expires_hours=168,
+                )
+            except Exception:
+                LOG.exception("Failed saving snapshot for %s", item["snapshot_key"])
+
+            posted_count += 1
+            if posted_count < len(to_post):
+                await asyncio.sleep(send_delay)
+
+    LOG.info("--- SCHOOL JOB FINISHED: %d sources posted ---", posted_count)
 
 async def check_trials(context: ContextTypes.DEFAULT_TYPE):
     """Validate trials and downgrade users whose trial expired."""
