@@ -903,7 +903,7 @@ def get_nigeria_school_updates_report(sources: Optional[List[Dict[str,str]]] = N
     More accurate for Nigerian education sites with news sections.
     """
     srcs = sources or DEFAULT_SCHOOL_SOURCES
-    now = _dt.now().strftime('%b %d, %Y — %H:%M')
+    now = datetime.now(TIMEZONE).strftime('%b %d, %Y — %H:%M')
     
     report_lines = [
         "📚 <b>Nigeria School Updates Report</b>",
