@@ -1239,7 +1239,7 @@ for a in target_soup.find_all("a", href=True):
         item = {
             "title": link_text,
             "snippet": "",
-            "date": None, js,
+            "date": None,
             "link": full_link,
             "origin": "link",
             "detail_available": False,
