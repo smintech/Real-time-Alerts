@@ -7,6 +7,7 @@ from typing import Dict, Optional, Any, Tuple, Callable, List
 import nest_asyncio
 from telegram.ext import Application, ContextTypes
 import os
+from bs4 import BeautifulSoup
 import redis
 import sys
 import hashlib
