@@ -117,11 +117,12 @@ def _db_upsert_channel_snapshot(ref: str, snapshot: dict, expires_hours: int):
         last_posted_at = snapshot.get("last_posted_at")
         last_posted_price = snapshot.get("last_posted_price")
         content_hash = snapshot.get("content_hash")  # ← NEW
-
+        item_count = snapshot.get("item_count")
+        
         cur.execute("""
             INSERT INTO channel_snapshots
-              (ref, site, title, url, current_price, raw, last_seen, expires_at, last_posted_at, last_posted_price, content_hash)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+              (ref, site, title, url, current_price, raw, last_seen, expires_at, last_posted_at, last_posted_price, content_hash, item_count)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
             ON CONFLICT (ref) DO UPDATE SET
               site = EXCLUDED.site,
               title = EXCLUDED.title,
@@ -132,7 +133,8 @@ def _db_upsert_channel_snapshot(ref: str, snapshot: dict, expires_hours: int):
               expires_at = EXCLUDED.expires_at,
               last_posted_at = EXCLUDED.last_posted_at,
               last_posted_price = EXCLUDED.last_posted_price,
-              content_hash = EXCLUDED.content_hash
+              content_hash = EXCLUDED.content_hash,
+               item_count = EXCLUDED.item_count
         """, (
             ref,
             snapshot.get("site"),
@@ -144,7 +146,8 @@ def _db_upsert_channel_snapshot(ref: str, snapshot: dict, expires_hours: int):
             expires_at,
             last_posted_at,
             last_posted_price,
-            content_hash  # ← NEW parameter
+            content_hash,
+            item_count
         ))
         conn.commit()
         cur.close()
@@ -175,7 +178,8 @@ def _db_create_channel_table():
           last_seen TIMESTAMPTZ DEFAULT NOW(),
           expires_at TIMESTAMPTZ,
           last_posted_at TIMESTAMPTZ,
-          content_hash TEXT           -- ← NEW: for change detection
+          content_hash TEXT,
+           item_count INTEGER
         );
         """)
         cur.close()
@@ -193,7 +197,9 @@ def _migrate_channel_table():
         cur = conn.cursor()
         cur.execute("""
         ALTER TABLE channel_snapshots
-        ADD COLUMN IF NOT EXISTS last_posted_at TIMESTAMPTZ;
+        ADD COLUMN IF NOT EXISTS last_posted_at TIMESTAMPTZ,
+        ADD COLUMN IF NOT EXISTS content_hash TEXT,
+        ADD COLUMN IF NOT EXISTS item_count INTEGER;
         """)
         logger.info("Migrated channel_snapshots: added last_posted_at")
     except Exception as exc:
@@ -210,7 +216,7 @@ def _db_get_channel_snapshot(ref: str):
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
             SELECT ref, site, title, url, current_price, raw, last_seen, expires_at, 
-                   last_posted_at, last_posted_price, content_hash
+                   last_posted_at, last_posted_price, content_hash, item_count
             FROM channel_snapshots
             WHERE ref = %s
             LIMIT 1
@@ -332,7 +338,9 @@ async def save_channel_snapshot(ref: str, snapshot: dict, ttl_seconds: int = 48 
                 "raw": snapshot.get("raw") or {},
                 "last_seen": datetime.now(timezone.utc).isoformat(),
                 "last_posted_at": snapshot.get("last_posted_at"),
-                "last_posted_price": snapshot.get("last_posted_price")
+                "last_posted_price": snapshot.get("last_posted_price"),
+                 "content_hash": snapshot.get("content_hash"),
+                "item_count": snapshot.get("item_count")
             }), ex=ttl_seconds)
         except Exception:
             logger.exception("Redis channel write failed %s", ref)
