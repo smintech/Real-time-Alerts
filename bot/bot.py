@@ -1,7 +1,8 @@
 import logging
 import asyncio
 from telegram import Update
-from datetime import datetime, timedelta, timezone,time
+from datetime import datetime, timedelta, timezone
+import time as std_time
 from typing import Dict, Optional, Any, Tuple, Callable, List
 import nest_asyncio
 from telegram.ext import Application, ContextTypes
@@ -342,7 +343,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
     Job: Scrapes monitored URLs, groups them, finds the best deal, 
     and posts to Telegram channels if a drop is detected or if it's a new item.
     """
-    start_time = time.time()
+    start_time = std_time.time()
     LOG.info("--- CHANNEL DEALS JOB STARTED ---")
     
     # Ensure exchange rates are current for currency formatting
