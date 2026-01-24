@@ -969,15 +969,25 @@ def get_nigeria_school_updates_report(sources: list[dict] = None) -> str:
 async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     """
     Job: Generate school updates report and post only if content changed since last post.
-    TEST_MODE: generate + compute hash but DO NOT send or save snapshot (safe dry-run).
-    SCHOOL_FORCE_POST: still forces a post when not in TEST_MODE.
+    Updated behavior:
+      - When TEST_MODE or SCHOOL_FORCE_POST is True => bypass all gating and send on every job run.
+      - If force_mode is False => original gating (AUTO_POST_TO_CHANNEL, recency, hash) still applies.
     """
     global TEST_MODE
-    force_mode = TEST_MODE or SCHOOL_FORCE_POST
+    force_mode = bool(TEST_MODE or SCHOOL_FORCE_POST)
 
-    if not AUTO_POST_TO_CHANNEL or not CHANNEL_DEAL_CHAT_ID:
-        LOG.info("Channel posting disabled — skipping school updates")
-        return
+    # If force_mode active we will bypass the channel-posting guard and other gates.
+    if force_mode:
+        LOG.info(
+            "Force mode active (TEST_MODE=%s, SCHOOL_FORCE_POST=%s) — bypassing gating and posting on every run",
+            TEST_MODE,
+            SCHOOL_FORCE_POST,
+        )
+    else:
+        # preserve original guard when not forced
+        if not AUTO_POST_TO_CHANNEL or not CHANNEL_DEAL_CHAT_ID:
+            LOG.info("Channel posting disabled — skipping school updates")
+            return
 
     now = datetime.now(TIMEZONE)
 
@@ -992,6 +1002,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     last_posted_at = snapshot.get("last_posted_at") if snapshot else None
 
     # Optional recency guard (avoid posting too frequently even if content changed rapidly)
+    # Skip recency guard entirely when force_mode True.
     if not force_mode and last_posted_at:
         try:
             last_dt = datetime.fromisoformat(last_posted_at)
@@ -1017,6 +1028,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     new_hash = _hash_report_content(new_report)
 
     # Decide whether to post
+    # When force_mode is True we always set should_post=True (send every run).
     content_changed = (previous_hash is None or new_hash != previous_hash)
     should_post = force_mode or content_changed
 
@@ -1034,14 +1046,9 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
         "\n\n🔔 Powered by live official sources"
     )
 
-    # TEST_MODE behavior: do not actually send or update snapshot — dry-run only
-    if TEST_MODE:
-        LOG.info("TEST_MODE active — skipping actual send and snapshot save.")
-        # Log a short preview so tests can inspect output; do not save snapshot or send message.
-        LOG.debug("School update preview (first 1000 chars): %s", new_report[:1000])
-        return
-
-    # Send to channel (normal operation)
+    # NOTE: TEST_MODE no longer prevents sending; TEST_MODE only toggles force_mode earlier.
+    # If you prefer TEST_MODE to still be a pure dry-run (no send / no snapshot save),
+    # revert the block below to the previous behavior.
     try:
         results = await safe_send(
             context.bot,
@@ -1058,6 +1065,8 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
 
     if any_success:
         try:
+            # Save snapshot after successful send (keeps history and prevents duplicate posts
+            # when not forced). We save even in TEST_MODE under the current implementation.
             await save_channel_snapshot(
                 SCHOOL_UPDATES_KEY,
                 {
