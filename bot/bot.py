@@ -1233,7 +1233,7 @@ async def run_bot():
             application.job_queue.run_daily(
                 callback=check_and_post_fuel_prices,
                 #interval=600,
-                time=time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
+                time=std_time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
                 name="check_fuel_prices",
                 #first=10,
             )
@@ -1245,7 +1245,7 @@ async def run_bot():
             )
             application.job_queue.run_repeating(
                 callback=check_and_post_school_updates,
-                #time=dt_time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
+                #time=std_time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
                 interval=120,  # Convert hours to seconds
                 first=10,  # Start 1 minute after bot launch
                 name="school_updates_poster"
