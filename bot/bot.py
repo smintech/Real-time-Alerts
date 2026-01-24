@@ -43,6 +43,7 @@ from Utils.utils import (
     scrape_lpg_prices,
     _fetch_html,
     _extract_snippets_from_html,
+    extract_anchors_from_soup,
 )
 from bot.persistence import (
     load_last_snapshot,
