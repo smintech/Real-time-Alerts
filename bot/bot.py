@@ -897,12 +897,12 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
         else:
             LOG.warning("No successful sends; snapshot not updated.")
 
-def get_nigeria_school_updates_report(sources: Optional[List[Dict[str,str]]] = None) -> str:
+def get_nigeria_school_updates_report(sources: list[dict] = None) -> str:
     """
-    Updated version: Pure BeautifulSoup parsing (no Playwright dependency).
-    More accurate for Nigerian education sites with news sections.
+    Generates a formatted HTML report using the improved extractor.
     """
     srcs = sources or DEFAULT_SCHOOL_SOURCES
+    # Ensure TIMEZONE is defined in your global scope, or import it
     now = datetime.now(TIMEZONE).strftime('%b %d, %Y — %H:%M')
     
     report_lines = [
@@ -921,42 +921,50 @@ def get_nigeria_school_updates_report(sources: Optional[List[Dict[str,str]]] = N
             continue
 
         try:
+            # Assuming _fetch_html is your existing function
             html = _fetch_html(url)
         except Exception as e:
-            LOG.warning(f"Failed to fetch {name}: {e}")
-            report_lines.append(f"<b>{name}</b> — <a href=\"{url}\">{url}</a>")
-            report_lines.append("• Failed to load page")
+            # LOG.warning(f"Failed to fetch {name}: {e}")
+            report_lines.append(f"<b>{name}</b>")
+            report_lines.append(f"└─ <i>Failed to load page</i>")
             report_lines.append("")
             continue
 
         items = _extract_snippets_from_html(html, url)
 
-        report_lines.append(f"<b>{name}</b> — <a href=\"{url}\">{url}</a>")
+        report_lines.append(f"<b>{name}</b>")
         
         if not items:
-            report_lines.append("• No recent updates detected")
+            report_lines.append("└─ <i>No recent updates detected</i>")
         else:
             for item in items:
-                line = "• "
-                if item.get("title"):
-                    line += f"<b>{item['title']}</b>"
+                # 1. Title Line
+                title_line = f"• <b>{item['title']}</b>"
                 if item.get("date"):
-                    line += f" — <i>{item['date']}</i>"
-                if item.get("link"):
-                    line += f" → <a href=\"{item['link']}\">View Details</a>"
-                if item.get("snippet") and not item.get("title"):
-                    line += f" {item['snippet']}"
-                report_lines.append(line)
+                    title_line += f" — <i>{item['date']}</i>"
+                report_lines.append(title_line)
+
+                # 2. Detail/Snippet Line
+                # We combine the snippet and the link
+                snippet_text = item.get("snippet", "").strip()
+                link_text = f"<a href=\"{item['link']}\">View Details</a>"
+                
+                if snippet_text:
+                    # Clean up snippet if it accidentally contains the "Read more" text
+                    snippet_text = snippet_text.replace("Read More", "").replace("View Details", "")
+                    report_lines.append(f"  └─ {snippet_text} → {link_text}")
+                else:
+                    report_lines.append(f"  └─ {link_text}")
+            
             total_found += len(items)
 
-        report_lines.append("")  # Spacer
+        report_lines.append("")  # Spacer between sources
 
     report_lines.append("━━━━━━━━━━━━━━━━━━")
     report_lines.append(f"<b>Total updates found:</b> {total_found}")
     report_lines.append("<i>Tip: Always verify on official sites before acting.</i>")
 
     return "\n".join(report_lines)
-
 
 async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     """
