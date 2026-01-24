@@ -1183,14 +1183,148 @@ def scrape_lpg_prices() -> Dict[str, Any]:
         "note": "Lagos retail estimate calculated as: average depot price per kg + ₦400–600/kg typical markup (for transport, bottling, dealer margin, etc.)",
     }
 
-def _extract_snippets_from_html(html: str, base_url: str) -> List[Dict[str, Any]]:
+def _is_pdf_link(href: str) -> bool:
+    if not href:
+        return False
+    href_clean = href.split('?')[0].split('#')[0].lower()
+    return href_clean.endswith(".pdf")
+
+def _get_pdf_head_info(url: str, timeout: float = 8.0) -> dict:
     """
-    Enhanced BeautifulSoup-based extractor optimized for Nigerian education sites.
-    Prioritizes:
-      - News/Announcement sections
-      - Headings containing keywords
-      - Links to circulars/notices
-      - Dated paragraphs/context
+    Lightweight HEAD probe for PDFs. Returns dict with keys:
+      - ok: bool
+      - content_type: str or None
+      - content_length: int or None
+      - final_url: str (after redirects)
+      - error: str if any
+    """
+    try:
+        # Use HEAD first (fast). Some servers block HEAD; fallback to GET with stream=True.
+        resp = requests.head(url, allow_redirects=True, timeout=timeout)
+        if resp.status_code >= 400 or 'pdf' not in (resp.headers.get("Content-Type") or "").lower():
+            # fallback to small GET to confirm
+            resp = requests.get(url, allow_redirects=True, timeout=timeout, stream=True)
+        content_type = (resp.headers.get("Content-Type") or "").lower()
+        content_length = None
+        if resp.headers.get("Content-Length"):
+            try:
+                content_length = int(resp.headers.get("Content-Length"))
+            except Exception:
+                content_length = None
+        return {
+            "ok": True,
+            "content_type": content_type,
+            "content_length": content_length,
+            "final_url": resp.url if hasattr(resp, "url") else url,
+            "status_code": resp.status_code
+        }
+    except Exception as e:
+        return {"ok": False, "error": str(e), "final_url": url}
+
+# Replace the anchors -> items block with this enhanced snippet (keeps previous behavior)
+anchors = []
+for a in target_soup.find_all("a", href=True):
+    link_text = a.get_text(" ", strip=True)
+    href = a.get("href", "").strip()
+    if not link_text or len(link_text) < 6:
+        continue
+    # prioritize anchors with keywords or PDFs/docs
+    if (_SCHOOL_KEYWORDS_RE.search(link_text) or _SCHOOL_KEYWORDS_RE.search(href) or href.lower().endswith((".pdf", ".doc", ".docx"))):
+        full_link = urljoin(base_url, href)
+        key = f"{link_text[:100]}|{full_link[:120]}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        item = {
+            "title": link_text,
+            "snippet": "",
+            "date": None, js
+            "link": full_link,
+            "origin": "link",
+            "detail_available": False,
+            "pdf": False,
+            "pdf_url": None,
+            "pdf_size_kb": None,
+        }
+
+        # try to find date near the link
+        sibling = a.find_parent(["p", "div", "li"])
+        if sibling:
+            date_match = _DATE_RE.search(sibling.get_text(" ", strip=True))
+            if date_match:
+                item["date"] = date_match.group(0)
+
+        # If PDF link -> probe it and annotate item accordingly (no full download)
+        if _is_pdf_link(full_link):
+            head = _get_pdf_head_info(full_link)
+            if head.get("ok") and head.get("content_type") and "pdf" in head["content_type"]:
+                item["pdf"] = True
+                item["pdf_url"] = head.get("final_url") or full_link
+                if head.get("content_length"):
+                    item["pdf_size_kb"] = round(head["content_length"] / 1024)
+                    item["snippet"] = f"(PDF — {item['pdf_size_kb']} KB) — open link to view"
+                else:
+                    item["snippet"] = "(PDF — open link to view)"
+            else:
+                # If the HEAD/GET check failed, still include link but note probe failure
+                err = head.get("error") or f"status={head.get('status_code')}"
+                item["snippet"] = f"(PDF link — probe failed: {err})"
+            # append item and continue (no following)
+            anchors.append(item)
+            continue
+
+        # Non-PDF links: add item and optionally follow (existing follow logic applies)
+        anchors.append((link_text, full_link, a))
+
+def _extract_preview_from_html(html: str, base_url: str) -> str:
+    """
+    Pick the best preview snippet from an article page:
+      1) <article> text
+      2) first long <div class="content"> or similar
+      3) first long <p>
+      4) meta description
+    Returns a short cleaned snippet (or empty string).
+    """
+    if not html:
+        return ""
+    soup = BeautifulSoup(html, "lxml")
+    # 1) article
+    article = soup.find("article")
+    if article:
+        text = article.get_text(" ", strip=True)
+        if len(text) > 60:
+            return text[:800]
+
+    # 2) common content containers
+    for sel in ("div.content", "div.article-body", "div.post-content", "main", "section.article"):
+        el = soup.select_one(sel)
+        if el:
+            text = el.get_text(" ", strip=True)
+            if len(text) > 60:
+                return text[:800]
+
+    # 3) first paragraph with reasonable length
+    for p in soup.find_all("p"):
+        txt = p.get_text(" ", strip=True)
+        if len(txt) >= 60:
+            return txt[:800]
+
+    # 4) meta description
+    meta = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
+    if meta and meta.get("content"):
+        return meta["content"][:800]
+
+    # fallback: page text
+    page_text = soup.get_text(" ", strip=True)
+    return page_text[:800] if page_text and len(page_text) > 20 else ""
+
+def _extract_snippets_from_html(html: str, base_url: str, follow_links: bool = False, max_follow: int = 2, follow_delay: float = 0.5) -> List[Dict[str, Any]]:
+    """
+    Enhanced BeautifulSoup extractor with optional link-following.
+    - follow_links: if True, attempt to fetch some linked pages for fuller details.
+    - max_follow: maximum number of links to follow per source (keep small).
+    - follow_delay: seconds to sleep between follow requests (politeness).
     """
     if not html:
         return []
@@ -1198,119 +1332,157 @@ def _extract_snippets_from_html(html: str, base_url: str) -> List[Dict[str, Any]
     soup = BeautifulSoup(html, "lxml")
     items: List[Dict[str, Any]] = []
     seen = set()
+    follow_count = 0
 
-    # 1. Target common news/announcement containers first (site-specific heuristics)
+    # 1. Try targeted news containers first
     news_selectors = [
-        "section#news", "div.news", ".latest-news", ".announcement", 
-        "div#latest-news", ".news-item", ".post", ".card", 
+        "section#news", "div.news", ".latest-news", ".announcement",
+        "div#latest-news", ".news-item", ".post", ".card",
         "ul.news-list", "div.row.news", "div.col-md-8", "main", "article"
     ]
     news_container = None
     for sel in news_selectors:
         candidates = soup.select(sel)
         if candidates:
-            news_container = candidates[0]  # Take first match
+            news_container = candidates[0]
             break
+    target_soup = news_container or soup
 
-    target_soup = news_container or soup  # Fallback to full page
-
-    # 2. Extract dated headings (h1-h4) with keywords
+    # 2. Headings (title + link)
     for heading in target_soup.find_all(["h1", "h2", "h3", "h4"]):
         text = heading.get_text(" ", strip=True)
         if not text or len(text) < 10:
             continue
         if not _SCHOOL_KEYWORDS_RE.search(text):
+            # still include headings that look like announcements? keep keyword filter
             continue
 
-        key = text[:150]
+        key = ("heading", text[:150])
         if key in seen:
             continue
         seen.add(key)
 
-        # Extract nearby date
-        date = None
+        link = None
+        # if heading wrapped by <a> or contains an <a>
+        a = heading.find("a", href=True)
+        if a:
+            link = urljoin(base_url, a["href"])
+
+        # try to extract a short nearby snippet
+        snippet = ""
         context = heading.find_next_sibling(["p", "div"])
         if context:
-            date_match = _DATE_RE.search(context.get_text())
-            if date_match:
-                date = date_match.group(0)
-
-        # Extract link if heading is wrapped in <a>
-        link = None
-        if heading.parent.name == "a" and heading.parent.get("href"):
-            link = urljoin(base_url, heading.parent["href"])
+            snippet = context.get_text(" ", strip=True)[:600]
 
         items.append({
             "title": text,
-            "snippet": context.get_text(" ", strip=True)[:300] if context else "",
-            "date": date,
+            "snippet": snippet,
+            "date": None,
             "link": link,
-            "origin": "heading"
+            "origin": "heading",
+            "detail_available": False
         })
 
-    # 3. Extract prominent links (circulars, PDFs, notices)
+    # 3. Anchors (notices, PDFs)
+    anchors = []
     for a in target_soup.find_all("a", href=True):
         link_text = a.get_text(" ", strip=True)
-        href = a.get("href", "").lower()
-
-        if len(link_text) < 8:
+        href = a.get("href", "").strip()
+        if not link_text or len(link_text) < 6:
             continue
-
-        # High-priority if link text or href contains keywords or file extensions
-        if (_SCHOOL_KEYWORDS_RE.search(link_text) or 
-            _SCHOOL_KEYWORDS_RE.search(href) or 
-            href.endswith((".pdf", ".doc", ".docx"))):
-            
-            full_link = urljoin(base_url, a["href"])
-            key = f"{link_text[:100]}{full_link[:100]}"
+        # prioritize anchors with keywords or PDFs/docs
+        if (_SCHOOL_KEYWORDS_RE.search(link_text) or _SCHOOL_KEYWORDS_RE.search(href) or href.lower().endswith((".pdf", ".doc", ".docx"))):
+            full_link = urljoin(base_url, href)
+            key = f"{link_text[:100]}|{full_link[:120]}"
             if key in seen:
                 continue
             seen.add(key)
+            anchors.append((link_text, full_link, a))
 
-            # Try to find date near the link
-            date = None
-            sibling = a.find_parent(["p", "div", "li"])
-            if sibling:
-                date_match = _DATE_RE.search(sibling.get_text())
-                if date_match:
-                    date = date_match.group(0)
+    # Convert anchors to items; optionally follow a few
+    for link_text, full_link, a_el in anchors:
+        item = {
+            "title": link_text,
+            "snippet": "",
+            "date": None,
+            "link": full_link,
+            "origin": "link",
+            "detail_available": False
+        }
 
-            items.append({
-                "title": link_text,
-                "link": full_link,
-                "snippet": "",
-                "date": date,
-                "origin": "link"
-            })
+        # find date near anchor
+        parent = a_el.find_parent(["p", "div", "li"])
+        if parent:
+            date_m = _DATE_RE.search(parent.get_text(" ", strip=True))
+            if date_m:
+                item["date"] = date_m.group(0)
 
-    # 4. Fallback: Scan paragraphs for keyword + date combinations
-    for p in target_soup.find_all("p"):
-        text = p.get_text(" ", strip=True)
-        if len(text) < 30 or not _SCHOOL_KEYWORDS_RE.search(text):
+        # If it's a PDF / doc we won't attempt to fetch body text (unless you add PDF parsing)
+        if _is_pdf_link(full_link):
+            item["snippet"] = "(PDF / attachment — open link to view)"
+            items.append(item)
             continue
 
-        date_match = _DATE_RE.search(text)
-        date = date_match.group(0) if date_match else None
+        # Optionally follow the link to fetch details (keep max_follow small)
+        if follow_links and follow_count < max_follow:
+            try:
+                # synchronous fetch via existing _fetch_html (cloudscraper + retry)
+                linked_html = _fetch_html(full_link)
+                # extract preview
+                preview = _extract_preview_from_html(linked_html, full_link)
+                if preview:
+                    item["snippet"] = preview
+                    item["detail_available"] = True
+                else:
+                    # if no strong preview, try meta or keep link text
+                    item["snippet"] = "(Details available — open link)"
+            except Exception as e:
+                # failed to fetch follow-up (DNS / cloudflare / 404 etc.)
+                item["snippet"] = f"(Could not load details: {str(e)})"
+            follow_count += 1
+            # politeness: small delay to avoid hammering same host
+            try:
+                time.sleep(follow_delay)
+            except Exception:
+                pass
 
-        key = text[:150]
+        else:
+            # not following links: leave hint to user
+            item["snippet"] = "(Open link for details)"
+
+        items.append(item)
+
+    # 4. Paragraph fallback (keyword + date)
+    for p in target_soup.find_all("p"):
+        text = p.get_text(" ", strip=True)
+        if len(text) < 40 or not _SCHOOL_KEYWORDS_RE.search(text):
+            continue
+        key = ("p", text[:140])
         if key in seen:
             continue
         seen.add(key)
-
+        date_m = _DATE_RE.search(text)
+        date = date_m.group(0) if date_m else None
         items.append({
-            "title": text[:200],
-            "snippet": text[:400],
+            "title": None,
+            "snippet": text[:600],
             "date": date,
-            "origin": "paragraph"
+            "link": None,
+            "origin": "paragraph",
+            "detail_available": True
         })
 
-    # Dedupe and limit
-    unique_items = []
+    # dedupe & return limited list (keep any items that have detail_available True first)
+    items_sorted = sorted(items, key=lambda i: (0 if i.get("detail_available") else 1))
     seen_keys = set()
-    for item in items:
-        key = item.get("title", "")[:100] + (item.get("link") or "")[:100]
-        if key not in seen_keys:
-            seen_keys.add(key)
-            unique_items.append(item)
+    out = []
+    for it in items_sorted:
+        key = (it.get("title") or "")[:100] + (it.get("link") or "")[:120]
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        out.append(it)
+        if len(out) >= 10:
+            break
 
-    return unique_items[:10]  # Limit per source
+    return out  # Limit per source
