@@ -969,8 +969,8 @@ def get_nigeria_school_updates_report(sources: list[dict] = None) -> str:
 async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     """
     Job: Generate school updates report and post only if content changed since last post.
-    Uses channel_snapshot persistence (reuses existing functions).
-    In TEST_MODE or SCHOOL_FORCE_POST: always generate and post (useful for debugging).
+    TEST_MODE: generate + compute hash but DO NOT send or save snapshot (safe dry-run).
+    SCHOOL_FORCE_POST: still forces a post when not in TEST_MODE.
     """
     global TEST_MODE
     force_mode = TEST_MODE or SCHOOL_FORCE_POST
@@ -1024,7 +1024,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
         LOG.info("No change in school updates content (hash match) — skipping post")
         return
 
-    LOG.info("School updates changed or force mode — posting new report")
+    LOG.info("School updates changed or force mode — preparing to post new report")
 
     # Build message (add emoji header)
     message = (
@@ -1034,7 +1034,14 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
         "\n\n🔔 Powered by live official sources"
     )
 
-    # Send to channel
+    # TEST_MODE behavior: do not actually send or update snapshot — dry-run only
+    if TEST_MODE:
+        LOG.info("TEST_MODE active — skipping actual send and snapshot save.")
+        # Log a short preview so tests can inspect output; do not save snapshot or send message.
+        LOG.debug("School update preview (first 1000 chars): %s", new_report[:1000])
+        return
+
+    # Send to channel (normal operation)
     try:
         results = await safe_send(
             context.bot,
@@ -1065,7 +1072,6 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             LOG.exception("Failed to save school updates snapshot")
     else:
         LOG.warning("School updates send failed — snapshot not updated")
-
 
 async def check_trials(context: ContextTypes.DEFAULT_TYPE):
     """Validate trials and downgrade users whose trial expired."""
