@@ -1210,7 +1210,7 @@ async def run_bot():
             application.job_queue.run_daily(
                 callback=check_and_post_fuel_prices,
                 #interval=600,
-                time=dt_time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
+                time=datetime(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
                 name="check_fuel_prices",
                 #first=10,
             )
