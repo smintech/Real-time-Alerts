@@ -22,7 +22,6 @@ from bot.settings import (
     HIGH_DEAL_THRESHOLD,
     MEDIUM_DEAL_THRESHOLD,
     LOW_DEAL_THRESHOLD,
-    _DATE_PATTERNS,
     _SCHOOL_KEYWORDS_RE,
     _DATE_RE,
 )
