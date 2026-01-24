@@ -9,7 +9,6 @@ import json
 import re
 import asyncio
 import requests
-from typing import Dict, Optional, Any, Tuple, Callable
 from functools import wraps
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup
