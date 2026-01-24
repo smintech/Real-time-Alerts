@@ -7,6 +7,10 @@ import time
 import logging
 import json
 import re
+# Add these imports near the top of the file
+import random
+import pathlib
+from http import HTTPStatus
 import asyncio
 import requests
 from functools import wraps
@@ -447,43 +451,181 @@ def _scrape_binance_ref(ref: str) -> Dict[str, Any]:
 # ---------------------------
 # Core fetch with cloudscraper
 # ---------------------------
-@retry(max_attempts=5, backoff=3.0)  # ← increased attempts & backoff
-def _fetch_html(url: str) -> str:
-    scraper = cloudscraper.create_scraper(
-        browser={
-            'browser': 'chrome',
-            'platform': 'windows',
-            'mobile': False,
-            'desktop': True,
-        },
-        delay=12,  # ← slightly higher delay helps
-        interpreter='js2py',  # ← sometimes helps with JS challenges
+# ---------- New globals / config ----------
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:116.0) Gecko/20100101 Firefox/116.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+]
+
+# Optionally allow a proxy list via env: CSV of proxy URLs like "http://user:pw@1.2.3.4:3128"
+_SCRAPER_PROXIES = os.environ.get("SCRAPER_PROXIES", "") and [p.strip() for p in os.environ.get("SCRAPER_PROXIES").split(",") if p.strip()] or []
+
+# reuse one scraper instance so cookies / session are kept between calls
+_SCRAPER_SINGLETON = {"scraper": None, "created_with": None}
+_SCRAPER_LOCK = asyncio.Lock() if "asyncio" in globals() else None
+
+# ---------- helper functions ----------
+def _create_scraper(interpreter: str = "js2py"):
+    """
+    Create and return a cloudscraper session configured for robust scraping.
+    Recreate only when interpreter param changes.
+    """
+    s = cloudscraper.create_scraper(
+        browser={"browser": "chrome", "platform": "windows", "mobile": False, "desktop": True},
+        delay=10,  # default delay; we also inject jitter before requests
+        interpreter=interpreter,
+        captcha={"provider": None},  # explicit: we don't auto-resolve CAPTCHAs here
     )
-    headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    # Reasonable connection pool settings
+    s.headers.update({
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
-        "Accept-Encoding": "gzip, deflate, br",
         "Referer": "https://www.google.com/",
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
-    }
+    })
+    return s
+
+def _get_shared_scraper(interpreter="js2py"):
+    """
+    Return a shared cloudscraper instance (reused across calls so cookies persist).
+    """
+    global _SCRAPER_SINGLETON
+    if _SCRAPER_SINGLETON["scraper"] is None or _SCRAPER_SINGLETON["created_with"] != interpreter:
+        _SCRAPER_SINGLETON["scraper"] = _create_scraper(interpreter=interpreter)
+        _SCRAPER_SINGLETON["created_with"] = interpreter
+    return _SCRAPER_SINGLETON["scraper"]
+
+def _is_blocked_html(html: str) -> bool:
+    """
+    Heuristic checks for Cloudflare/anti-bot landing pages.
+    """
+    if not html:
+        return True
+    t = (html or "").lower()
+    keywords = ["just a moment", "verify you are human", "attention required", "check your browser", "cloudflare", "are you human", "javascript required"]
+    # look for common challenge snippets and large inline scripts typical of CF
+    if any(k in t for k in keywords):
+        return True
+    # some challenge pages contain "cf-chl-bypass" or "Checking your browser before accessing"
+    if "cf-chl-bypass" in t or "checking your browser before accessing" in t:
+        return True
+    return False
+
+def _choose_proxy():
+    """Return a proxy dict for requests if proxies configured (rotates)."""
+    if not _SCRAPER_PROXIES:
+        return None
+    proxy = random.choice(_SCRAPER_PROXIES)
+    # cloudscraper/requests accept 'http'/'https' mapping
+    return {"http": proxy, "https": proxy}
+
+# ---------- resilient _fetch_html (drop-in replacement) ----------
+@retry(max_attempts=5, backoff=3.0)
+def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False, interpreter: str = "js2py") -> str:
+    """
+    Robust synchronous fetch:
+     - Reuses a cloudscraper session (keeps cookies)
+     - Rotates user-agents
+     - Optional proxy rotation if SCRAPER_PROXIES env var is set
+     - Heuristic detection of anti-bot blocks -> falls back to Playwright renderer
+    """
+    scraper = _get_shared_scraper(interpreter=interpreter)
+    # small jitter before issuing the request (helps avoid very regular patterns)
+    time.sleep(random.uniform(0.8, 2.2))
+
+    # Try fast Playwright first if caller asks (for the most JS-correct result)
+    if prefer_playwright_on_first_try:
+        try:
+            rendered = asyncio.run(_fetch_rendered_html(url))
+            if rendered and not _is_blocked_html(rendered):
+                LOG.info("Playwright primary fetch succeeded for %s", url)
+                return rendered
+            LOG.info("Playwright primary fetch returned blocked/empty; continuing with cloudscraper fallback")
+        except Exception as e:
+            LOG.warning("Playwright primary fetch failed (continuing to cloudscraper): %s", e)
+
+    # Strategy list: try a few different UA / proxy combos before giving up
+    strategies = []
+    # prefer a random subset of UAs to reduce detectability
+    random_uas = random.sample(_USER_AGENTS, min(len(_USER_AGENTS), 3))
+    proxies_list = _SCRAPER_PROXIES or [None]
+
+    for ua in random_uas:
+        for _proxy in proxies_list:
+            strategies.append((ua, _proxy))
+
+    # ensure at least one default strategy exists
+    if not strategies:
+        strategies = [(_USER_AGENTS[0], None)]
+
+    last_exc = None
+    for idx, (ua, proxy) in enumerate(strategies, start=1):
+        headers = {"User-Agent": ua}
+        # Merge/override session headers just for this request
+        try:
+            # attach random small sleep/jitter between strategy attempts
+            time.sleep(random.uniform(0.3, 1.2))
+
+            # prefer scraper.get which uses the session and keeps cookies
+            kwargs = {"headers": headers, "timeout": 45, "allow_redirects": True}
+            if proxy:
+                kwargs["proxies"] = {"http": proxy, "https": proxy}
+
+            LOG.debug("Attempt %d/%d fetching %s (ua=%s proxy=%s)", idx, len(strategies), url, ua[:40], bool(proxy))
+
+            resp = scraper.get(url, **kwargs)
+
+            # If status=403/429 treat as challenge and try alternate strategy
+            status = getattr(resp, "status_code", None)
+            if status in (HTTPStatus.FORBIDDEN, HTTPStatus.TOO_MANY_REQUESTS):
+                LOG.warning("Status %s for %s (UA=%s, proxy=%s). Trying alternate strategy.", status, ua, bool(proxy))
+                last_exc = ScrapeError(f"HTTP {status}")
+                # try next strategy
+                continue
+
+            text = resp.text or ""
+            # Quick block detection
+            if _is_blocked_html(text):
+                LOG.warning("Blocked/Challenge page detected (UA=%s, proxy=%s). Trying alternate strategy.", ua[:40], bool(proxy))
+                last_exc = ScrapeError("Blocked by anti-bot")
+                continue
+
+            # Good response
+            return text
+
+        except requests.exceptions.RequestException as e:
+            LOG.warning("requests error for %s with ua=%s proxy=%s -> %s", url, ua[:40], bool(proxy), e)
+            last_exc = e
+            # small extra wait if proxy errored
+            time.sleep(random.uniform(1.0, 2.0))
+            continue
+        except Exception as e:
+            LOG.exception("Unexpected error fetching %s (ua=%s, proxy=%s): %s", url, ua[:40], bool(proxy), e)
+            last_exc = e
+            continue
+
+    # If we reach here, cloudscraper failed or all strategies looked blocked.
+    # Try Playwright as a last-resort renderer (synchronous wrapper over your async helper)
     try:
-        response = scraper.get(url, headers=headers, timeout=45)  # ← increased timeout
-        response.raise_for_status()
-        return response.text
-    except requests.exceptions.HTTPError as e:
-        if e.response.status_code == 403:
-            LOG.warning(f"403 Forbidden on {url} - headers: {headers}")
-            # Optional: try one more time with different UA
-            headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
-            response = scraper.get(url, headers=headers, timeout=45)
-            response.raise_for_status()
-            return response.text
-        raise
-    except RequestException as e:
-        LOG.error(f"Request failed for {url}: {e}")
-        raise ScrapeError(f"Fetch failed: {e}")
+        LOG.info("All cloudscraper strategies exhausted or blocked for %s; attempting Playwright fallback.", url)
+        rendered = asyncio.run(_fetch_rendered_html(url))
+        if rendered and not _is_blocked_html(rendered):
+            LOG.info("Playwright fallback succeeded for %s", url)
+            return rendered
+        LOG.warning("Playwright fallback returned blocked/empty for %s", url)
+    except Exception as e:
+        LOG.exception("Playwright fallback failed for %s: %s", url, e)
+        last_exc = e
+
+    # Give one last diagnostic log and raise
+    err_msg = f"All fetch strategies failed for {url}"
+    if last_exc:
+        err_msg += f": {last_exc}"
+    LOG.error(err_msg)
+    raise ScrapeError(err_msg)
 # ---------------------------
 # Main e-commerce scraper (multi-layer extraction)
 # ---------------------------
