@@ -447,26 +447,43 @@ def _scrape_binance_ref(ref: str) -> Dict[str, Any]:
 # ---------------------------
 # Core fetch with cloudscraper
 # ---------------------------
-@retry(max_attempts=4, backoff=2.0)
+@retry(max_attempts=5, backoff=3.0)  # ← increased attempts & backoff
 def _fetch_html(url: str) -> str:
     scraper = cloudscraper.create_scraper(
         browser={
             'browser': 'chrome',
             'platform': 'windows',
+            'mobile': False,
             'desktop': True,
         },
-        delay=10,
+        delay=12,  # ← slightly higher delay helps
+        interpreter='js2py',  # ← sometimes helps with JS challenges
     )
     headers = {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.9",
+        "Accept-Encoding": "gzip, deflate, br",
         "Referer": "https://www.google.com/",
+        "Connection": "keep-alive",
+        "Upgrade-Insecure-Requests": "1",
     }
-    response = scraper.get(url, headers=headers, timeout=30)
-    if response.status_code != 200:
-        raise ScrapeError(f"HTTP {response.status_code} for {url}")
-    return response.text
+    try:
+        response = scraper.get(url, headers=headers, timeout=45)  # ← increased timeout
+        response.raise_for_status()
+        return response.text
+    except requests.exceptions.HTTPError as e:
+        if e.response.status_code == 403:
+            LOG.warning(f"403 Forbidden on {url} - headers: {headers}")
+            # Optional: try one more time with different UA
+            headers["User-Agent"] = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36"
+            response = scraper.get(url, headers=headers, timeout=45)
+            response.raise_for_status()
+            return response.text
+        raise
+    except RequestException as e:
+        LOG.error(f"Request failed for {url}: {e}")
+        raise ScrapeError(f"Fetch failed: {e}")
 # ---------------------------
 # Main e-commerce scraper (multi-layer extraction)
 # ---------------------------
