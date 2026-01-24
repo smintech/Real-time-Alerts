@@ -119,15 +119,14 @@ DEFAULT_SCHOOL_SOURCES = [
 ]
 
 _SCHOOL_KEYWORDS_RE = re.compile(
-    r"\b(resum(?:ption|ed|e)|reschedule|academic\s+calendar|holiday|exam(?:ination)?|postpon|cancel|strike|suspend|closure|announcement|notice|circular|scholarship|admission|registration|result|mock)\b",
+    r"\b(resum(?:ption|ed|e)|reschedule|academic\s+calendar|holiday|exam(?:ination)?|postpon|cancel|strike|suspend|closure|announcement|notice|circular|scholarship|admission|registration|result|mock|timetable|portal|deadline)\b",
     flags=re.I
 )
 
-_DATE_PATTERNS = [
-    r"\b\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s*,?\s*\d{4}\b",
-    r"\b(?:January|February|March|April|May|June|July|August|September|October|November|December|Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{1,2}(?:st|nd|rd|th)?,?\s*\d{4}\b",
-    r"\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b",
-    r"\b\d{4}-\d{2}-\d{2}\b",
-]
-
-_DATE_RE = re.compile("|".join(_DATE_PATTERNS), flags=re.I)
+# Matches standard dates (e.g., "Jan 24, 2026", "24-01-2026", "2026-01-24")
+_DATE_RE = re.compile(
+    r"(\b\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[a-z,.]*\s*\d{4}\b)|"
+    r"(\b\d{4}-\d{2}-\d{2}\b)|"
+    r"(\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b)",
+    flags=re.I
+)
