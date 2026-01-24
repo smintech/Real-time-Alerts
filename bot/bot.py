@@ -3,7 +3,7 @@ import asyncio
 import time
 from telegram import Update
 from datetime import datetime, timedelta, timezone
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 import nest_asyncio
 from telegram.ext import Application, ContextTypes
 import os
