@@ -11,7 +11,7 @@ import asyncio
 import requests
 from functools import wraps
 from urllib.parse import urlparse, urljoin
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup,Tag
 import cloudscraper
 from requests.exceptions import RequestException
 from typing import Dict, Optional, Any, Tuple, Callable, List
@@ -1318,13 +1318,6 @@ def _extract_preview_from_html(html: str, base_url: str) -> str:
     # fallback: page text
     page_text = soup.get_text(" ", strip=True)
     return page_text[:800] if page_text and len(page_text) > 20 else ""
-
-import re
-from urllib.parse import urljoin
-from bs4 import BeautifulSoup, Tag
-import time
-from typing import List, Dict, Any
-
 
 def _extract_snippets_from_html(html: str, base_url: str, follow_links: bool = False, max_follow: int = 2) -> List[Dict[str, Any]]:
     """
