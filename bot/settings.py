@@ -109,25 +109,42 @@ PAID_TIERS = {
 }
 DEFAULT_FREE_LIMIT = MAX_WATCHES_FREE
 
-DEFAULT_SCHOOL_SOURCES = [
+DEFAULT_SCHOOL_SOURCES = {
     # --- Official Exam Bodies (Most Critical) ---
-    {"name": "JAMB", "url": "https://www.jamb.gov.ng/"},
-    {"name": "WAEC Nigeria", "url": "https://www.waecnigeria.org/"},
-    {"name": "NECO", "url": "https://www.neco.gov.ng/"},
+    "JAMB": [
+        "https://www.jamb.gov.ng/"
+    ],
+    "WAEC Nigeria": [
+        "https://www.waecnigeria.org/"
+    ],
+    "NECO": [
+        "https://www.neco.gov.ng/"
+    ],
     
     # --- Higher Education Regulators ---
-    {"name": "NUC (Universities)", "url": "https://www.nuc.edu.ng/"},
-    {"name": "NYSC", "url": "https://www.nysc.gov.ng/"},
+    "NUC (Universities)": [
+        "https://www.nuc.edu.ng/"
+    ],
+    "NYSC": [
+        "https://www.nysc.gov.ng/"
+    ],
 
     # --- Reliable Education News Aggregators (Best for "Daily" updates) ---
-    # These sites post updates 10x faster than the official ministry sites.
-    {"name": "MySchool.ng", "url": "https://myschool.ng/news"},
-    {"name": "Punch Education", "url": "https://punchng.com/topics/education/"},
+    "MySchool.ng": [
+        "https://myschool.ng/news"
+    ],
+    "Punch Education": [
+        "https://punchng.com/topics/education/"
+    ],
     
     # --- Ministries (Often slow/heavy, but official) ---
-    {"name": "Fed Ministry of Education", "url": "https://education.gov.ng/"},
-    {"name": "Lagos State Education", "url": "https://lasubeb.lg.gov.ng/"}, # Replaced OEQA with LASUBEB (more active)
-]
+    "Fed Ministry of Education": [
+        "https://education.gov.ng/"
+    ],
+    "Lagos State Education": [
+        "https://lasubeb.lg.gov.ng/"
+    ],  # Replaced OEQA with LASUBEB (more active)
+}
 
 _SCHOOL_KEYWORDS_RE = re.compile(
     r"\b(resum(?:ption|ed|e)|reschedule|academic\s+calendar|holiday|exam(?:ination)?|postpone|cancel|strike|suspend|closure|announcement|notice|circular|scholarship|admission|registration|result|mock|timetable|portal|deadline)\b",
