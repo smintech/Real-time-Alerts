@@ -2,7 +2,7 @@ import logging
 import asyncio
 import time
 from telegram import Update
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timedelta, timezone,time
 from typing import Dict, Optional, Any, Tuple, Callable, List
 import nest_asyncio
 from telegram.ext import Application, ContextTypes
@@ -1210,7 +1210,7 @@ async def run_bot():
             application.job_queue.run_daily(
                 callback=check_and_post_fuel_prices,
                 #interval=600,
-                time=datetime(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
+                time=time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
                 name="check_fuel_prices",
                 #first=10,
             )
