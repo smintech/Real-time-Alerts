@@ -6,7 +6,7 @@ import logging
 import asyncio
 from urllib.parse import quote_plus
 from datetime import datetime, timezone, timedelta
-
+import hashlib
 import redis  # pip install redis
 from psycopg2 import pool
 import psycopg2.extras
@@ -107,39 +107,51 @@ def _db_get_snapshot(url: str):
         if conn:
             pool_conn.putconn(conn)
 
-def _db_upsert_snapshot(snapshot):
+def _db_upsert_channel_snapshot(ref: str, snapshot: dict, expires_hours: int):
     conn = None
     try:
         pool_conn = get_pg_pool()
         conn = pool_conn.getconn()
         cur = conn.cursor()
+        expires_at = datetime.now(timezone.utc) + timedelta(hours=expires_hours)
+        last_posted_at = snapshot.get("last_posted_at")
+        last_posted_price = snapshot.get("last_posted_price")
+        content_hash = snapshot.get("content_hash")  # ← NEW
+
         cur.execute("""
-            INSERT INTO product_snapshots
-              (url, site, title, current_price, previous_price, stock_status, raw, last_checked_at)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (url) DO UPDATE SET
+            INSERT INTO channel_snapshots
+              (ref, site, title, url, current_price, raw, last_seen, expires_at, last_posted_at, last_posted_price, content_hash)
+            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+            ON CONFLICT (ref) DO UPDATE SET
               site = EXCLUDED.site,
               title = EXCLUDED.title,
+              url = EXCLUDED.url,
               current_price = EXCLUDED.current_price,
-              previous_price = EXCLUDED.previous_price,
-              stock_status = EXCLUDED.stock_status,
               raw = EXCLUDED.raw,
-              last_checked_at = EXCLUDED.last_checked_at
+              last_seen = EXCLUDED.last_seen,
+              expires_at = EXCLUDED.expires_at,
+              last_posted_at = EXCLUDED.last_posted_at,
+              last_posted_price = EXCLUDED.last_posted_price,
+              content_hash = EXCLUDED.content_hash
         """, (
-            snapshot.get("url"),
+            ref,
             snapshot.get("site"),
             snapshot.get("title"),
+            snapshot.get("url"),
             snapshot.get("current_price"),
-            snapshot.get("previous_price"),
-            snapshot.get("stock_status"),
             json.dumps(snapshot.get("raw") or {}),
-            datetime.now(timezone.utc)
+            datetime.now(timezone.utc),
+            expires_at,
+            last_posted_at,
+            last_posted_price,
+            content_hash  # ← NEW parameter
         ))
         conn.commit()
         cur.close()
     finally:
         if conn:
             pool_conn.putconn(conn)
+
 
 # -----------------------
 # Channel snapshots table
@@ -162,7 +174,8 @@ def _db_create_channel_table():
           raw JSONB,
           last_seen TIMESTAMPTZ DEFAULT NOW(),
           expires_at TIMESTAMPTZ,
-          last_posted_at TIMESTAMPTZ
+          last_posted_at TIMESTAMPTZ,
+          content_hash TEXT           -- ← NEW: for change detection
         );
         """)
         cur.close()
@@ -189,48 +202,6 @@ def _migrate_channel_table():
         if conn:
             pool_conn.putconn(conn)
 
-def _db_upsert_channel_snapshot(ref: str, snapshot: dict, expires_hours: int):
-    conn = None
-    try:
-        pool_conn = get_pg_pool()
-        conn = pool_conn.getconn()
-        cur = conn.cursor()
-        expires_at = datetime.now(timezone.utc) + timedelta(hours=expires_hours)
-        last_posted_at = snapshot.get("last_posted_at")
-        last_posted_price = snapshot.get("last_posted_price")  # Extract once
-
-        cur.execute("""
-            INSERT INTO channel_snapshots
-              (ref, site, title, url, current_price, raw, last_seen, expires_at, last_posted_at, last_posted_price)
-            VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-            ON CONFLICT (ref) DO UPDATE SET
-              site = EXCLUDED.site,
-              title = EXCLUDED.title,
-              url = EXCLUDED.url,
-              current_price = EXCLUDED.current_price,
-              raw = EXCLUDED.raw,
-              last_seen = EXCLUDED.last_seen,
-              expires_at = EXCLUDED.expires_at,
-              last_posted_at = EXCLUDED.last_posted_at,
-              last_posted_price = EXCLUDED.last_posted_price
-        """, (
-            ref,
-            snapshot.get("site"),
-            snapshot.get("title"),
-            snapshot.get("url"),
-            snapshot.get("current_price"),
-            json.dumps(snapshot.get("raw") or {}),
-            datetime.now(timezone.utc),
-            expires_at,
-            last_posted_at,
-            last_posted_price          # ← 10th parameter, matches the column
-        ))
-        conn.commit()
-        cur.close()
-    finally:
-        if conn:
-            pool_conn.putconn(conn)
-
 def _db_get_channel_snapshot(ref: str):
     conn = None
     try:
@@ -238,7 +209,8 @@ def _db_get_channel_snapshot(ref: str):
         conn = pool_conn.getconn()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
-            SELECT ref, site, title, url, current_price, raw, last_seen, expires_at, last_posted_at, last_posted_price
+            SELECT ref, site, title, url, current_price, raw, last_seen, expires_at, 
+                   last_posted_at, last_posted_price, content_hash
             FROM channel_snapshots
             WHERE ref = %s
             LIMIT 1
