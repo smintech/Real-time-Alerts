@@ -3,11 +3,6 @@ FROM mcr.microsoft.com/playwright/python:v1.57.0-noble
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
 
 RUN apt-get update && apt-get install -y \
-    libssl-dev \
-    libxss1 \
-    libnss3 \
-    libappindicator1 \
-    libindicator7 \
     fonts-liberation \
     fonts-dejavu \
     fonts-noto \
