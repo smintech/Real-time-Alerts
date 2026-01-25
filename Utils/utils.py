@@ -86,21 +86,25 @@ async def _fetch_rendered_html(url: str) -> str:
 # Retry decorator (robust for network/cloudflare issues)
 # ---------------------------
 def retry(max_attempts: int = 4, backoff: float = 2.0):
-    def decorator(fn: Callable):
+    def decorator(fn):
         @wraps(fn)
         def wrapper(*args, **kwargs):
             attempt = 0
+            last_exc = None
             while attempt < max_attempts:
                 try:
                     return fn(*args, **kwargs)
                 except Exception as e:
                     attempt += 1
+                    last_exc = e
                     if attempt >= max_attempts:
+                        LOG.exception("%s failed after %d attempts", fn.__name__, attempt)
                         raise
                     sleep_for = backoff * (2 ** (attempt - 1))
-                    LOG.warning(f"{fn.__name__} failed (attempt {attempt}/{max_attempts}): {e}. Retrying in {sleep_for:.1f}s...")
+                    LOG.warning("%s failed (attempt %d/%d): %s. Sleeping %.1fs...", fn.__name__, attempt, max_attempts, e, sleep_for)
                     time.sleep(sleep_for)
-            return None
+            # unreachable, but keep explicit
+            raise last_exc
         return wrapper
     return decorator
 
