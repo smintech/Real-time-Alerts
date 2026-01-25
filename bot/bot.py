@@ -10,6 +10,7 @@ import os
 from bs4 import BeautifulSoup
 import redis
 import sys
+import re 
 import hashlib
 import redis.asyncio as redis_async
 from Utils.config import TELEGRAM_TOKEN, DB_URL
