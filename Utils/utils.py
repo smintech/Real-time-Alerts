@@ -594,20 +594,16 @@ def _get_shared_scraper(interpreter="js2py"):
     return _SCRAPER_SINGLETON["scraper"]
 
 def _is_blocked_html(html: str) -> bool:
-    """
-    Heuristic checks for Cloudflare/anti-bot landing pages.
-    """
     if not html:
         return True
     t = (html or "").lower()
-    keywords = ["just a moment", "verify you are human", "attention required", "check your browser", "cloudflare", "are you human", "javascript required"]
-    # look for common challenge snippets and large inline scripts typical of CF
-    if any(k in t for k in keywords):
-        return True
-    # some challenge pages contain "cf-chl-bypass" or "Checking your browser before accessing"
-    if "cf-chl-bypass" in t or "checking your browser before accessing" in t:
-        return True
-    return False
+    keywords = [
+        "just a moment", "verify you are human", "attention required",
+        "checking your browser", "cloudflare", "are you human",
+        "javascript required", "enable javascript", "access denied",
+        "403", "429", "bot", "automated"
+    ]
+    return any(k in t for k in keywords)
 
 def _choose_proxy():
     """Return a proxy dict for requests if proxies configured (rotates)."""
