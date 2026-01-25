@@ -7,6 +7,7 @@ import time
 import logging
 import json
 import re
+from playwright.sync_api import sync_playwright
 # Add these imports near the top of the file
 import random
 import pathlib
@@ -62,25 +63,42 @@ async def safe_send(bot: Bot, targets: int | List[int], text: str, **kwargs) -> 
             results.append((target, False, str(e)))
     return results
 
-async def _fetch_rendered_html(url: str) -> str:
+# Replace the existing `_fetch_rendered_html` synchronous function
+# with these two functions:
+
+def _fetch_rendered_html_sync(url: str, wait_for_selector: str | None = "text=Average Petrol Price") -> str:
     """
-    Render JS-heavy page with Playwright (downloads Chromium automatically on first run).
+    Synchronous Playwright renderer (safe to call from threads).
+    Uses sync_playwright so we don't call asyncio.run() inside a running loop.
     """
     try:
-        async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page()
-            await page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            # Wait for price section to load
-            await page.wait_for_selector("text=Average Petrol Price", timeout=30000)
-            # Extra wait for stability
-            await asyncio.sleep(5)
-            content = await page.content()
-            await browser.close()
-            return content
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            page = browser.new_page()
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            if wait_for_selector:
+                try:
+                    page.wait_for_selector(wait_for_selector, timeout=30000)
+                except Exception:
+                    # selector may not exist on every page — ignore selector failure
+                    pass
+            # small extra pause for stability
+            import time
+            time.sleep(1.5)
+            content = page.content()
+            browser.close()
+            return content or ""
     except Exception as e:
-        LOG.error(f"Playwright render failed for {url}: {e}")
+        LOG.error("Playwright sync render failed for %s: %s", url, e)
         return ""
+
+async def _fetch_rendered_html(url: str, wait_for_selector: str | None = "text=Average Petrol Price") -> str:
+    """
+    Async wrapper which runs the synchronous renderer in a thread executor.
+    Use this from coroutines (await _fetch_rendered_html(...)).
+    """
+    loop = asyncio.get_running_loop()
+    return await loop.run_in_executor(None, _fetch_rendered_html_sync, url, wait_for_selector)
 
 # ---------------------------
 # Retry decorator (robust for network/cloudflare issues)
@@ -534,7 +552,7 @@ def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False, interpre
      - Reuses a cloudscraper session (keeps cookies)
      - Rotates user-agents
      - Optional proxy rotation if SCRAPER_PROXIES env var is set
-     - Heuristic detection of anti-bot blocks -> falls back to Playwright renderer
+     - Heuristic detection of anti-bot blocks -> falls back to Playwright renderer (sync)
     """
     scraper = _get_shared_scraper(interpreter=interpreter)
     # small jitter before issuing the request (helps avoid very regular patterns)
@@ -543,18 +561,21 @@ def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False, interpre
     # Try fast Playwright first if caller asks (for the most JS-correct result)
     if prefer_playwright_on_first_try:
         try:
-            rendered = asyncio.run(_fetch_rendered_html(url))
+            rendered = _fetch_rendered_html_sync(url)
             if rendered and not _is_blocked_html(rendered):
                 LOG.info("Playwright primary fetch succeeded for %s", url)
                 return rendered
-            LOG.info("Playwright primary fetch returned blocked/empty; continuing with cloudscraper fallback")
+            LOG.info("Playwright primary fetch returned blocked/empty; continuing with cloudscraper fallback for %s", url)
         except Exception as e:
-            LOG.warning("Playwright primary fetch failed (continuing to cloudscraper): %s", e)
+            LOG.warning("Playwright primary fetch failed (continuing to cloudscraper) for %s: %s", url, e)
 
     # Strategy list: try a few different UA / proxy combos before giving up
     strategies = []
     # prefer a random subset of UAs to reduce detectability
-    random_uas = random.sample(_USER_AGENTS, min(len(_USER_AGENTS), 3))
+    try:
+        random_uas = random.sample(_USER_AGENTS, min(len(_USER_AGENTS), 3))
+    except Exception:
+        random_uas = _USER_AGENTS[:1]
     proxies_list = _SCRAPER_PROXIES or [None]
 
     for ua in random_uas:
@@ -570,10 +591,9 @@ def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False, interpre
         headers = {"User-Agent": ua}
         # Merge/override session headers just for this request
         try:
-            # attach random small sleep/jitter between strategy attempts
+            # attach small jitter between strategy attempts
             time.sleep(random.uniform(0.3, 1.2))
 
-            # prefer scraper.get which uses the session and keeps cookies
             kwargs = {"headers": headers, "timeout": 45, "allow_redirects": True}
             if proxy:
                 kwargs["proxies"] = {"http": proxy, "https": proxy}
@@ -582,12 +602,10 @@ def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False, interpre
 
             resp = scraper.get(url, **kwargs)
 
-            # If status=403/429 treat as challenge and try alternate strategy
             status = getattr(resp, "status_code", None)
             if status in (HTTPStatus.FORBIDDEN, HTTPStatus.TOO_MANY_REQUESTS):
                 LOG.warning("Status %s for %s (UA=%s, proxy=%s). Trying alternate strategy.", status, ua, bool(proxy))
                 last_exc = ScrapeError(f"HTTP {status}")
-                # try next strategy
                 continue
 
             text = resp.text or ""
@@ -612,10 +630,10 @@ def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False, interpre
             continue
 
     # If we reach here, cloudscraper failed or all strategies looked blocked.
-    # Try Playwright as a last-resort renderer (synchronous wrapper over your async helper)
+    # Try Playwright (synchronous renderer) as a last-resort
     try:
-        LOG.info("All cloudscraper strategies exhausted or blocked for %s; attempting Playwright fallback.", url)
-        rendered = asyncio.run(_fetch_rendered_html(url))
+        LOG.info("All cloudscraper strategies exhausted or blocked for %s; attempting Playwright fallback (sync).", url)
+        rendered = _fetch_rendered_html_sync(url)
         if rendered and not _is_blocked_html(rendered):
             LOG.info("Playwright fallback succeeded for %s", url)
             return rendered
@@ -1178,7 +1196,8 @@ async def scrape_fuel_prices() -> Dict[str, Any]:
     # Fallback: Only reached if primary method failed
     index_url = "https://www.fuelpricewatch.com/fuel-price-index-nigeria"
     try:
-        index_html = _fetch_html(index_url)  # cloudscraper
+        loop = asyncio.get_running_loop()
+        index_html = await loop.run_in_executor(None, _fetch_html, index_url)  # cloudscraper
         # Note: We pass the original app_url so the source link remains clickable
         # (even though this is the index page, the data is the same)
         index_result = _parse_fuelpricewatch(index_html, url=app_url)
