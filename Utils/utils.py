@@ -547,39 +547,60 @@ def _scrape_binance_ref(ref: str) -> Dict[str, Any]:
 # Core fetch with cloudscraper
 # ---------------------------
 # ---------- New globals / config ----------
+# Expanded with latest 2025-2026 UAs from reliable sources (Chrome 120+, Firefox, mobile for diversity)
 _USER_AGENTS = [
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
     "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:116.0) Gecko/20100101 Firefox/116.0",
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    # New: Latest from 2025-2026 (Chrome 120-144 variants, Edge, mobile)
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Vivaldi/7.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",  # Mobile for variety
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",  # Android mobile
 ]
 
-# Optionally allow a proxy list via env: CSV of proxy URLs like "http://user:pw@1.2.3.4:3128"
+# Proxies: Keep as is (empty OK), but add fallback log if none
 _SCRAPER_PROXIES = os.environ.get("SCRAPER_PROXIES", "") and [p.strip() for p in os.environ.get("SCRAPER_PROXIES").split(",") if p.strip()] or []
-
+if not _SCRAPER_PROXIES:
+    LOG.debug("No proxies configured — running proxy-free mode")
 # reuse one scraper instance so cookies / session are kept between calls
 _SCRAPER_SINGLETON = {"scraper": None, "created_with": None}
 _SCRAPER_LOCK = asyncio.Lock() if "asyncio" in globals() else None
 
 # ---------- helper functions ----------
 def _create_scraper(interpreter: str = "js2py"):
-    """
-    Create and return a cloudscraper session configured for robust scraping.
-    Recreate only when interpreter param changes.
-    """
+    # Randomize browser/platform for diversity (evade pattern detection)
+    browsers = [
+        {"browser": "chrome", "platform": "windows", "mobile": False, "desktop": True},
+        {"browser": "firefox", "platform": "linux", "mobile": False, "desktop": True},
+        {"browser": "chrome", "platform": "mac", "mobile": False, "desktop": True},
+    ]
+    browser_config = random.choice(browsers)
+    
     s = cloudscraper.create_scraper(
-        browser={"browser": "chrome", "platform": "windows", "mobile": False, "desktop": True},
-        delay=10,  # default delay; we also inject jitter before requests
+        browser=browser_config,
+        delay=random.uniform(8, 12),  # Randomize delay slightly
         interpreter=interpreter,
-        captcha={"provider": None},  # explicit: we don't auto-resolve CAPTCHAs here
+        captcha={"provider": None},
     )
     # Reasonable connection pool settings
+    accept_languages = ["en-US,en;q=0.9", "en-NG,en;q=0.9"]  # NG for your local sites
+    accept_encodings = ["gzip, deflate, br", "gzip, deflate"]
+    
     s.headers.update({
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": "en-US,en;q=0.9",
-        "Referer": "https://www.google.com/",
+        "Accept-Language": random.choice(accept_languages),
+        "Accept-Encoding": random.choice(accept_encodings),
+        "Referer": random.choice(["https://www.google.com/", "https://www.google.com.ng/"]),  # NG variant
         "Connection": "keep-alive",
         "Upgrade-Insecure-Requests": "1",
+        "Sec-Fetch-Dest": "document",  # New: Modern fetch metadata
+        "Sec-Fetch-Mode": "navigate",
+        "Sec-Fetch-Site": "none",
     })
     return s
 
@@ -601,7 +622,8 @@ def _is_blocked_html(html: str) -> bool:
         "just a moment", "verify you are human", "attention required",
         "checking your browser", "cloudflare", "are you human",
         "javascript required", "enable javascript", "access denied",
-        "403", "429", "bot", "automated"
+        "403", "429", "bot", "automated", "blocked", "challenge",
+        "ddos protection", "ray id", "turnstile", "captcha"  # 2026 additions
     ]
     return any(k in t for k in keywords)
 
@@ -616,18 +638,17 @@ def _choose_proxy():
 # ---------- resilient _fetch_html (drop-in replacement) ----------
 @retry(max_attempts=5, backoff=3.0)
 def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False, interpreter: str = "js2py") -> str:
-    """
-    Robust synchronous fetch:
-     - Reuses a cloudscraper session (keeps cookies)
-     - Rotates user-agents
-     - Optional proxy rotation if SCRAPER_PROXIES env var is set
-     - Heuristic detection of anti-bot blocks -> falls back to Playwright renderer (sync)
-    """
-    scraper = _get_shared_scraper(interpreter=interpreter)
-    # small jitter before issuing the request (helps avoid very regular patterns)
-    time.sleep(random.uniform(0.8, 2.2))
+    domain = _get_domain_from_url(url)
+    # Auto-prefer Playwright for tough sites (gov, e-com)
+    tough_domains = ['konga', 'jumia', 'gov.ng', 'nysc', 'nuc', 'waec', 'neco', 'myschool', 'punchng', 'education']
+    if any(d in domain for d in tough_domains):
+        prefer_playwright_on_first_try = True
+        LOG.debug(f"Auto-preferring Playwright for tough domain: {domain}")
 
-    # Try fast Playwright first if caller asks (for the most JS-correct result)
+    scraper = _get_shared_scraper(interpreter=interpreter)
+    # Longer jitter for all requests (2026 evasion)
+    time.sleep(random.uniform(1.5, 3.5))
+
     if prefer_playwright_on_first_try:
         try:
             rendered = _fetch_rendered_html_sync(url)
@@ -638,11 +659,9 @@ def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False, interpre
         except Exception as e:
             LOG.warning("Playwright primary fetch failed (continuing to cloudscraper) for %s: %s", url, e)
 
-    # Strategy list: try a few different UA / proxy combos before giving up
     strategies = []
-    # prefer a random subset of UAs to reduce detectability
     try:
-        random_uas = random.sample(_USER_AGENTS, min(len(_USER_AGENTS), 3))
+        random_uas = random.sample(_USER_AGENTS, min(len(_USER_AGENTS), 5))  # More samples for variety
     except Exception:
         random_uas = _USER_AGENTS[:1]
     proxies_list = _SCRAPER_PROXIES or [None]
@@ -651,19 +670,34 @@ def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False, interpre
         for _proxy in proxies_list:
             strategies.append((ua, _proxy))
 
-    # ensure at least one default strategy exists
     if not strategies:
         strategies = [(_USER_AGENTS[0], None)]
 
     last_exc = None
-    for idx, (ua, proxy) in enumerate(strategies, start=1):
-        headers = {"User-Agent": ua}
-        # Merge/override session headers just for this request
-        try:
-            # attach small jitter between strategy attempts
-            time.sleep(random.uniform(0.3, 1.2))
+    alt_interpreter_tried = False  # Flag to try alternate interpreter once
 
-            kwargs = {"headers": headers, "timeout": 45, "allow_redirects": True}
+    for idx, (ua, proxy) in enumerate(strategies, start=1):
+        # Randomized headers (more evasion)
+        headers = {
+            "User-Agent": ua,
+            "Accept": random.choice([
+                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
+                "text/html,application/xhtml+xml,image/webp,image/apng,*/*;q=0.8"
+            ]),
+            "Accept-Language": random.choice(["en-US,en;q=0.9", "en-NG,en;q=0.9"]),  # NG for local sites
+            "Accept-Encoding": random.choice(["gzip, deflate, br", "gzip, deflate"]),
+            "Referer": random.choice(["https://www.google.com.ng/", "https://www.bing.com/"]),
+            "Sec-Fetch-Dest": "document",
+            "Sec-Fetch-Mode": "navigate",
+            "Sec-Fetch-Site": random.choice(["none", "same-origin"]),
+            "Upgrade-Insecure-Requests": "1",
+            "Connection": "keep-alive",
+        }
+
+        try:
+            time.sleep(random.uniform(0.5, 2.0))  # Per-attempt jitter increase
+
+            kwargs = {"headers": headers, "timeout": 60, "allow_redirects": True}  # Longer timeout
             if proxy:
                 kwargs["proxies"] = {"http": proxy, "https": proxy}
 
@@ -673,35 +707,35 @@ def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False, interpre
 
             status = getattr(resp, "status_code", None)
             if status in (HTTPStatus.FORBIDDEN, HTTPStatus.TOO_MANY_REQUESTS):
-                LOG.warning("Status %s for %s (UA=%s, proxy=%s). Trying alternate strategy.", status, ua, bool(proxy))
+                LOG.warning("Status %s for %s (UA=%s, proxy=%s). Trying alternate strategy.", status, url, ua[:40], bool(proxy))
                 last_exc = ScrapeError(f"HTTP {status}")
                 continue
 
             text = resp.text or ""
-            # Quick block detection
             if _is_blocked_html(text):
-                LOG.warning("Blocked/Challenge page detected (UA=%s, proxy=%s). Trying alternate strategy.", ua[:40], bool(proxy))
+                LOG.warning("Blocked/Challenge page detected (UA=%s, proxy=%s) for %s. Trying alternate strategy.", ua[:40], bool(proxy), url)
+                # Try alternate interpreter once on block
+                if not alt_interpreter_tried and interpreter == "js2py":
+                    alt_interpreter_tried = True
+                    scraper = _get_shared_scraper(interpreter="nodejs")  # Switch for JS challenges
                 last_exc = ScrapeError("Blocked by anti-bot")
                 continue
 
-            # Good response
             return text
 
         except requests.exceptions.RequestException as e:
             LOG.warning("requests error for %s with ua=%s proxy=%s -> %s", url, ua[:40], bool(proxy), e)
             last_exc = e
-            # small extra wait if proxy errored
-            time.sleep(random.uniform(1.0, 2.0))
+            time.sleep(random.uniform(2.0, 4.0))  # Longer wait on error
             continue
         except Exception as e:
             LOG.exception("Unexpected error fetching %s (ua=%s, proxy=%s): %s", url, ua[:40], bool(proxy), e)
             last_exc = e
             continue
 
-    # If we reach here, cloudscraper failed or all strategies looked blocked.
-    # Try Playwright (synchronous renderer) as a last-resort
+    # Playwright fallback (your existing, but with log fixes)
     try:
-        LOG.info("All cloudscraper strategies exhausted or blocked for %s; attempting Playwright fallback (sync).", url)
+        LOG.info("All cloudscraper strategies exhausted or blocked for %s. Attempting Playwright fallback (sync).", url)
         rendered = _fetch_rendered_html_sync(url)
         if rendered and not _is_blocked_html(rendered):
             LOG.info("Playwright fallback succeeded for %s", url)
@@ -711,7 +745,6 @@ def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False, interpre
         LOG.exception("Playwright fallback failed for %s: %s", url, e)
         last_exc = e
 
-    # Give one last diagnostic log and raise
     err_msg = f"All fetch strategies failed for {url}"
     if last_exc:
         err_msg += f": {last_exc}"
