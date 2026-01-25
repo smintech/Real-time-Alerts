@@ -7,13 +7,14 @@ import time
 import logging
 import json
 import re
-from playwright.sync_api import sync_playwright
-# Add these imports near the top of the file
+from playwright.sync_api import sync_playwright, Page, Response
 import random
 import pathlib
 from http import HTTPStatus
 import asyncio
 import requests
+import shutil
+from datetime import datetime
 from functools import wraps
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup,Tag
