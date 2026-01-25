@@ -68,28 +68,101 @@ async def safe_send(bot: Bot, targets: int | List[int], text: str, **kwargs) -> 
 
 def _fetch_rendered_html_sync(url: str, wait_for_selector: str | None = "text=Average Petrol Price") -> str:
     """
-    Synchronous Playwright renderer (safe to call from threads).
-    Uses sync_playwright so we don't call asyncio.run() inside a running loop.
+    Enhanced Playwright renderer with anti-detection measures.
+    - Stealth mode launch arguments
+    - Realistic user agent rotation
+    - Request interception to block tracking
+    - Proper context/page isolation
     """
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True)
-            page = browser.new_page()
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            # Enhanced launch args with anti-detection
+            launch_args = [
+                "--disable-blink-features=AutomationControlled",
+                "--disable-dev-shm-usage",  # Fixes memory issues in Docker
+                "--no-first-run",
+                "--no-default-browser-check",
+                "--disable-gpu",
+                "--disable-web-resources",
+                "--disable-component-extensions-with-background-pages",
+                "--disable-default-apps",
+                "--enable-automation=false",  # Hide automation flag
+            ]
+            
+            browser = p.chromium.launch(
+                headless=True,
+                args=launch_args,
+                timeout=30000,
+            )
+            
+            # Create context with stealth settings
+            context = browser.new_context(
+                user_agent=random.choice(_USER_AGENTS),
+                viewport={"width": 1920, "height": 1080},
+                ignore_https_errors=True,
+                java_script_enabled=True,
+                # Realistic browser fingerprint
+                extra_http_headers={
+                    "Accept-Language": "en-US,en;q=0.9",
+                    "Accept-Encoding": "gzip, deflate, br",
+                    "DNT": "1",
+                    "Connection": "keep-alive",
+                    "Upgrade-Insecure-Requests": "1",
+                },
+            )
+            
+            page = context.new_page()
+            
+            # Inject stealth script before loading page
+            page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {
+                    get: () => false,
+                });
+                Object.defineProperty(navigator, 'plugins', {
+                    get: () => [1, 2, 3, 4, 5],
+                });
+                Object.defineProperty(navigator, 'languages', {
+                    get: () => ['en-US', 'en'],
+                });
+            """)
+            
+            # Block tracking/ads (speeds up page load)
+            def route_handler(route):
+                if any(block in route.request.url for block in ['google-analytics', 'facebook.com', 'doubleclick']):
+                    route.abort()
+                else:
+                    route.continue_()
+            
+            page.route("**/*", route_handler)
+            
+            # Navigate with reasonable timeout
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=45000)
+            except Exception as nav_err:
+                LOG.warning("Navigation timeout/error for %s: %s", url, nav_err)
+            
+            # Wait for selector if provided
             if wait_for_selector:
                 try:
-                    page.wait_for_selector(wait_for_selector, timeout=30000)
+                    page.wait_for_selector(wait_for_selector, timeout=20000)
                 except Exception:
-                    # selector may not exist on every page — ignore selector failure
-                    pass
-            # small extra pause for stability
+                    pass  # Selector might not exist
+            
+            # Let JavaScript settle
             import time
-            time.sleep(1.5)
+            time.sleep(random.uniform(1.0, 2.5))
+            
             content = page.content()
+            
+            # Cleanup
+            page.close()
+            context.close()
             browser.close()
+            
             return content or ""
+            
     except Exception as e:
-        LOG.error("Playwright sync render failed for %s: %s", url, e)
+        LOG.error("Playwright enhanced render failed for %s: %s", url, e)
         return ""
 
 async def _fetch_rendered_html(url: str, wait_for_selector: str | None = "text=Average Petrol Price") -> str:
