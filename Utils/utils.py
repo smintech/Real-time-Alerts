@@ -66,42 +66,92 @@ async def safe_send(bot: Bot, targets: int | List[int], text: str, **kwargs) -> 
 # Replace the existing `_fetch_rendered_html` synchronous function
 # with these two functions:
 
-def _fetch_rendered_html_sync(url: str, wait_for_selector: str | None = "text=Average Petrol Price") -> str:
+PROFILES_ROOT = os.getenv("HUMAN_PROFILES_ROOT", "/var/human_profiles")  # change if needed
+QUARANTINE_ROOT = os.path.join(PROFILES_ROOT, "quarantined")
+os.makedirs(PROFILES_ROOT, exist_ok=True)
+os.makedirs(QUARANTINE_ROOT, exist_ok=True)
+
+# Per-domain block tracking: {domain: {"until": timestamp, "attempts": int}}
+DOMAIN_BLOCK_STATE: Dict[str, Dict[str, Any]] = {}
+
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:116.0) Gecko/20100101 Firefox/116.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Vivaldi/7.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+]
+
+def human_scroll(page: Page):
+    """Slow human-like smooth scrolling with occasional mouse wiggles."""
+    viewport = page.evaluate("() => ({w: window.innerWidth, h: window.innerHeight})")
+    height = page.evaluate("() => document.body.scrollHeight")
+    y = 0
+    while y < height:
+        step = random.randint(int(viewport['h'] * 0.2), int(viewport['h'] * 0.6))
+        y = min(y + step, height)
+        page.evaluate(f"window.scrollTo({{top: {y}, behavior: 'smooth'}})")
+        time.sleep(random.uniform(0.8, 2.6))
+        if random.random() < 0.3:
+            page.mouse.move(
+                random.randint(100, viewport['w'] - 100),
+                random.randint(100, viewport['h'] - 100)
+            )
+
+def _quarantine_profile(profile_dir: str):
+    """Move a repeatedly blocked profile to quarantine and let a fresh one be created next time."""
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    dest = os.path.join(QUARANTINE_ROOT, f"{os.path.basename(profile_dir)}_{timestamp}")
+    try:
+        shutil.move(profile_dir, dest)
+        LOG.warning("Quarantined burned profile: %s → %s", profile_dir, dest)
+    except Exception as e:
+        LOG.error("Failed to quarantine profile %s: %s", profile_dir, e)
+
+# ---------------------------
+# Updated human-like renderer (persistent, headful, stealthy)
+# ---------------------------
+def _fetch_rendered_html_sync(url: str, wait_for_selector: Optional[str] = None) -> str:
     """
-    Enhanced Playwright renderer with anti-detection measures.
-    - Stealth mode launch arguments
-    - Realistic user agent rotation
-    - Request interception to block tracking
-    - Proper context/page isolation
+    New persistent headful human-like renderer.
+    One profile per domain → cookies persist for days/weeks.
+    Includes cooldown & quarantine logic.
     """
+    domain = _get_domain_from_url(url)
+    profile_name = domain.replace(".", "_")
+    profile_dir = os.path.join(PROFILES_ROOT, profile_name)
+
+    # Cooldown check
+    state = DOMAIN_BLOCK_STATE.get(domain, {"until": 0, "attempts": 0})
+    if time.time() < state["until"]:
+        remaining = int(state["until"] - time.time())
+        LOG.warning("Domain %s on cooldown for another %ds – skipping human render", domain, remaining)
+        return ""
+
     try:
         with sync_playwright() as p:
-            # Enhanced launch args with anti-detection
-            launch_args = [
-                "--disable-blink-features=AutomationControlled",
-                "--disable-dev-shm-usage",  # Fixes memory issues in Docker
-                "--no-first-run",
-                "--no-default-browser-check",
-                "--disable-gpu",
-                "--disable-web-resources",
-                "--disable-component-extensions-with-background-pages",
-                "--disable-default-apps",
-                "--enable-automation=false",  # Hide automation flag
-            ]
-            
-            browser = p.chromium.launch(
-                headless=True,
-                args=launch_args,
-                timeout=30000,
-            )
-            
-            # Create context with stealth settings
-            context = browser.new_context(
+            context = p.chromium.launch_persistent_context(
+                user_data_dir=profile_dir,
+                channel="chrome",                     # uses system Chrome
+                headless=False,                       # headful as required
+                args=[
+                    "--no-first-run",
+                    "--disable-blink-features=AutomationControlled",
+                    "--enable-features=NetworkService",
+                    "--no-default-browser-check",
+                    "--disable-component-extensions-with-background-pages",
+                    "--disable-default-apps",
+                ],
+                viewport={"width": 1280, "height": 800},
                 user_agent=random.choice(_USER_AGENTS),
-                viewport={"width": 1920, "height": 1080},
                 ignore_https_errors=True,
                 java_script_enabled=True,
-                # Realistic browser fingerprint
                 extra_http_headers={
                     "Accept-Language": "en-US,en;q=0.9",
                     "Accept-Encoding": "gzip, deflate, br",
@@ -110,66 +160,77 @@ def _fetch_rendered_html_sync(url: str, wait_for_selector: str | None = "text=Av
                     "Upgrade-Insecure-Requests": "1",
                 },
             )
-            
+
             page = context.new_page()
-            
-            # Inject stealth script before loading page
+
+            # Basic stealth init script
             page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {
-                    get: () => false,
-                });
-                Object.defineProperty(navigator, 'plugins', {
-                    get: () => [1, 2, 3, 4, 5],
-                });
-                Object.defineProperty(navigator, 'languages', {
-                    get: () => ['en-US', 'en'],
-                });
+                Object.defineProperty(navigator, 'webdriver', {get: () => false});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
+                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
             """)
-            
-            # Block tracking/ads (speeds up page load)
-            def route_handler(route):
-                if any(block in route.request.url for block in ['google-analytics', 'facebook.com', 'doubleclick']):
+
+            # Block trackers/ads (faster + smaller fingerprint)
+            def block_route(route):
+                block_domains = ['google-analytics', 'facebook.com', 'doubleclick', 'ads', 'analytics']
+                if any(block in route.request.url for block in block_domains):
                     route.abort()
                 else:
                     route.continue_()
-            
-            page.route("**/*", route_handler)
-            
-            # Navigate with reasonable timeout
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=45000)
-            except Exception as nav_err:
-                LOG.warning("Navigation timeout/error for %s: %s", url, nav_err)
-            
-            # Wait for selector if provided
+            page.route("**/*", block_route)
+
+            # Navigate
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            time.sleep(random.uniform(1.5, 4.0))
+
             if wait_for_selector:
                 try:
                     page.wait_for_selector(wait_for_selector, timeout=20000)
                 except Exception:
-                    pass  # Selector might not exist
-            
-            # Let JavaScript settle
-            import time
-            time.sleep(random.uniform(1.0, 2.5))
-            
+                    pass
+
+            try:
+                page.wait_for_load_state("networkidle", timeout=15000)
+            except Exception:
+                pass
+
+            # Human actions
+            human_scroll(page)
+            time.sleep(random.uniform(1.0, 3.0))
+
             content = page.content()
-            
-            # Cleanup
+
+            # Detect block/challenge
+            if _is_blocked_html(content):
+                attempts = state.get("attempts", 0) + 1
+                backoff_hours = [1, 6, 24][min(attempts - 1, 2)]  # 1h → 6h → 24h
+                until = time.time() + backoff_hours * 3600
+                DOMAIN_BLOCK_STATE[domain] = {"until": until, "attempts": attempts}
+                LOG.warning("Challenge detected on %s (attempt %d) – cooldown %dh", domain, attempts, backoff_hours)
+
+                if attempts >= 3:
+                    _quarantine_profile(profile_dir)
+
+                page.close()
+                context.close()
+                return ""
+
+            # Success → reset block state
+            if domain in DOMAIN_BLOCK_STATE:
+                del DOMAIN_BLOCK_STATE[domain]
+
             page.close()
             context.close()
-            browser.close()
-            
-            return content or ""
-            
+            return content
+
     except Exception as e:
-        LOG.error("Playwright enhanced render failed for %s: %s", url, e)
+        LOG.error("Human renderer failed for %s: %s", url, e)
+        # On exception also apply a short cooldown to avoid hammering
+        DOMAIN_BLOCK_STATE[domain] = {"until": time.time() + 3600, "attempts": 1}
         return ""
 
-async def _fetch_rendered_html(url: str, wait_for_selector: str | None = "text=Average Petrol Price") -> str:
-    """
-    Async wrapper which runs the synchronous renderer in a thread executor.
-    Use this from coroutines (await _fetch_rendered_html(...)).
-    """
+# Async wrapper unchanged (runs the new sync version in executor)
+async def _fetch_rendered_html(url: str, wait_for_selector: Optional[str] = None) -> str:
     loop = asyncio.get_running_loop()
     return await loop.run_in_executor(None, _fetch_rendered_html_sync, url, wait_for_selector)
 
