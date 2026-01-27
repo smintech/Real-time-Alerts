@@ -1,6 +1,5 @@
-# Utils/utils.py - Fully updated scraper (Apify completely removed, cloudscraper-based, bulletproof for JS-heavy sites)
-from telegram.error import TelegramError  # For safe_send
-from telegram import Bot  # Type hint for safe_send
+from telegram.error import TelegramError
+from telegram import Bot
 import os
 from playwright.async_api import async_playwright
 import time
@@ -17,10 +16,11 @@ import shutil
 from datetime import datetime
 from functools import wraps
 from urllib.parse import urlparse, urljoin
-from bs4 import BeautifulSoup,Tag
+from bs4 import BeautifulSoup, Tag
 import cloudscraper
 from requests.exceptions import RequestException
 from typing import Dict, Optional, Any, Tuple, Callable, List, Set
+
 # Settings / thresholds
 from bot.settings import (
     SUPPORTED_SITES,
@@ -40,14 +40,259 @@ class ScrapeError(Exception):
 class NoDataError(ScrapeError):
     """Raised when page loaded but no usable product data found."""
 
-# ---------------------------
-# safe_send (brought back as requested)
-# ---------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# CONFIGURATION
+# ═══════════════════════════════════════════════════════════════════════════
+
+_USER_AGENTS = [
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:116.0) Gecko/20100101 Firefox/116.0",
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Vivaldi/7.0",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
+    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
+    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
+    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+]
+
+_SCRAPER_PROXIES = os.environ.get("SCRAPER_PROXIES", "") and [
+    p.strip() for p in os.environ.get("SCRAPER_PROXIES").split(",") if p.strip()
+] or []
+
+if not _SCRAPER_PROXIES:
+    LOG.debug("No proxies configured — running proxy-free mode")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AGGRESSIVE CLOUDSCRAPER (fresh instance per attempt)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def fetch_with_cloudscraper_aggressive(url: str, retries: int = 6) -> str:
+    """Try cloudscraper repeatedly, creating a fresh scraper each attempt."""
+    for attempt in range(1, retries + 1):
+        LOG.debug("Cloudscraper attempt %d/%d for %s", attempt, retries, url)
+        try:
+            time.sleep(random.uniform(2.5, 6.0))
+            scraper = cloudscraper.create_scraper(
+                browser={
+                    'browser': 'chrome',
+                    'platform': random.choice(['windows', 'darwin', 'linux']),
+                    'mobile': False
+                },
+                delay=random.randint(6, 14),
+            )
+            headers = {
+                'User-Agent': random.choice(_USER_AGENTS),
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.9',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Referer': 'https://www.google.com/',
+                'DNT': '1',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1',
+            }
+            resp = scraper.get(url, headers=headers, timeout=60)
+            status = getattr(resp, "status_code", None)
+            text = resp.text or ""
+            
+            if status == 200 and len(text) > 3000:
+                blocked_kw = ['just a moment', 'verify you are human', 'cloudflare challenge', 
+                             'attention required', 'checking your browser']
+                if not any(k in text.lower() for k in blocked_kw):
+                    LOG.debug("Cloudscraper returned content for %s", url)
+                    return text
+                else:
+                    LOG.debug("Cloudscraper appears blocked (attempt %d) for %s", attempt, url)
+            else:
+                LOG.debug("Cloudscraper status %s or small content (len=%d)", status, len(text))
+        except Exception as e:
+            LOG.debug("Cloudscraper attempt %d error for %s: %s", attempt, url, e)
+        
+        if attempt < retries:
+            time.sleep(random.uniform(4, 10))
+    
+    raise Exception("Cloudscraper failed all attempts")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# AGGRESSIVE PLAYWRIGHT (fresh browser/context each attempt with anti-detection)
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def fetch_with_playwright_aggressive(url: str, retries: int = 4) -> str:
+    """Aggressive Playwright fetch: fresh browser/context each attempt with anti-detection steps."""
+    for attempt in range(1, retries + 1):
+        LOG.debug("Playwright attempt %d/%d for %s", attempt, retries, url)
+        try:
+            async with async_playwright() as p:
+                browser = await p.chromium.launch(headless=True, args=[
+                    '--no-sandbox',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-dev-shm-usage',
+                    '--disable-web-security',
+                    '--disable-features=IsolateOrigins,site-per-process',
+                    '--disable-setuid-sandbox',
+                ])
+                context = await browser.new_context(
+                    user_agent=random.choice(_USER_AGENTS),
+                    viewport={'width': 1280, 'height': 800},
+                    locale='en-US',
+                    timezone_id='Africa/Lagos',
+                )
+                page = await context.new_page()
+                
+                # anti-detection
+                await page.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+                    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
+                    window.chrome = { runtime: {} };
+                """)
+                
+                await asyncio.sleep(random.uniform(2.5, 6.0))
+                await page.goto(url, wait_until='domcontentloaded', timeout=60000)
+                
+                # Wait and interact a bit
+                await page.wait_for_timeout(random.randint(2000, 5000))
+                try:
+                    await page.evaluate('window.scrollTo(0, document.body.scrollHeight/2)')
+                    await page.wait_for_timeout(800)
+                except Exception:
+                    pass
+                
+                html = await page.content()
+                await browser.close()
+                
+                if len(html) > 3000 and 'cloudflare' not in html.lower() and 'just a moment' not in html.lower():
+                    LOG.debug("Playwright succeeded for %s", url)
+                    return html
+                else:
+                    LOG.debug("Playwright produced blocked/insufficient content for %s (len=%d)", url, len(html))
+        except Exception as e:
+            LOG.debug("Playwright attempt %d exception for %s: %s", attempt, url, e)
+        
+        if attempt < retries:
+            await asyncio.sleep(random.uniform(4, 10))
+    
+    raise Exception("Playwright failed all attempts")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# ULTIMATE FETCH (combines both strategies)
+# ═══════════════════════════════════════════════════════════════════════════
+
+async def fetch_html_ultimate(url: str) -> str:
+    """Ultimate fetch: Cloudscraper attempts first, then Playwright aggressive."""
+    LOG.info("fetch_html_ultimate: fetching %s", url)
+    
+    # 1) cloudscraper aggressive
+    try:
+        loop = asyncio.get_running_loop()
+        html = await loop.run_in_executor(None, fetch_with_cloudscraper_aggressive, url, 5)
+        return html
+    except Exception as e:
+        LOG.debug("Cloudscraper exhausted for %s: %s", url, e)
+    
+    # 2) Playwright aggressive
+    try:
+        html = await fetch_with_playwright_aggressive(url, retries=3)
+        return html
+    except Exception as e:
+        LOG.debug("Playwright exhausted for %s: %s", url, e)
+    
+    raise Exception(f"Failed to fetch {url}")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# RETRY DECORATOR
+# ═══════════════════════════════════════════════════════════════════════════
+
+def retry(max_attempts: int = 4, backoff: float = 2.0):
+    def decorator(fn):
+        @wraps(fn)
+        async def async_wrapper(*args, **kwargs):
+            attempt = 0
+            last_exc = None
+            while attempt < max_attempts:
+                try:
+                    return await fn(*args, **kwargs)
+                except Exception as e:
+                    attempt += 1
+                    last_exc = e
+                    if attempt >= max_attempts:
+                        LOG.exception("%s failed after %d attempts", fn.__name__, attempt)
+                        raise
+                    sleep_for = backoff * (2 ** (attempt - 1))
+                    LOG.warning("%s failed (attempt %d/%d): %s. Sleeping %.1fs…", 
+                               fn.__name__, attempt, max_attempts, e, sleep_for)
+                    await asyncio.sleep(sleep_for)
+            raise last_exc
+        
+        @wraps(fn)
+        def sync_wrapper(*args, **kwargs):
+            attempt = 0
+            last_exc = None
+            while attempt < max_attempts:
+                try:
+                    return fn(*args, **kwargs)
+                except Exception as e:
+                    attempt += 1
+                    last_exc = e
+                    if attempt >= max_attempts:
+                        LOG.exception("%s failed after %d attempts", fn.__name__, attempt)
+                        raise
+                    sleep_for = backoff * (2 ** (attempt - 1))
+                    LOG.warning("%s failed (attempt %d/%d): %s. Sleeping %.1fs…", 
+                               fn.__name__, attempt, max_attempts, e, sleep_for)
+                    time.sleep(sleep_for)
+            raise last_exc
+        
+        return async_wrapper if asyncio.iscoroutinefunction(fn) else sync_wrapper
+    return decorator
+
+# ═══════════════════════════════════════════════════════════════════════════
+# CORE FETCH FUNCTION
+# ═══════════════════════════════════════════════════════════════════════════
+
+@retry(max_attempts=4, backoff=2.0)
+async def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False) -> str:
+    domain = get_domain_from_url(url)
+    tough_domains = ['konga', 'jumia', 'gov.ng', 'nysc', 'nuc', 'waec', 'neco', 'myschool', 'punchng', 'education']
+    
+    if any(d in domain for d in tough_domains):
+        prefer_playwright_on_first_try = True
+    
+    # If prefer_playwright_on_first_try, try playwright aggressive directly
+    if prefer_playwright_on_first_try:
+        try:
+            html = await fetch_with_playwright_aggressive(url, retries=3)
+            if html and 'cloudflare' not in html.lower():
+                LOG.info("Playwright primary fetch succeeded for %s", url)
+                return html
+        except Exception as e:
+            LOG.debug("Playwright primary failed for %s: %s", url, e)
+    
+    # Try cloudscraper first (fast)
+    try:
+        loop = asyncio.get_running_loop()
+        html = await loop.run_in_executor(None, fetch_with_cloudscraper_aggressive, url, 4)
+        if html and not any(k in html.lower() for k in ['just a moment', 'verify you are human', 'cloudflare']):
+            return html
+    except Exception:
+        pass
+    
+    # Ultimate fallback - aggressive try both
+    try:
+        html = await fetch_html_ultimate(url)
+        return html
+    except Exception as e:
+        LOG.exception("All fetch strategies failed for %s: %s", url, e)
+        raise ScrapeError(f"All fetch strategies failed for {url}: {e}")
+
+# ═══════════════════════════════════════════════════════════════════════════
+# HELPER FUNCTIONS
+# ═══════════════════════════════════════════════════════════════════════════
+
 async def safe_send(bot: Bot, targets: int | List[int], text: str, **kwargs) -> List[Tuple[int, bool, Optional[str]]]:
-    """
-    Sends a message to one or more chat_ids safely.
-    Returns a list of (target, success_bool, error_message).
-    """
+    """Sends a message to one or more chat_ids safely."""
     if not isinstance(targets, list):
         targets = [targets]
     
@@ -64,220 +309,14 @@ async def safe_send(bot: Bot, targets: int | List[int], text: str, **kwargs) -> 
             results.append((target, False, str(e)))
     return results
 
-# Replace the existing `_fetch_rendered_html` synchronous function
-# with these two functions:
-
-PROFILES_ROOT = os.getenv("HUMAN_PROFILES_ROOT", "/var/human_profiles")  # change if needed
-QUARANTINE_ROOT = os.path.join(PROFILES_ROOT, "quarantined")
-os.makedirs(PROFILES_ROOT, exist_ok=True)
-os.makedirs(QUARANTINE_ROOT, exist_ok=True)
-
-# Per-domain block tracking: {domain: {"until": timestamp, "attempts": int}}
-DOMAIN_BLOCK_STATE: Dict[str, Dict[str, Any]] = {}
-
-_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:116.0) Gecko/20100101 Firefox/116.0",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Vivaldi/7.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-]
-
-def human_scroll(page: Page):
-    """Slow human-like smooth scrolling with occasional mouse wiggles."""
-    viewport = page.evaluate("() => ({w: window.innerWidth, h: window.innerHeight})")
-    height = page.evaluate("() => document.body.scrollHeight")
-    y = 0
-    while y < height:
-        step = random.randint(int(viewport['h'] * 0.2), int(viewport['h'] * 0.6))
-        y = min(y + step, height)
-        page.evaluate(f"window.scrollTo({{top: {y}, behavior: 'smooth'}})")
-        time.sleep(random.uniform(0.8, 2.6))
-        if random.random() < 0.3:
-            page.mouse.move(
-                random.randint(100, viewport['w'] - 100),
-                random.randint(100, viewport['h'] - 100)
-            )
-
-def _quarantine_profile(profile_dir: str):
-    """Move a repeatedly blocked profile to quarantine and let a fresh one be created next time."""
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    dest = os.path.join(QUARANTINE_ROOT, f"{os.path.basename(profile_dir)}_{timestamp}")
-    try:
-        shutil.move(profile_dir, dest)
-        LOG.warning("Quarantined burned profile: %s → %s", profile_dir, dest)
-    except Exception as e:
-        LOG.error("Failed to quarantine profile %s: %s", profile_dir, e)
-
-# ---------------------------
-# Updated human-like renderer (persistent, headful, stealthy)
-# ---------------------------
-def _fetch_rendered_html_sync(url: str, wait_for_selector: Optional[str] = None) -> str:
-    """
-    New persistent headful human-like renderer.
-    One profile per domain → cookies persist for days/weeks.
-    Includes cooldown & quarantine logic.
-    """
-    domain = _get_domain_from_url(url)
-    profile_name = domain.replace(".", "_")
-    profile_dir = os.path.join(PROFILES_ROOT, profile_name)
-
-    # Cooldown check
-    state = DOMAIN_BLOCK_STATE.get(domain, {"until": 0, "attempts": 0})
-    if time.time() < state["until"]:
-        remaining = int(state["until"] - time.time())
-        LOG.warning("Domain %s on cooldown for another %ds – skipping human render", domain, remaining)
-        return ""
-
-    try:
-        with sync_playwright() as p:
-            context = p.chromium.launch_persistent_context(
-                user_data_dir=profile_dir,
-                channel="chrome",                     # uses system Chrome
-                headless=False,                       # headful as required
-                args=[
-                    "--no-first-run",
-                    "--disable-blink-features=AutomationControlled",
-                    "--enable-features=NetworkService",
-                    "--no-default-browser-check",
-                    "--disable-component-extensions-with-background-pages",
-                    "--disable-default-apps",
-                ],
-                viewport={"width": 1280, "height": 800},
-                user_agent=random.choice(_USER_AGENTS),
-                ignore_https_errors=True,
-                java_script_enabled=True,
-                extra_http_headers={
-                    "Accept-Language": "en-US,en;q=0.9",
-                    "Accept-Encoding": "gzip, deflate, br",
-                    "DNT": "1",
-                    "Connection": "keep-alive",
-                    "Upgrade-Insecure-Requests": "1",
-                },
-            )
-
-            page = context.new_page()
-
-            # Basic stealth init script
-            page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => false});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1, 2, 3, 4, 5]});
-                Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-            """)
-
-            # Block trackers/ads (faster + smaller fingerprint)
-            def block_route(route):
-                block_domains = ['google-analytics', 'facebook.com', 'doubleclick', 'ads', 'analytics']
-                if any(block in route.request.url for block in block_domains):
-                    route.abort()
-                else:
-                    route.continue_()
-            page.route("**/*", block_route)
-
-            # Navigate
-            page.goto(url, wait_until="domcontentloaded", timeout=60000)
-            time.sleep(random.uniform(1.5, 4.0))
-
-            if wait_for_selector:
-                try:
-                    page.wait_for_selector(wait_for_selector, timeout=20000)
-                except Exception:
-                    pass
-
-            try:
-                page.wait_for_load_state("networkidle", timeout=15000)
-            except Exception:
-                pass
-
-            # Human actions
-            human_scroll(page)
-            time.sleep(random.uniform(1.0, 3.0))
-
-            content = page.content()
-
-            # Detect block/challenge
-            if _is_blocked_html(content):
-                attempts = state.get("attempts", 0) + 1
-                backoff_hours = [1, 6, 24][min(attempts - 1, 2)]  # 1h → 6h → 24h
-                until = time.time() + backoff_hours * 3600
-                DOMAIN_BLOCK_STATE[domain] = {"until": until, "attempts": attempts}
-                LOG.warning("Challenge detected on %s (attempt %d) – cooldown %dh", domain, attempts, backoff_hours)
-
-                if attempts >= 3:
-                    _quarantine_profile(profile_dir)
-
-                page.close()
-                context.close()
-                return ""
-
-            # Success → reset block state
-            if domain in DOMAIN_BLOCK_STATE:
-                del DOMAIN_BLOCK_STATE[domain]
-
-            page.close()
-            context.close()
-            return content
-
-    except Exception as e:
-        LOG.error("Human renderer failed for %s: %s", url, e)
-        # On exception also apply a short cooldown to avoid hammering
-        DOMAIN_BLOCK_STATE[domain] = {"until": time.time() + 3600, "attempts": 1}
-        return ""
-
-# Async wrapper unchanged (runs the new sync version in executor)
-async def _fetch_rendered_html(url: str, wait_for_selector: Optional[str] = None) -> str:
-    loop = asyncio.get_running_loop()
-    return await loop.run_in_executor(None, _fetch_rendered_html_sync, url, wait_for_selector)
-
-# ---------------------------
-# Retry decorator (robust for network/cloudflare issues)
-# ---------------------------
-def retry(max_attempts: int = 4, backoff: float = 2.0):
-    def decorator(fn):
-        @wraps(fn)
-        def wrapper(*args, **kwargs):
-            attempt = 0
-            last_exc = None
-            while attempt < max_attempts:
-                try:
-                    return fn(*args, **kwargs)
-                except Exception as e:
-                    attempt += 1
-                    last_exc = e
-                    if attempt >= max_attempts:
-                        LOG.exception("%s failed after %d attempts", fn.__name__, attempt)
-                        raise
-                    sleep_for = backoff * (2 ** (attempt - 1))
-                    LOG.warning("%s failed (attempt %d/%d): %s. Sleeping %.1fs...", fn.__name__, attempt, max_attempts, e, sleep_for)
-                    time.sleep(sleep_for)
-            # unreachable, but keep explicit
-            raise last_exc
-        return wrapper
-    return decorator
-
-@retry(max_attempts=4, backoff=2.0)
-def _fetch_lpg_html() -> str:
-    url = "https://lpginnigeria.com/chart"
-    return _fetch_html(url)  # Reuses existing cloudscraper with retry
-# ---------------------------
-# Helpers
-# ---------------------------
-def _get_domain_from_url(u: str) -> str:
+def get_domain_from_url(u: str) -> str:
     try:
         return urlparse(u).netloc.lower().replace("www.", "")
     except Exception:
         return "unknown"
 
-
 def _slugify(s: str) -> str:
     return re.sub(r'[^a-z0-9]+', '-', (s or "").lower()).strip('-')
-
 
 def _best_identifier(raw: Dict[str, Any]) -> Optional[str]:
     for key in ("sku", "model", "upc", "ean", "mpn", "item_id", "id", "productId"):
@@ -285,7 +324,6 @@ def _best_identifier(raw: Dict[str, Any]) -> Optional[str]:
         if v:
             return str(v).strip().lower()
     return None
-
 
 def normalize_product_key(scrape_result: Dict[str, Any]) -> str:
     raw = scrape_result.get("raw") or {}
@@ -305,34 +343,22 @@ def normalize_product_key(scrape_result: Dict[str, Any]) -> str:
     price = scrape_result.get("current_price") or 0
     return f"UNK::{site}::{int(price)}"
 
-# --- add near the top of the file with other helpers ---
 def _parse_price_string(s: str) -> Optional[float]:
-    """
-    Robust price string parser.
-    Handles NBSP, commas/dots, 'N' or 'NGN' tokens, and chooses the longest numeric piece.
-    Returns float or None.
-    """
     if not s or not isinstance(s, str):
         return None
-    # Normalize common whitespace (including NBSP) and remove non-digits except dot/comma
     s = s.replace('\xa0', ' ').strip()
-    # Find numeric pieces like 1,234.56 or 1234 or 1.234
-    m = re.findall(r"[\d\.,]+", s)
+    m = re.findall(r"[\d.,]+", s)
     if not m:
         return None
-    # choose the longest numeric piece (usually the full price)
     num = max(m, key=len)
     try:
-        # If both comma and dot exist and dot appears after the last comma, treat commas as thousands sep
         if ',' in num and '.' in num and num.rfind('.') > num.rfind(','):
             clean = num.replace(',', '')
         elif num.count(',') > 0 and num.count('.') == 0:
-            # Ambiguous like "1,234" - remove commas as thousands sep
             clean = num.replace(',', '')
         else:
             clean = num
-        # final safe replace any stray non-digit/dot
-        clean = re.sub(r"[^\d\.]", "", clean)
+        clean = re.sub(r"[^\d.]", "", clean)
         if clean == "":
             return None
         v = float(clean)
@@ -340,21 +366,12 @@ def _parse_price_string(s: str) -> Optional[float]:
     except Exception:
         return None
 
-
 def _split_concatenated_numeric_token(token: str) -> List[float]:
-    """
-    When page text collapsed two adjacent price elements into one numeric token
-    like '270000290000', attempt to split into plausible pairs (current, previous).
-    Returns [current, previous] (floats) for the best candidate, or [] if none found.
-    Heuristic: try all splits with at least 3 digits each, keep pairs where both >= 10,
-    then choose the split with smallest absolute difference.
-    """
     cleaned = re.sub(r"[^\d]", "", token)
     n = len(cleaned)
     results = []
-    if n < 6:  # too short to represent two prices
+    if n < 6:
         return []
-    # try splits leaving at least 3 digits on each side
     for i in range(3, n - 2):
         a = cleaned[:i]
         b = cleaned[i:]
@@ -372,31 +389,16 @@ def _split_concatenated_numeric_token(token: str) -> List[float]:
     best = min(results, key=lambda p: abs(p[0] - p[1]))
     return [float(best[0]), float(best[1])]
 
-
 def _gather_price_candidates_from_dom(soup: BeautifulSoup) -> List[float]:
-    """
-    Find elements likely containing prices and parse them individually.
-    Returns a list of parsed prices (floats). Attempts to avoid concatenation issues
-    by parsing element-level text where possible and attempting splits when necessary.
-    """
     selectors = [
-        "span.prc",
-        "span.price",
-        "div.price",
-        "div.prc",
-        ".product-price",
-        ".price",
-        ".prc",
-        "span[class*='price']",
-        "div[class*='price']",
-        "span[class*='prc']",
-        "span[class*='old-price']",
-        ".price--was",
-        "span[class*='_3e_22_199e7']",
-        "[data-testid*='price']"
+        "span.prc", "span.price", "div.price", "div.prc", ".product-price",
+        ".price", ".prc", "span[class*='price']", "div[class*='price']",
+        "span[class*='prc']", "span[class*='old-price']", ".price--was",
+        "span[class*='_3e_22_199e7']", "[data-testid*='price']"
     ]
     found: List[float] = []
     seen_texts = set()
+    
     for sel in selectors:
         for el in soup.select(sel):
             txt = el.get_text(" ", strip=True)
@@ -407,13 +409,11 @@ def _gather_price_candidates_from_dom(soup: BeautifulSoup) -> List[float]:
             if p:
                 found.append(p)
             else:
-                # maybe element text collapsed two numbers — try splitting numeric tokens inside
-                for token in re.findall(r"[\d\.,]{6,}", txt):
+                for token in re.findall(r"[\d.,]{6,}", txt):
                     split = _split_concatenated_numeric_token(token)
                     if split:
                         found.extend(split)
-
-    # Heuristic: look for sibling price elements inside the same container
+    
     for container in soup.select("div, section, li"):
         price_children = []
         for child in container.find_all(True, recursive=False):
@@ -431,24 +431,19 @@ def _gather_price_candidates_from_dom(soup: BeautifulSoup) -> List[float]:
                             price_children.extend(split)
         if len(price_children) >= 2:
             found.extend(price_children)
-
+    
     return found
 
-def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain: str, page_text: str, current_price: Optional[float]) -> Optional[float]:
-    """
-    Try many heuristics to find a 'struck' / earlier / list price on the page.
-    Returns float or None.
-    """
+def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain: str, 
+                           page_text: str, current_price: Optional[float]) -> Optional[float]:
     candidates: List[float] = []
-
-    # 1) JSON-LD common fields
+    
     try:
         if isinstance(json_ld, dict):
             offers = json_ld.get("offers")
             if offers:
                 offers_list = offers if isinstance(offers, list) else [offers]
                 for offer in offers_list:
-                    # Check common price fields
                     for key in ("priceBeforeDiscount", "listPrice", "originalPrice", "highPrice"):
                         v = offer.get(key)
                         if isinstance(v, (int, float)):
@@ -456,8 +451,6 @@ def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain
                         elif isinstance(v, str):
                             p = _parse_price_string(v)
                             if p: candidates.append(p)
-                    
-                    # nested priceSpecification
                     ps = offer.get("priceSpecification")
                     if isinstance(ps, dict):
                         v = ps.get("price") or ps.get("value")
@@ -465,24 +458,21 @@ def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain
                         if p: candidates.append(p)
     except Exception:
         pass
-
-    # 2) DOM-based element extraction (preferred)
+    
     try:
         dom_prices = _gather_price_candidates_from_dom(soup)
         if dom_prices:
             candidates.extend(dom_prices)
     except Exception:
         pass
-
-    # 3) Semantic HTML tags often used for struck price
+    
     for tag in ("del", "s", "strike"):
         for el in soup.find_all(tag):
             txt = el.get_text(" ", strip=True)
             p = _parse_price_string(txt)
             if p:
                 candidates.append(p)
-
-    # 4) Class/attribute patterns (extra coverage)
+    
     class_selectors = [
         "[class*='old-price']", "[class*='was-price']", "[class*='wasprice']",
         "[class*='strike']", "[class*='list-price']", "[class*='regular-price']",
@@ -494,20 +484,16 @@ def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain
             txt = el.get_text(" ", strip=True)
             p = _parse_price_string(txt)
             if p: candidates.append(p)
-
-    # 5) Inline label-based fallbacks
-    # strictly require a currency symbol or label nearby to avoid phone numbers
+    
     label_patterns = [
         r"(?:was|old|list|rrp)\s*[:\-\u2014]?\s*(?:₦|NGN|N)?\s*([\d\.,]+)",
-        r"(?:₦|NGN|N)\s*([\d\.,]+)", # strict currency match
+        r"(?:₦|NGN|N)\s*([\d\.,]+)",
     ]
     for pat in label_patterns:
         for m in re.findall(pat, page_text, flags=re.IGNORECASE):
             p = _parse_price_string(m)
             if p: candidates.append(p)
-
-    # 6) Page text fallback - REMOVED the "naked" number scan to prevent phone number matches
-    # Only keep the specific split logic for concatenated currency strings
+    
     for m in re.findall(r"(?:₦|NGN|N)\s*[\d\.,]+\s*(?:₦|NGN|N)\s*[\d\.,]+", page_text):
         parts = re.findall(r"[\d\.,]+", m)
         if len(parts) >= 2:
@@ -515,54 +501,37 @@ def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain
             p2 = _parse_price_string(parts[1])
             if p1: candidates.append(p1)
             if p2: candidates.append(p2)
-
-    # --- CLEANUP & SANITY CHECK ---
-    cleaned: List[float] = []
     
-    # Define a sane upper limit multiplier. 
-    # If previous price is > 10x current price, it's likely a phone number or error.
-    # Exception: If current_price is very low (e.g. < 1000), 10x might still be valid, 
-    # but for phones/laptops, 10x is impossible.
-    limit_multiplier = 10.0 
+    cleaned: List[float] = []
+    limit_multiplier = 10.0
     
     for c in candidates:
         try:
             v = float(c)
-            if v <= 0 or v < 10: 
+            if v <= 0 or v < 10:
                 continue
-                
-            # SANITY CHECK:
             if current_price and current_price > 0:
-                # If the candidate is less than current price, it's not a "previous" price (usually)
-                # But sometimes it is (if price increased).
-                # However, if candidate is > 10x current price, reject it.
                 if v > (current_price * limit_multiplier):
                     continue
-                
-                # Double check against specific massive numbers you saw in logs (optional hard block)
-                if v > 1_000_000_000: # 1 Billion threshold
-                     continue
-
+                if v > 1_000_000_000:
+                    continue
             cleaned.append(v)
         except Exception:
             continue
-
+    
     if not cleaned:
         return None
-
-    # Usually previous price is the highest valid number found
-    best_guess = max(cleaned)
     
-    # Final logical check: if best guess is same as current, return None
+    best_guess = max(cleaned)
     if current_price and abs(best_guess - current_price) < 1.0:
         return None
-        
     return best_guess
 
-# ---------------------------
-# Binance scraper (unchanged)
-# ---------------------------
-def _scrape_binance_ref(ref: str) -> Dict[str, Any]:
+# ═══════════════════════════════════════════════════════════════════════════
+# E-COMMERCE SCRAPERS
+# ═══════════════════════════════════════════════════════════════════════════
+
+def scrape_binance_ref(ref: str) -> Dict[str, Any]:
     symbol = None
     if ref.upper().startswith("SYMBOL:"):
         symbol = ref.split(":", 1)[1].strip().upper()
@@ -575,15 +544,15 @@ def _scrape_binance_ref(ref: str) -> Dict[str, Any]:
                     symbol = part.split("=", 1)[1].upper()
                     break
             if not symbol:
-                m = re.search(r'/trade/([A-Z0-9_]+)', p.path or "")
+                m = re.search(r'/trade/([A-Z0-9]+)', p.path or "")
                 if m:
                     symbol = m.group(1).replace("_", "").upper()
         except Exception:
             pass
-
+    
     if not symbol:
         raise ValueError(f"Could not extract Binance symbol from {ref}")
-
+    
     try:
         resp = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}", timeout=10)
         resp.raise_for_status()
@@ -592,7 +561,7 @@ def _scrape_binance_ref(ref: str) -> Dict[str, Any]:
     except Exception as e:
         LOG.exception("Binance scrape failed")
         raise ScrapeError(f"Binance API error: {e}")
-
+    
     return {
         "title": symbol,
         "current_price": price,
@@ -604,234 +573,28 @@ def _scrape_binance_ref(ref: str) -> Dict[str, Any]:
         "raw": data,
     }
 
-
-# ---------------------------
-# Core fetch with cloudscraper
-# ---------------------------
-# ---------- New globals / config ----------
-# Expanded with latest 2025-2026 UAs from reliable sources (Chrome 120+, Firefox, mobile for diversity)
-_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:116.0) Gecko/20100101 Firefox/116.0",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    # New: Latest from 2025-2026 (Chrome 120-144 variants, Edge, mobile)
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Vivaldi/7.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",  # Mobile for variety
-    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",  # Android mobile
-]
-
-# Proxies: Keep as is (empty OK), but add fallback log if none
-_SCRAPER_PROXIES = os.environ.get("SCRAPER_PROXIES", "") and [p.strip() for p in os.environ.get("SCRAPER_PROXIES").split(",") if p.strip()] or []
-if not _SCRAPER_PROXIES:
-    LOG.debug("No proxies configured — running proxy-free mode")
-# reuse one scraper instance so cookies / session are kept between calls
-_SCRAPER_SINGLETON = {"scraper": None, "created_with": None}
-_SCRAPER_LOCK = asyncio.Lock() if "asyncio" in globals() else None
-
-# ---------- helper functions ----------
-def _create_scraper(interpreter: str = "js2py"):
-    # Randomize browser/platform for diversity (evade pattern detection)
-    browsers = [
-        {"browser": "chrome", "platform": "windows", "mobile": False, "desktop": True},
-        {"browser": "firefox", "platform": "linux", "mobile": False, "desktop": True},
-        {"browser": "chrome", "platform": "mac", "mobile": False, "desktop": True},
-    ]
-    browser_config = random.choice(browsers)
-    
-    s = cloudscraper.create_scraper(
-        browser=browser_config,
-        delay=random.uniform(8, 12),  # Randomize delay slightly
-        interpreter=interpreter,
-        captcha={"provider": None},
-    )
-    # Reasonable connection pool settings
-    accept_languages = ["en-US,en;q=0.9", "en-NG,en;q=0.9"]  # NG for your local sites
-    accept_encodings = ["gzip, deflate, br", "gzip, deflate"]
-    
-    s.headers.update({
-        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-        "Accept-Language": random.choice(accept_languages),
-        "Accept-Encoding": random.choice(accept_encodings),
-        "Referer": random.choice(["https://www.google.com/", "https://www.google.com.ng/"]),  # NG variant
-        "Connection": "keep-alive",
-        "Upgrade-Insecure-Requests": "1",
-        "Sec-Fetch-Dest": "document",  # New: Modern fetch metadata
-        "Sec-Fetch-Mode": "navigate",
-        "Sec-Fetch-Site": "none",
-    })
-    return s
-
-def _get_shared_scraper(interpreter="js2py"):
-    """
-    Return a shared cloudscraper instance (reused across calls so cookies persist).
-    """
-    global _SCRAPER_SINGLETON
-    if _SCRAPER_SINGLETON["scraper"] is None or _SCRAPER_SINGLETON["created_with"] != interpreter:
-        _SCRAPER_SINGLETON["scraper"] = _create_scraper(interpreter=interpreter)
-        _SCRAPER_SINGLETON["created_with"] = interpreter
-    return _SCRAPER_SINGLETON["scraper"]
-
-def _is_blocked_html(html: str) -> bool:
-    if not html:
-        return True
-    t = (html or "").lower()
-    keywords = [
-        "just a moment", "verify you are human", "attention required",
-        "checking your browser", "cloudflare", "are you human",
-        "javascript required", "enable javascript", "access denied",
-        "403", "429", "bot", "automated", "blocked", "challenge",
-        "ddos protection", "ray id", "turnstile", "captcha"  # 2026 additions
-    ]
-    return any(k in t for k in keywords)
-
-def _choose_proxy():
-    """Return a proxy dict for requests if proxies configured (rotates)."""
-    if not _SCRAPER_PROXIES:
-        return None
-    proxy = random.choice(_SCRAPER_PROXIES)
-    # cloudscraper/requests accept 'http'/'https' mapping
-    return {"http": proxy, "https": proxy}
-
-# ---------- resilient _fetch_html (drop-in replacement) ----------
-@retry(max_attempts=5, backoff=3.0)
-def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False, interpreter: str = "js2py") -> str:
-    domain = _get_domain_from_url(url)
-    # Auto-prefer Playwright for tough sites (gov, e-com)
-    tough_domains = ['konga', 'jumia', 'gov.ng', 'nysc', 'nuc', 'waec', 'neco', 'myschool', 'punchng', 'education']
-    if any(d in domain for d in tough_domains):
-        prefer_playwright_on_first_try = True
-        LOG.debug(f"Auto-preferring Playwright for tough domain: {domain}")
-
-    scraper = _get_shared_scraper(interpreter=interpreter)
-    # Longer jitter for all requests (2026 evasion)
-    time.sleep(random.uniform(1.5, 3.5))
-
-    if prefer_playwright_on_first_try:
-        try:
-            rendered = _fetch_rendered_html_sync(url)
-            if rendered and not _is_blocked_html(rendered):
-                LOG.info("Playwright primary fetch succeeded for %s", url)
-                return rendered
-            LOG.info("Playwright primary fetch returned blocked/empty; continuing with cloudscraper fallback for %s", url)
-        except Exception as e:
-            LOG.warning("Playwright primary fetch failed (continuing to cloudscraper) for %s: %s", url, e)
-
-    strategies = []
-    try:
-        random_uas = random.sample(_USER_AGENTS, min(len(_USER_AGENTS), 5))  # More samples for variety
-    except Exception:
-        random_uas = _USER_AGENTS[:1]
-    proxies_list = _SCRAPER_PROXIES or [None]
-
-    for ua in random_uas:
-        for _proxy in proxies_list:
-            strategies.append((ua, _proxy))
-
-    if not strategies:
-        strategies = [(_USER_AGENTS[0], None)]
-
-    last_exc = None
-    alt_interpreter_tried = False  # Flag to try alternate interpreter once
-
-    for idx, (ua, proxy) in enumerate(strategies, start=1):
-        # Randomized headers (more evasion)
-        headers = {
-            "User-Agent": ua,
-            "Accept": random.choice([
-                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-                "text/html,application/xhtml+xml,image/webp,image/apng,*/*;q=0.8"
-            ]),
-            "Accept-Language": random.choice(["en-US,en;q=0.9", "en-NG,en;q=0.9"]),  # NG for local sites
-            "Accept-Encoding": random.choice(["gzip, deflate, br", "gzip, deflate"]),
-            "Referer": random.choice(["https://www.google.com.ng/", "https://www.bing.com/"]),
-            "Sec-Fetch-Dest": "document",
-            "Sec-Fetch-Mode": "navigate",
-            "Sec-Fetch-Site": random.choice(["none", "same-origin"]),
-            "Upgrade-Insecure-Requests": "1",
-            "Connection": "keep-alive",
-        }
-
-        try:
-            time.sleep(random.uniform(0.5, 2.0))  # Per-attempt jitter increase
-
-            kwargs = {"headers": headers, "timeout": 60, "allow_redirects": True}  # Longer timeout
-            if proxy:
-                kwargs["proxies"] = {"http": proxy, "https": proxy}
-
-            LOG.debug("Attempt %d/%d fetching %s (ua=%s proxy=%s)", idx, len(strategies), url, ua[:40], bool(proxy))
-
-            resp = scraper.get(url, **kwargs)
-
-            status = getattr(resp, "status_code", None)
-            if status in (HTTPStatus.FORBIDDEN, HTTPStatus.TOO_MANY_REQUESTS):
-                LOG.warning("Status %s for %s (UA=%s, proxy=%s). Trying alternate strategy.", status, url, ua[:40], bool(proxy))
-                last_exc = ScrapeError(f"HTTP {status}")
-                continue
-
-            text = resp.text or ""
-            if _is_blocked_html(text):
-                LOG.warning("Blocked/Challenge page detected (UA=%s, proxy=%s) for %s. Trying alternate strategy.", ua[:40], bool(proxy), url)
-                # Try alternate interpreter once on block
-                if not alt_interpreter_tried and interpreter == "js2py":
-                    alt_interpreter_tried = True
-                    scraper = _get_shared_scraper(interpreter="nodejs")  # Switch for JS challenges
-                last_exc = ScrapeError("Blocked by anti-bot")
-                continue
-
-            return text
-
-        except requests.exceptions.RequestException as e:
-            LOG.warning("requests error for %s with ua=%s proxy=%s -> %s", url, ua[:40], bool(proxy), e)
-            last_exc = e
-            time.sleep(random.uniform(2.0, 4.0))  # Longer wait on error
-            continue
-        except Exception as e:
-            LOG.exception("Unexpected error fetching %s (ua=%s, proxy=%s): %s", url, ua[:40], bool(proxy), e)
-            last_exc = e
-            continue
-
-    # Playwright fallback (your existing, but with log fixes)
-    try:
-        LOG.info("All cloudscraper strategies exhausted or blocked for %s. Attempting Playwright fallback (sync).", url)
-        rendered = _fetch_rendered_html_sync(url)
-        if rendered and not _is_blocked_html(rendered):
-            LOG.info("Playwright fallback succeeded for %s", url)
-            return rendered
-        LOG.warning("Playwright fallback returned blocked/empty for %s", url)
-    except Exception as e:
-        LOG.exception("Playwright fallback failed for %s: %s", url, e)
-        last_exc = e
-
-    err_msg = f"All fetch strategies failed for {url}"
-    if last_exc:
-        err_msg += f": {last_exc}"
-    LOG.error(err_msg)
-    raise ScrapeError(err_msg)
-# ---------------------------
-# Main e-commerce scraper (multi-layer extraction)
-# ---------------------------
-def scrape_ecommerce(url: str) -> Dict[str, Any]:
-    domain = _get_domain_from_url(url)
+async def scrape_ecommerce(url: str) -> Dict[str, Any]:
+    domain = get_domain_from_url(url)
     if not any(s in domain for s in SUPPORTED_SITES):
         raise NotImplementedError(f"Unsupported site: {domain}. Add to SUPPORTED_SITES.")
-
+    
     try:
-        html = _fetch_html(url)
+        if any(d in domain for d in ("jumia", "konga")):
+            try:
+                html = await fetch_with_playwright_aggressive(url, retries=3)
+            except Exception:
+                html = await _fetch_html(url)
+        else:
+            html = await _fetch_html(url)
     except Exception as e:
         raise NoDataError(f"Failed to fetch page: {e}")
-
+    
     soup = BeautifulSoup(html, "lxml")
-
-    # Block detection
+    
     title_str = soup.title.string.lower() if soup.title else ""
     if any(kw in title_str for kw in ["just a moment", "verify", "cloudflare", "attention required", "challenge"]):
         raise NoDataError("Blocked by Cloudflare/anti-bot protection")
-
+    
     product = {
         "title": "Product",
         "current_price": None,
@@ -845,7 +608,7 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
         "image": None,
         "description": "",
     }
-
+    
     json_ld_data = None
     for script in soup.find_all("script", type="application/ld+json"):
         try:
@@ -871,8 +634,7 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
                             avail = offer.get("availability", "")
                             if "OutOfStock" in avail or "Discontinued" in avail:
                                 product["stock_status"] = "out_of_stock"
-
-                    # images from JSON-LD
+                    
                     img_field = item.get("image") or item.get("images")
                     if img_field:
                         if isinstance(img_field, str):
@@ -884,13 +646,12 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
                     break
         except Exception:
             continue
-
-    # Open Graph / meta tags
+    
     if product["title"] == "Product":
         og_title = soup.find("meta", property="og:title")
         if og_title and og_title.get("content"):
             product["title"] = og_title["content"].strip()
-
+    
     if product["current_price"] is None:
         og_price = soup.find("meta", property="og:price:amount")
         if og_price and og_price.get("content"):
@@ -898,14 +659,12 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
                 product["current_price"] = float(og_price["content"])
             except:
                 pass
-
-    # Meta description fallback
+    
     if not product["description"]:
         meta_desc = soup.find("meta", attrs={"name": "description"})
         if meta_desc and meta_desc.get("content"):
             product["description"] = meta_desc["content"].strip()
-
-    # Site-specific description
+    
     if not product["description"]:
         if "jumia" in domain:
             desc_sel = soup.select_one("div.markup, div.-pvs, section.-phm.-pvxl, div.-hr.-mtm.-pvs")
@@ -915,8 +674,7 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
             desc_sel = soup.select_one("div.description, div._2f369_2Dp2R, div.product-description")
             if desc_sel:
                 product["description"] = desc_sel.get_text(separator="\n", strip=True)
-
-    # Image extraction
+    
     def _add_image_candidate(src):
         if not src:
             return
@@ -926,11 +684,11 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
                 product["images"].append(abs_url)
         except Exception:
             pass
-
+    
     og_image = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"})
     if og_image and og_image.get("content"):
         _add_image_candidate(og_image["content"])
-
+    
     if "jumia" in domain:
         possible = soup.select("img[class*='prd-img'], img[class*='image'], img[class*='gallery'], img")
         for img in possible:
@@ -943,7 +701,7 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
             src = img.get("data-src") or img.get("src") or img.get("data-original")
             if src and len(product["images"]) < 6:
                 _add_image_candidate(src)
-
+    
     if not product["images"]:
         img_tags = soup.find_all("img")
         seen = set()
@@ -954,7 +712,6 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
             src = urljoin(url, src.strip())
             if src in seen:
                 continue
-            # Filter small icons
             w = img.get("width") or img.get("data-width")
             h = img.get("height") or img.get("data-height")
             try:
@@ -968,50 +725,37 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
             product["images"].append(src)
             if len(product["images"]) >= 6:
                 break
-
-    # -------------------------------------------------------
-    # CRITICAL FIX: CURRENT PRICE EXTRACTION
-    # -------------------------------------------------------
+    
+    # CURRENT PRICE EXTRACTION
     if product["current_price"] is None:
-        
-        # Jumia specific
         if "jumia" in domain:
             selectors = ["span.-b", ".-fs24", ".prc", ".-prc", "div.prc"]
             for sel in selectors:
                 el = soup.select_one(sel)
                 if el:
-                    # FIX: Use " " separator so ₦45000₦50000 becomes "₦45000 ₦50000"
-                    text = el.get_text(" ", strip=True) 
+                    text = el.get_text(" ", strip=True)
                     p = _parse_price_string(text)
                     if p:
                         product["current_price"] = p
                         break
-
-        # Konga specific
+        
         if "konga" in domain and product["current_price"] is None:
             selectors = ["span._3e_22_199e7", "._3e_22_199e7", "h4._44738_3988u", "div.price", "[class*='price']"]
             for sel in selectors:
                 el = soup.select_one(sel)
                 if el:
-                    # FIX: Force space between elements inside the tag
                     text = el.get_text(" ", strip=True)
-                    
-                    # FIX: Use robust parser instead of blind regex replace
                     p = _parse_price_string(text)
-                    
-                    # FIX: If parser still returns a massive number (concatenation happened in text source), try split
-                    if p and p > 100_000_000: 
+                    if p and p > 100_000_000:
                         split = _split_concatenated_numeric_token(str(int(p)))
                         if split:
-                            p = min(split) # Current price is usually the lower one (discounted)
-                            
+                            p = min(split)
                     if p:
                         product["current_price"] = p
                         break
-
-        # Generic regex (last resort)
+        
         if product["current_price"] is None:
-            page_text = soup.get_text(" ", strip=True) # Use space separator here too!
+            page_text = soup.get_text(" ", strip=True)
             matches = re.findall(r"(?:₦|NGN)[\s]?([\d,]+\.?\d*)", page_text)
             if matches:
                 prices = []
@@ -1022,39 +766,30 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
                     except:
                         pass
                 if prices:
-                    # usually the largest price on page is NOT the current price (it might be old price), 
-                    # but for generic fallback, it's risky. 
-                    # Let's try to pick the most frequent or reasonable one, but max() is the standard fallback behavior.
                     product["current_price"] = max(prices)
-
-    # -------------------------------------------------------
-    # PREVIOUS PRICE EXTRACTION (With Sanity Checks)
-    # -------------------------------------------------------
-    page_text = soup.get_text(" ", strip=True) # Ensure spaces
     
-    # Pass current_price to helper for validation
+    # PREVIOUS PRICE EXTRACTION
+    page_text = soup.get_text(" ", strip=True)
     prev_price = _extract_previous_price(soup, json_ld_data, domain, page_text, product["current_price"])
-    
     if prev_price:
         product["previous_price"] = prev_price
         LOG.info("Found previous price: ₦%.0f for %s", prev_price, product["title"])
-
+    
     # Stock & title fallbacks
     page_text_lower = soup.get_text().lower()
     if any(phrase in page_text_lower for phrase in ["out of stock", "sold out", "unavailable", "not available"]):
         product["stock_status"] = "out_of_stock"
-
+    
     if product["title"] == "Product" or "Buy" in product["title"]:
         h1 = soup.select_one("h1.-fs20, h1.-pb10, h1.brd, .v-p-hd h1, h1")
         if h1:
             product["title"] = h1.get_text(strip=True)
         elif soup.title:
             product["title"] = soup.title.string.strip()
-
+    
     if product["current_price"] is None:
         raise NoDataError("No price found after all extraction methods")
-
-    # Clean images & set primary
+    
     cleaned = []
     seen = set()
     for i in product["images"]:
@@ -1068,39 +803,45 @@ def scrape_ecommerce(url: str) -> Dict[str, Any]:
             continue
     product["images"] = cleaned[:6]
     product["image"] = cleaned[0] if cleaned else None
-
-    # Truncate description
+    
     product["description"] = product["description"][:1500].strip()
-
     product["raw"] = {"json_ld": json_ld_data} if json_ld_data else {"snippet": product["title"]}
-
-    LOG.info("Successfully scraped %s — ₦%.0f — %s (desc len=%d)", product["title"], product["current_price"], domain, len(product["description"]))
+    
+    LOG.info("Successfully scraped %s — ₦%.0f — %s (desc len=%d)", 
+             product["title"], product["current_price"], domain, len(product["description"]))
     return product
 
-
-# ---------------------------
-# Public scrape_product router
-# ---------------------------
-def scrape_product(url: str) -> Dict[str, Any]:
+async def scrape_product(url: str) -> Dict[str, Any]:
     if not url or not isinstance(url, str):
         raise ValueError("Invalid URL")
-
+    
     url = url.strip()
     low = url.lower()
+    
+    if low.startswith("symbol:") or "binance" in get_domain_from_url(url):
+        return scrape_binance_ref(url)
+    
+    return await scrape_ecommerce(url)
 
-    if low.startswith("symbol:") or "binance" in _get_domain_from_url(url):
-        return _scrape_binance_ref(url)
+def safe_scrape_product(url: str) -> Tuple[bool, Optional[Dict], Optional[str]]:
+    try:
+        product = asyncio.run(scrape_product(url))
+        return True, product, None
+    except NoDataError as e:
+        LOG.info("NoDataError: %s", e)
+        return False, None, str(e)
+    except Exception as e:
+        LOG.exception("Unexpected scrape error")
+        return False, None, f"Error: {e}"
 
-    return scrape_ecommerce(url)
+# ═══════════════════════════════════════════════════════════════════════════
+# CHANGE DETECTION & DEAL SCORING
+# ═══════════════════════════════════════════════════════════════════════════
 
-
-# ---------------------------
-# Compute changes & deal score (unchanged from your original)
-# ---------------------------
 def compute_changes(old_data: Optional[Dict], new_data: Dict) -> Dict[str, Any]:
     if new_data is None or not isinstance(new_data, dict):
         raise ValueError("new_data must be a dict")
-
+    
     if old_data is None:
         return {
             "changed": True,
@@ -1108,24 +849,24 @@ def compute_changes(old_data: Optional[Dict], new_data: Dict) -> Dict[str, Any]:
             "price_diff_percent": 0.0,
             "significant_change": True,
         }
-
+    
     changed = False
     what_changed = []
     price_diff_percent = 0.0
-
+    
     old_price = old_data.get("current_price")
     new_price = new_data.get("current_price")
-
+    
     try:
         old_price_num = float(old_price) if old_price is not None else None
     except (ValueError, TypeError):
         old_price_num = None
-
+    
     try:
         new_price_num = float(new_price) if new_price is not None else None
     except (ValueError, TypeError):
         new_price_num = None
-
+    
     if old_price_num != new_price_num:
         changed = True
         what_changed.append("price")
@@ -1133,19 +874,19 @@ def compute_changes(old_data: Optional[Dict], new_data: Dict) -> Dict[str, Any]:
             price_diff_percent = round(((old_price_num - new_price_num) / old_price_num) * 100, 2)
         else:
             price_diff_percent = 0.0
-
+    
     old_stock = old_data.get("stock_status")
     new_stock = new_data.get("stock_status")
     if old_stock != new_stock:
         changed = True
         what_changed.append("stock")
-
+    
     significant = False
     if isinstance(price_diff_percent, (int, float)) and abs(price_diff_percent) >= (MIN_CHANGE_TO_ALERT or 0):
         significant = True
     if "stock" in what_changed:
         significant = True
-
+    
     return {
         "changed": changed,
         "what_changed": what_changed,
@@ -1153,16 +894,15 @@ def compute_changes(old_data: Optional[Dict], new_data: Dict) -> Dict[str, Any]:
         "significant_change": significant,
     }
 
-
 def calculate_deal_score(price_diff_percent: Optional[float], historical_avg: Optional[float] = None) -> str:
     try:
         drop = float(price_diff_percent or 0.0)
     except (ValueError, TypeError):
         drop = 0.0
-
+    
     if drop <= 0:
         return "none"
-
+    
     if drop >= (HIGH_DEAL_THRESHOLD or 50):
         return "high"
     if drop >= (MEDIUM_DEAL_THRESHOLD or 25):
@@ -1171,20 +911,9 @@ def calculate_deal_score(price_diff_percent: Optional[float], historical_avg: Op
         return "low"
     return "none"
 
-
-# ---------------------------
-# Safe wrapper
-# ---------------------------
-def safe_scrape_product(url: str) -> Tuple[bool, Optional[Dict], Optional[str]]:
-    try:
-        product = scrape_product(url)
-        return True, product, None
-    except NoDataError as e:
-        LOG.info("NoDataError: %s", e)
-        return False, None, str(e)
-    except Exception as e:
-        LOG.exception("Unexpected scrape error")
-        return False, None, f"Error: {e}"
+# ═══════════════════════════════════════════════════════════════════════════
+# ENERGY SCRAPERS
+# ═══════════════════════════════════════════════════════════════════════════
 
 def _extract_naira_amount(text: str) -> Optional[float]:
     if not text:
@@ -1221,22 +950,16 @@ def _detect_block(soup: BeautifulSoup) -> Optional[str]:
     return None
 
 def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/") -> Dict[str, Any]:
-    """
-    Parse fuel price from FuelPriceWatch live app page.
-    Improved change detection: uses label-specific regex ("today" for absolute, "from last period" for percent)
-    to avoid picking changes from Diesel/Kerosene sections.
-    """
     soup = BeautifulSoup(html, "lxml")
     page_text = soup.get_text("\n", strip=True)
-
-    # Price extraction (unchanged - reliable)
+    
     price_patterns = [
         r"Average\s+Petrol\s+Price\s*₦?\s*([0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)",
         r"Average\s+Petrol\s+Price.{0,300}₦\s*([0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)",
         r"₦\s*([0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)\s*Average\s+Petrol\s+Price",
         r"₦\s*([0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)\s*(?:PMS|Petrol)",
     ]
-
+    
     v = None
     for pat in price_patterns:
         m = re.search(pat, page_text, re.I | re.DOTALL)
@@ -1245,48 +968,25 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
             v = _parse_price_string(price_str)
             if v and 600 <= v <= 1500:
                 break
-
+    
     if v is None:
         return {"error": "no_price"}
-
+    
     price_formatted = f"₦{v:,.2f}"
-
-    # === IMPROVED CHANGE EXTRACTION ===
+    
     perc_change = "N/A"
     abs_change = "N/A"
-
-    # Specific: percent with "from last period" label (only matches Petrol section)
+    
     perc_m = re.search(r"([+-]\s*[\d\.]+\s*%)\s*from last period", page_text, re.I)
     if perc_m:
         perc_change = perc_m.group(1).strip()
-
-    # Specific: absolute with "today" label (only matches Petrol section)
+    
     abs_m = re.search(r"([+-]\s*₦\s*[\d\.,]+\.?\d*)\s*today", page_text, re.I)
     if abs_m:
         abs_change = abs_m.group(1).strip()
-
-    # Fallback: if labels missing (unlikely), use old context-based method
-    if perc_change == "N/A" or abs_change == "N/A":
-        # Find context around price for fallback
-        price_match = re.search(r"Average\s+Petrol\s+Price", page_text, re.I)
-        if price_match:
-            start = max(0, price_match.start() - 300)
-            end = price_match.end() + 500
-            context = page_text[start:end]
-
-            change_matches = re.findall(r"([+-]\s*[\d\.]+\s*%|[+-]?\s*₦?\s*[\d\.,]+\.?\d*)", context, re.I)
-            for match in change_matches:
-                cleaned = match.strip()
-                if "%" in cleaned and perc_change == "N/A":
-                    perc_change = cleaned
-                elif "₦" in cleaned or cleaned.startswith(("+", "-")) and abs_change == "N/A":
-                    abs_change = cleaned
-
-    LOG.info(
-        "FuelPriceWatch parsed → %s | Percent: %s | Absolute: %s",
-        price_formatted, perc_change, abs_change
-    )
-
+    
+    LOG.info("FuelPriceWatch parsed → %s | Percent: %s | Absolute: %s", price_formatted, perc_change, abs_change)
+    
     return {
         "source": url,
         "price_raw": v,
@@ -1296,53 +996,18 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
         "last_updated": "Live data",
     }
 
-def _parse_total(html: str) -> Dict[str, Any]:
-    soup = BeautifulSoup(html, "lxml")
-    block = _detect_block(soup)
-    if block:
-        return {"source": "TotalEnergies (or marketer)", "error": block, "price_raw": None, "price_str": None, "last_updated": None, "raw": None}
-
-    text = soup.get_text(" ", strip=True)
-    m = re.search(r"(?:PMS|Petrol|Price).{0,120}?(?:₦|NGN|N)\s*[0-9][0-9,\.]*", text, flags=re.I)
-    if m:
-        value = _extract_naira_amount(m.group(0))
-    else:
-        value = _extract_naira_amount(text)
-
-    return {"source": "TotalEnergies (or marketer)", "price_raw": value, "price_str": _format_naira(value) if value else None, "last_updated": None, "raw": None}
-
-def _parse_oando(html: str) -> Dict[str, Any]:
-    soup = BeautifulSoup(html, "lxml")
-    block = _detect_block(soup)
-    if block:
-        return {"source": "Marketer (Oando/Mobil/etc)", "error": block, "price_raw": None, "price_str": None, "last_updated": None, "raw": None}
-
-    text = soup.get_text(" ", strip=True)
-    m = re.search(r"(?:PMS|Petrol|Fuel Price).{0,120}?(?:₦|NGN|N)\s*[0-9][0-9,\.]*", text, flags=re.I)
-    if m:
-        value = _extract_naira_amount(m.group(0))
-    else:
-        value = _extract_naira_amount(text)
-
-    return {"source": "Marketer (Oando/Mobil/etc)", "price_raw": value, "price_str": _format_naira(value) if value else None, "last_updated": None, "raw": None}
-# ---------------------------
-# Async entrypoint for fuel scrapes (uses the sync _fetch_html in executor)
-# ---------------------------
-FUEL_SITE_SOURCES = [
-    {"url": "https://app.fuelpricewatch.com/", "parser": _parse_fuelpricewatch},
-    #{"url": "https://www.totalenergies.com.ng/en", "parser": _parse_total},
-]
+@retry(max_attempts=4, backoff=2.0)
+async def _fetch_lpg_html() -> str:
+    url = "https://lpginnigeria.com/chart"
+    return await _fetch_html(url)
 
 async def scrape_fuel_prices() -> Dict[str, Any]:
     app_url = "https://app.fuelpricewatch.com/"
     
     try:
-        # Primary method: Try the live rendered app first (most up-to-date)
-        html = await _fetch_rendered_html(app_url)
+        html = await fetch_with_playwright_aggressive(app_url, retries=3)
         result = _parse_fuelpricewatch(html, url=app_url)
-        
         if result.get("price_raw") is not None:
-            # Success! Return immediately — no need for fallback
             return {
                 "avg_petrol": result["price_str"],
                 "avg_raw": result["price_raw"],
@@ -1352,20 +1017,13 @@ async def scrape_fuel_prices() -> Dict[str, Any]:
                 "sources": [result],
                 "debug": {"method": "live_app_playwright"}
             }
-            
     except Exception as e:
-        LOG.exception(f"Live app scrape failed: {e}")
-        LOG.warning("Playwright app failed - falling back to static index")
-
-    # Fallback: Only reached if primary method failed
+        LOG.debug("Playwright app fetch failed, falling back to index: %s", e)
+    
     index_url = "https://www.fuelpricewatch.com/fuel-price-index-nigeria"
     try:
-        loop = asyncio.get_running_loop()
-        index_html = await loop.run_in_executor(None, _fetch_html, index_url)  # cloudscraper
-        # Note: We pass the original app_url so the source link remains clickable
-        # (even though this is the index page, the data is the same)
+        index_html = await _fetch_html(index_url)
         index_result = _parse_fuelpricewatch(index_html, url=app_url)
-        
         if index_result.get("price_raw") is not None:
             return {
                 "avg_petrol": index_result["price_str"],
@@ -1376,11 +1034,9 @@ async def scrape_fuel_prices() -> Dict[str, Any]:
                 "sources": [index_result],
                 "debug": {"method": "static_index_fallback"}
             }
-            
     except Exception as e:
-        LOG.exception(f"Index fallback failed: {e}")
-
-    # Ultimate failure case
+        LOG.debug("Index fallback failed: %s", e)
+    
     return {
         "avg_petrol": "N/A",
         "change_percent": "N/A",
@@ -1392,14 +1048,9 @@ async def scrape_fuel_prices() -> Dict[str, Any]:
         "debug": {"method": "failed"}
     }
 
-def scrape_lpg_prices() -> Dict[str, Any]:
-    """
-    Scrape current LPG depot prices from lpginnigeria.com/chart (Markdown-based table).
-    Integrates robust parsing: tries HTML table first, then regex fallback for Markdown/text.
-    Calculates average depot price per 20MT (excluding 0/invalid), per kg, and Lagos retail estimate.
-    """
+async def scrape_lpg_prices() -> Dict[str, Any]:
     try:
-        html = _fetch_lpg_html()
+        html = await _fetch_lpg_html()
     except Exception as e:
         LOG.error(f"Failed to fetch LPG chart: {e}")
         return {
@@ -1410,11 +1061,10 @@ def scrape_lpg_prices() -> Dict[str, Any]:
             "last_updated": "N/A",
             "source": "https://lpginnigeria.com/chart",
         }
-
+    
     soup = BeautifulSoup(html, "lxml")
     page_text = soup.get_text("\n", strip=True)
-
-    # Detect block
+    
     block = _detect_block(soup)
     if block:
         LOG.warning(f"LPG chart blocked: {block}")
@@ -1426,34 +1076,31 @@ def scrape_lpg_prices() -> Dict[str, Any]:
             "last_updated": "N/A",
             "source": "https://lpginnigeria.com/chart",
         }
-
-    # Extract Date (Robust regex handling day name, brackets, commas)
+    
     date_match = re.search(r"(?:\[)?(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)?(?:\])?,\s*\d{1,2}(st|nd|rd|th)?\s+\w+\s*,\s*\d{4}", page_text, re.IGNORECASE)
     last_updated = date_match.group(0).strip("[] ,") if date_match else "Today"
-
-    # Parse Data: Try HTML table first, then fallback to regex on page_text (for Markdown)
+    
     depots = []
     valid_prices = []
-
-    # Attempt HTML Table Parsing (if site reverts to <table>)
+    
     target_table = None
     for table in soup.find_all("table"):
         header_text = table.get_text().lower()
         if "depot" in header_text and "price" in header_text:
             target_table = table
             break
-
+    
     if target_table:
-        for row in target_table.find_all("tr")[1:]:  # Skip header
+        for row in target_table.find_all("tr")[1:]:
             cols = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
-            if len(cols) >= 4:  # Expect depot, price, diff, diff%
+            if len(cols) >= 4:
                 depot_name = cols[0]
                 price_raw = cols[1]
                 diff_str = cols[2]
                 diff_pct_str = cols[3]
-
+                
                 price = _parse_price_string(price_raw) or 0.0
-
+                
                 depots.append({
                     "depot": depot_name,
                     "price_20mt": price,
@@ -1461,17 +1108,15 @@ def scrape_lpg_prices() -> Dict[str, Any]:
                     "diff": diff_str,
                     "diff_pct": diff_pct_str,
                 })
-
+                
                 if price > 10_000_000 and price < 50_000_000 and "infinity" not in diff_pct_str.lower():
                     valid_prices.append(price)
-
-    # Regex Fallback (for current Markdown format)
+    
     if not valid_prices:
-        # Matches rows like "Depot Name 16,900,000 +200,000 +1.20%"
         row_matches = re.findall(r"([A-Z][A-Za-z\s\(\)&]+)\s+(\d{1,2}(?:,\d{3})*)\s+([+-]?\d{1,3}(?:,\d{3})*)\s+([+-]?\d+\.\d+%|Infinity%)", page_text)
         for depot_name, price_str, diff_str, diff_pct_str in row_matches:
             price = _parse_price_string(price_str) or 0.0
-
+            
             depots.append({
                 "depot": depot_name.strip(),
                 "price_20mt": price,
@@ -1479,12 +1124,12 @@ def scrape_lpg_prices() -> Dict[str, Any]:
                 "diff": diff_str,
                 "diff_pct": diff_pct_str,
             })
-
+            
             if price > 10_000_000 and price < 50_000_000 and "infinity" not in diff_pct_str.lower():
                 valid_prices.append(price)
-
+    
     if not valid_prices:
-        LOG.warning("No valid depot prices found after table and regex parsing")
+        LOG.warning("No valid depot prices found")
         return {
             "error": "no_valid_prices",
             "avg_depot_20mt": "N/A",
@@ -1494,25 +1139,22 @@ def scrape_lpg_prices() -> Dict[str, Any]:
             "source": "https://lpginnigeria.com/chart",
             "depots": depots,
         }
-
-    # Calculations
+    
     avg_20mt = sum(valid_prices) / len(valid_prices)
-    per_kg = avg_20mt / 20_000  # 20MT = 20,000 kg
-
+    per_kg = avg_20mt / 20_000
+    
     margin_low = 400
     margin_high = 600
     retail_low = per_kg + margin_low
     retail_high = per_kg + margin_high
-
+    
     avg_20mt_str = f"₦{int(round(avg_20mt)):,}"
     per_kg_str = f"₦{per_kg:,.2f}"
     retail_range_str = f"₦{int(round(retail_low)):,} – ₦{int(round(retail_high)):,} per kg"
-
-    LOG.info(
-        "LPG scraped → Avg 20MT: %s | Per kg: %s | Lagos retail est: %s | Date: %s | Valid depots: %d",
-        avg_20mt_str, per_kg_str, retail_range_str, last_updated, len(valid_prices)
-    )
-
+    
+    LOG.info("LPG scraped → Avg 20MT: %s | Per kg: %s | Lagos retail est: %s | Date: %s | Valid depots: %d",
+             avg_20mt_str, per_kg_str, retail_range_str, last_updated, len(valid_prices))
+    
     return {
         "avg_depot_20mt": avg_20mt_str,
         "avg_depot_per_kg": per_kg_str,
@@ -1525,36 +1167,189 @@ def scrape_lpg_prices() -> Dict[str, Any]:
         "source": "https://lpginnigeria.com/chart",
         "depots": depots,
         "valid_depots_count": len(valid_prices),
-        "note": "Lagos retail estimate calculated as: average depot price per kg + ₦400–600/kg typical markup (for transport, bottling, dealer margin, etc.)",
+        "note": "Lagos retail estimate calculated as: average depot price per kg + ₦400–600/kg typical markup",
+    }
+
+# ═══════════════════════════════════════════════════════════════════════════
+# SCHOOL NEWS ARTICLE EXTRACTION (IMPROVED FOR BETTER SNIPPETS)
+# ═══════════════════════════════════════════════════════════════════════════
+
+def extract_key_information(content: str) -> Dict[str, Any]:
+    """Extract structured information from article content."""
+    key_info = {
+        'dates_mentioned': [],
+        'institutions': [],
+        'exams': [],
+        'deadlines': [],
+        'important_actions': []
+    }
+    
+    if not content:
+        return key_info
+    
+    # Extract dates
+    dates = _DATE_RE.findall(content) if _DATE_RE else []
+    found_dates = []
+    for d in dates:
+        if isinstance(d, tuple):
+            for part in d:
+                if part and part.strip():
+                    found_dates.append(part.strip())
+        elif isinstance(d, str):
+            found_dates.append(d)
+    key_info['dates_mentioned'] = list(dict.fromkeys(found_dates))[:5]
+    
+    # Extract institutions
+    institutions_pattern = r'\b([A-Z][A-Za-z]+\s+(?:University|Polytechnic|College|Institute))\b'
+    key_info['institutions'] = list(set(re.findall(institutions_pattern, content)))[:10]
+    
+    # Extract exam mentions
+    exam_pattern = r'\b(JAMB|WAEC|NECO|POST-UTME|UTME|GCE|BECE)\b'
+    key_info['exams'] = list(set(re.findall(exam_pattern, content, re.I)))
+    
+    # Extract deadlines
+    deadline_pattern = r'(?:deadline|closes?|ends?|due|before|by)\s+.*?(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})'
+    key_info['deadlines'] = re.findall(deadline_pattern, content, re.I)[:3]
+    
+    # Extract action items
+    action_pattern = r'\b(register|apply|submit|pay|upload|visit|contact|download)\b.*?(?:\.|;|\n)'
+    actions = re.findall(action_pattern, content, re.I)
+    key_info['important_actions'] = [a.strip() for a in actions[:5]]
+    
+    return key_info
+
+def clean_text(text: str) -> str:
+    """Clean extracted text."""
+    if not text:
+        return ""
+    text = re.sub(r'\s+', ' ', text)
+    text = re.sub(r'(Advertisement|ADVERTISEMENT|Subscribe|Share|Tweet|Pin)', '', text)
+    return text.strip()
+
+def extract_article_content(html: str, url: str) -> Dict[str, str]:
+    """
+    Extract article content with improved snippet extraction.
+    Returns enough content to give users a good preview while encouraging clicks.
+    """
+    soup = BeautifulSoup(html, 'lxml')
+    
+    # Remove noise
+    for elem in soup.select('script, style, [class*="ad"], [id*="ad"], [class*="banner"], [id*="banner"], iframe, noscript'):
+        try:
+            elem.decompose()
+        except Exception:
+            pass
+    
+    # Extract title
+    title = ""
+    for selector in ['h1.entry-title', 'h1.post-title', 'h1', 'title', 'meta[property="og:title"]', 'h2', 'h3']:
+        elem = soup.select_one(selector)
+        if elem:
+            if selector.startswith('meta'):
+                title = clean_text(elem.get('content', ''))
+            else:
+                title = clean_text(elem.get_text())
+            if title:
+                break
+    
+    # Extract date
+    date = None
+    if _DATE_RE:
+        date_match = _DATE_RE.search(html)
+        if date_match:
+            date = date_match.group(0)
+    
+    # Extract content with priority selectors
+    content = ""
+    article_selectors = [
+        'article.post-content',
+        'div.entry-content',
+        'div.post-content',
+        'div.article-content',
+        'div.content',
+        'article',
+        'div.post',
+        'div.article-body',
+        'div.main-content',
+        'section.article',
+        'div.body-text',
+        'div#article',
+        'div#content',
+    ]
+    
+    for selector in article_selectors:
+        article_elem = soup.select_one(selector)
+        if article_elem:
+            # Remove ads within article
+            for inner_ad in article_elem.select('[class*="ad"], [id*="ad"], [class*="banner"], [id*="banner"]'):
+                try:
+                    inner_ad.decompose()
+                except Exception:
+                    pass
+            
+            paragraphs = article_elem.find_all('p')
+            if len(paragraphs) >= 2:
+                content_parts = []
+                for p in paragraphs:
+                    text = clean_text(p.get_text())
+                    if len(text) > 50:
+                        content_parts.append(text)
+                content = "\n\n".join(content_parts)
+                break
+    
+    # Fallback: extract from all paragraphs
+    if not content or len(content) < 200:
+        all_paragraphs = soup.find_all('p')
+        content_parts = []
+        for p in all_paragraphs:
+            text = clean_text(p.get_text())
+            if len(text) > 30 and (_SCHOOL_KEYWORDS_RE.search(text) if _SCHOOL_KEYWORDS_RE else True):
+                content_parts.append(text)
+        content = "\n\n".join(content_parts[:20])
+    
+    # Last resort: body text
+    if not content:
+        body = soup.select_one('body')
+        if body:
+            content = clean_text(body.get_text(separator="\n", strip=True))
+    
+    # Extract key information
+    key_info = extract_key_information(content)
+    
+    # Create a compelling snippet (150-250 words to encourage "Read More")
+    snippet = ""
+    if content:
+        # Take first 200 words as snippet
+        words = content.split()
+        if len(words) > 200:
+            snippet = ' '.join(words[:200]) + "..."
+        else:
+            snippet = content
+    
+    return {
+        'title': title or "Untitled Article",
+        'date': date,
+        'content': snippet,  # Preview snippet
+        'full_content': content,  # Full content if needed
+        'key_info': key_info,
+        'url': url,
+        'word_count': len(content.split()) if content else 0
     }
 
 def _is_pdf_link(href: str) -> bool:
-    """
-    Return True if href looks like a PDF link (ignores query/hash).
-    """
+    """Check if link is a PDF."""
     if not href:
         return False
     href_clean = href.split('?', 1)[0].split('#', 1)[0].lower()
     return href_clean.endswith(".pdf")
 
-
 def _get_pdf_head_info(url: str, timeout: float = 8.0) -> dict:
-    """
-    Lightweight HEAD probe for PDFs. Returns dict with keys:
-      - ok: bool
-      - content_type: str or None
-      - content_length: int or None
-      - final_url: str (after redirects)
-      - status_code: int or None
-      - error: str if any
-    Uses HEAD first, falls back to GET(stream=True) when necessary.
-    """
+    """Get PDF metadata without downloading full file."""
     try:
         resp = requests.head(url, allow_redirects=True, timeout=timeout)
         status = getattr(resp, "status_code", None)
         content_type = (resp.headers.get("Content-Type") or "").lower()
-
-        # If HEAD isn't convincing, try a small GET (streamed so we don't download body)
+        
         if status is None or status >= 400 or "pdf" not in content_type:
             try:
                 resp = requests.get(url, allow_redirects=True, timeout=timeout, stream=True)
@@ -1565,7 +1360,7 @@ def _get_pdf_head_info(url: str, timeout: float = 8.0) -> dict:
                     "final_url": getattr(resp, "url", url) if resp is not None else url,
                     "status_code": status
                 }
-
+        
         final_status = getattr(resp, "status_code", None)
         final_url = getattr(resp, "url", url)
         final_content_type = (resp.headers.get("Content-Type") or "").lower()
@@ -1575,14 +1370,16 @@ def _get_pdf_head_info(url: str, timeout: float = 8.0) -> dict:
                 content_length = int(resp.headers.get("Content-Length"))
             except Exception:
                 content_length = None
-
-        # Close streaming response to free connection
+        
         try:
             if getattr(resp, "raw", None):
-                resp.close()
+                try:
+                    resp.close()
+                except Exception:
+                    pass
         except Exception:
             pass
-
+        
         return {
             "ok": True,
             "content_type": final_content_type,
@@ -1593,289 +1390,148 @@ def _get_pdf_head_info(url: str, timeout: float = 8.0) -> dict:
     except Exception as e:
         return {"ok": False, "error": str(e), "final_url": url, "status_code": None}
 
-def extract_anchors_from_soup(
-    target_soup: BeautifulSoup,
-    base_url: str,
-    seen: Optional[Set[str]] = None,
-) -> List[Dict[str, Any]]:
-    """
-    Robust replacement for the inline 'anchors -> items' block you had.
-    Returns a list of dict items with keys:
-      title, snippet, date, link, origin, detail_available, pdf, pdf_url, pdf_size_kb, anchor (the Tag)
-    NOTE: This function uses module-level regexes: _SCHOOL_KEYWORDS_RE and _DATE_RE.
-    """
-    if seen is None:
-        seen = set()
+async def fetch_article_details(article_url: str) -> Optional[Dict[str, Any]]:
+    """Fetch and extract full article details."""
+    LOG.info(f"Fetching article: {article_url[:60]}…")
+    try:
+        html = await fetch_html_ultimate(article_url)
+        details = extract_article_content(html, article_url)
+        LOG.info(f"✓ Extracted {details['word_count']} words")
+        return details
+    except Exception as e:
+        LOG.error(f"✗ Failed to fetch article: {str(e)[:50]}")
+        return None
 
-    anchors: List[Dict[str, Any]] = []
-
-    for a in target_soup.find_all("a", href=True):
-        try:
-            link_text = a.get_text(" ", strip=True)
-        except Exception:
-            link_text = ""
-        href = a.get("href", "").strip()
-
-        # Basic filtering
-        if not link_text or len(link_text) < 6:
-            continue
-
-        # prioritize anchors with keywords or PDFs/docs
-        try:
-            matches_keyword = bool(_SCHOOL_KEYWORDS_RE.search(link_text) if _SCHOOL_KEYWORDS_RE else False) \
-                              or bool(_SCHOOL_KEYWORDS_RE.search(href) if _SCHOOL_KEYWORDS_RE else False)
-        except Exception:
-            matches_keyword = False
-
-        if not (matches_keyword or href.lower().endswith((".pdf", ".doc", ".docx"))):
-            continue
-
-        full_link = urljoin(base_url, href)
-        key = f"{link_text[:100]}|{full_link[:200]}"
-        if key in seen:
-            continue
-        seen.add(key)
-
-        item: Dict[str, Any] = {
-            "title": link_text,
-            "snippet": "",
-            "date": None,
-            "link": full_link,
-            "origin": "link",
-            "detail_available": False,
-            "pdf": False,
-            "pdf_url": None,
-            "pdf_size_kb": None,
-            "anchor": a,  # keep the Tag for possible follow-up processing
-        }
-
-        # try to find date near the link (parent p/div/li/article)
-        parent_block = a.find_parent(["p", "div", "li", "article"])
-        if parent_block is not None:
-            try:
-                text_block = parent_block.get_text(" ", strip=True)
-                if _DATE_RE:
-                    date_match = _DATE_RE.search(text_block)
-                    if date_match:
-                        item["date"] = date_match.group(0)
-            except Exception:
-                pass
-
-        # If PDF link -> probe it and annotate item accordingly (no full download)
-        if _is_pdf_link(full_link):
-            head = _get_pdf_head_info(full_link)
-            if head.get("ok") and head.get("content_type") and "pdf" in (head.get("content_type") or ""):
-                item["pdf"] = True
-                item["pdf_url"] = head.get("final_url") or full_link
-                if head.get("content_length"):
-                    item["pdf_size_kb"] = round(head["content_length"] / 1024)
-                    item["snippet"] = f"(PDF — {item['pdf_size_kb']} KB) — open link to view"
-                else:
-                    item["snippet"] = "(PDF — open link to view)"
-            else:
-                # If the HEAD/GET check failed, still include link but note probe failure
-                err = head.get("error") or f"status={head.get('status_code')}"
-                item["snippet"] = f"(PDF link — probe failed: {err})"
-            anchors.append(item)
-            continue
-
-        # Non-PDF: give a small snippet based on nearby content
-        snippet = ""
-        if parent_block is not None:
-            container_text = parent_block.get_text(" ", strip=True)
-
-            # 1) Try next-sibling descriptive elements
-            siblings = list(a.find_next_siblings(["p", "div", "span"]))
-            if not siblings:
-                # maybe anchor inside a heading; check heading siblings
-                parent_heading = a.find_parent(["h1", "h2", "h3", "h4", "h5"])
-                if parent_heading:
-                    siblings = list(parent_heading.find_next_siblings(["p", "div", "span"]))
-
-            for sib in siblings:
-                try:
-                    sib_text = sib.get_text(" ", strip=True)
-                except Exception:
-                    sib_text = ""
-                if len(sib_text) > 20 and sib_text != item.get("date"):
-                    snippet = sib_text[:300]
-                    break
-
-            # 2) Fallback: parent's text minus title & date
-            if not snippet and len(container_text) > len(link_text) + 20:
-                clean_text = container_text.replace(link_text, "").replace("Read More", "").strip()
-                if item.get("date"):
-                    clean_text = clean_text.replace(item["date"], "").strip()
-                if len(clean_text) > 20:
-                    snippet = clean_text[:300]
-
-        if not snippet:
-            snippet = "Open link for full update details."
-
-        item["snippet"] = snippet
-        anchors.append(item)
-
-    return anchors
-
-
-def _extract_preview_from_html(html: str, base_url: Optional[str] = None) -> str:
-    """
-    Pick the best preview snippet from an article page:
-      1) <article> text
-      2) first long <div class="content"> or similar
-      3) first long <p>
-      4) meta description
-    Returns a short cleaned snippet (or empty string).
-    """
-    if not html:
-        return ""
-    soup = BeautifulSoup(html, "lxml")
-
-    def _clean_and_truncate(s: str, limit: int = 800) -> str:
-        txt = " ".join((s or "").split())
-        return txt[:limit]
-
-    # 1) article
-    article = soup.find("article")
-    if article:
-        text = article.get_text(" ", strip=True)
-        if len(text) > 60:
-            return _clean_and_truncate(text)
-
-    # 2) common content containers
-    for sel in ("div.content", "div.article-body", "div.post-content", "main", "section.article"):
-        el = soup.select_one(sel)
-        if el:
-            text = el.get_text(" ", strip=True)
-            if len(text) > 60:
-                return _clean_and_truncate(text)
-
-    # 3) first paragraph with reasonable length
-    for p in soup.find_all("p"):
-        txt = p.get_text(" ", strip=True)
-        if len(txt) >= 60:
-            return _clean_and_truncate(txt)
-
-    # 4) meta description
-    meta = soup.find("meta", attrs={"name": "description"}) or soup.find("meta", attrs={"property": "og:description"})
-    if meta and meta.get("content"):
-        return _clean_and_truncate(meta["content"])
-
-    # fallback: page text
-    page_text = soup.get_text(" ", strip=True)
-    return _clean_and_truncate(page_text) if page_text and len(page_text) > 20 else ""
-
-
-def _extract_snippets_from_html(html: str, base_url: str, follow_links: bool = False, max_follow: int = 2) -> List[Dict[str, Any]]:
-    """
-    Extracts title, link, date, and update details (snippet) from HTML.
-    Prioritizes extracting the summary text directly from the listing page.
-
-    Returns up to 15 items with keys: title, snippet, date, link, pdf
-    """
-    if not html:
+def extract_school_news_listings(html: str, base_url: str) -> List[Dict[str, Any]]:
+    """Extract news listings from a page with improved snippet extraction."""
+    if not html or len(html) < 1000:
         return []
-
-    soup = BeautifulSoup(html, "lxml")
-    items: List[Dict[str, Any]] = []
-    seen: Set[str] = set()
-
-    # Identify the Main News Container (optional but helps precision)
-    news_selectors = [
-        "section#news", ".news-list", ".blog-posts", ".latest-news",
-        "div.news", "ul.news", "div.posts", "#main-content", "article"
-    ]
-    target_area = soup
-    for sel in news_selectors:
-        found = soup.select(sel)
-        if found:
-            # pick the one with the most text content to be safe
-            target_area = max(found, key=lambda t: len(t.get_text() or ""))
-            break
-
-    # Iterate anchors
-    for a in target_area.find_all("a", href=True):
+    
+    soup = BeautifulSoup(html, 'lxml')
+    items = []
+    seen = set()
+    
+    for a in soup.find_all("a", href=True):
         title = a.get_text(" ", strip=True)
         href = a.get("href", "").strip()
-
-        # Skip if title too short and doesn't contain school keywords
+        
         if not title or len(title) < 10:
-            low = title.lower() if title else ""
-            if any(x in low for x in ("read", "view", "click")):
-                prev_header = a.find_previous(["h1", "h2", "h3", "h4", "h5"])
-                if prev_header and len(prev_header.get_text(strip=True)) > 10:
-                    title = prev_header.get_text(" ", strip=True)
-                else:
-                    continue
-            else:
-                if not (_SCHOOL_KEYWORDS_RE.search(title) if _SCHOOL_KEYWORDS_RE else False) and \
-                   not (_SCHOOL_KEYWORDS_RE.search(href) if _SCHOOL_KEYWORDS_RE else False):
-                    continue
-
+            continue
+        
+        if _SCHOOL_KEYWORDS_RE and not _SCHOOL_KEYWORDS_RE.search(title):
+            continue
+        
         full_link = urljoin(base_url, href)
         key = f"{title[:50]}|{full_link}"
         if key in seen:
             continue
         seen.add(key)
-
+        
+        # Extract a better snippet (aim for 50-100 words)
         snippet = ""
         date_str = None
-
-        container = a.find_parent(["li", "div", "article", "p"])
-        if container is not None:
+        
+        container = a.find_parent(["li", "div", "article", "p", "td"])
+        if container:
             container_text = container.get_text(" ", strip=True)
-
-            # A) Date
-            try:
-                if _DATE_RE:
-                    date_match = _DATE_RE.search(container_text)
-                    if date_match:
-                        date_str = date_match.group(0)
-            except Exception:
-                date_str = None
-
-            # B) Snippet: siblings first
-            siblings = list(a.find_next_siblings(["p", "div", "span"]))
-            if not siblings:
-                parent_heading = a.find_parent(["h1", "h2", "h3", "h4", "h5"])
-                if parent_heading:
-                    siblings = list(parent_heading.find_next_siblings(["p", "div", "span"]))
-
-            for sib in siblings:
-                try:
-                    sib_text = sib.get_text(" ", strip=True)
-                except Exception:
-                    sib_text = ""
-                if len(sib_text) > 20 and sib_text != date_str:
-                    snippet = sib_text[:300]
+            
+            # Extract date
+            if _DATE_RE:
+                date_match = _DATE_RE.search(container_text)
+                if date_match:
+                    date_str = date_match.group(0)
+            
+            # Try to get snippet from siblings
+            siblings = a.find_next_siblings(["p", "div", "span"])
+            for sib in siblings[:3]:
+                sib_text = sib.get_text(" ", strip=True)
+                if len(sib_text) > 50:
+                    # Take first 100 words
+                    words = sib_text.split()
+                    if len(words) > 100:
+                        snippet = ' '.join(words[:100]) + "..."
+                    else:
+                        snippet = sib_text
                     break
-
-            # C) Fallback: parent's text minus title/date
-            if not snippet and len(container_text) > len(title) + 20:
-                clean_text = container_text.replace(title, "").replace("Read More", "").strip()
-                if date_str:
-                    clean_text = clean_text.replace(date_str, "").strip()
-                if len(clean_text) > 20:
-                    snippet = clean_text[:300]
-
-        # PDF flag
-        is_pdf = _is_pdf_link(full_link) or full_link.lower().endswith(".pdf")
-        if is_pdf:
-            snippet = f"[PDF Document] {snippet}".strip()
-
+            
+            # Fallback to container text
+            if not snippet and len(container_text) > 100:
+                words = container_text.split()
+                if len(words) > 100:
+                    snippet = ' '.join(words[:100]) + "..."
+                else:
+                    snippet = container_text[:300]
+        
         if not snippet:
-            snippet = "Open link for full update details."
-
-        item = {
+            snippet = "Click to read full update..."
+        
+        items.append({
             "title": title,
             "snippet": snippet,
             "date": date_str,
             "link": full_link,
-            "pdf": is_pdf
-        }
-        items.append(item)
-
-    # Sort: items with dates first, then longer snippets first
-    items.sort(key=lambda x: (x['date'] is None, -len(x.get('snippet') or "")))
-
+            "source": urlparse(base_url).netloc,
+            "pdf": _is_pdf_link(full_link)
+        })
+    
+    # Sort by date and snippet quality
+    items.sort(key=lambda x: (x['date'] is None, -len(x['snippet'])))
     return items[:15]
+
+async def scrape_school_news(urls: List[str], fetch_full_content: bool = True, max_articles: int = 5) -> List[Dict[str, Any]]:
+    """
+    Scrape school news from URLs.
+    If fetch_full_content=True, fetches full articles for top items.
+    Otherwise returns listings with improved snippets.
+    """
+    all_news = []
+    
+    for url in urls:
+        LOG.info(f"\n{'='*70}")
+        LOG.info(f"📰 {url}")
+        LOG.info(f"{'='*70}")
+        
+        try:
+            LOG.info(f"Fetching listings page…")
+            html = await fetch_html_ultimate(url)
+            items = extract_school_news_listings(html, url)
+            LOG.info(f"✓ Found {len(items)} articles")
+            
+            if fetch_full_content:
+                LOG.info(f"\n📄 Fetching full content for top {max_articles} articles…")
+                for i, item in enumerate(items[:max_articles], 1):
+                    LOG.info(f"\n[{i}/{min(max_articles, len(items))}] {item['title'][:50]}…")
+                    details = await fetch_article_details(item['link'])
+                    if details:
+                        item['full_content'] = details['full_content']
+                        item['word_count'] = details['word_count']
+                        item['key_info'] = details['key_info']
+                        # Update snippet with better excerpt from full content
+                        item['snippet'] = details['content']
+                        if details['date'] and not item['date']:
+                            item['date'] = details['date']
+                    all_news.append(item)
+                    await asyncio.sleep(random.uniform(3, 6))
+                
+                # Add remaining items without full fetch
+                for item in items[max_articles:]:
+                    item['full_content'] = item['snippet']
+                    item['word_count'] = len(item['snippet'].split())
+                    item['key_info'] = {}
+                    all_news.append(item)
+            else:
+                # Just use the improved snippets from listings
+                for item in items:
+                    item['full_content'] = item['snippet']
+                    item['word_count'] = len(item['snippet'].split())
+                    item['key_info'] = {}
+                all_news.extend(items)
+            
+            LOG.info(f"\n✓ Processed {len(items)} articles from this source")
+        except Exception as e:
+            LOG.error(f"\n✗ FAILED: {str(e)}\n")
+        
+        LOG.info("-" * 70)
+        await asyncio.sleep(8)
+    
+    return all_news
