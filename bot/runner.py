@@ -216,7 +216,7 @@ async def trigger_cleanup(auth_token: str = Body(..., embed=True)):
     Requires admin authentication.
     """
     # Simple token auth (use env var in production)
-    expected_token = os.getenv("ADMIN_TOKEN", "change-me-in-production")
+    expected_token = os.getenv("ADMIN_TOKEN")
     if auth_token != expected_token:
         raise HTTPException(status_code=403, detail="Invalid admin token")
     
