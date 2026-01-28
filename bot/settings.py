@@ -114,21 +114,13 @@ DEFAULT_SCHOOL_SOURCES = {
     "JAMB": [
         "https://www.jamb.gov.ng/"
     ],
-    "WAEC Nigeria": [
-        "https://www.waecnigeria.org/"
-    ],
     "NECO": [
         "https://www.neco.gov.ng/"
     ],
-    
     # --- Higher Education Regulators ---
     "NUC (Universities)": [
         "https://www.nuc.edu.ng/"
     ],
-    "NYSC": [
-        "https://www.nysc.gov.ng/"
-    ],
-
     # --- Reliable Education News Aggregators (Best for "Daily" updates) ---
     "MySchool.ng": [
         "https://myschool.ng/news"
@@ -136,7 +128,6 @@ DEFAULT_SCHOOL_SOURCES = {
     "Punch Education": [
         "https://punchng.com/topics/education/"
     ],
-    
     # --- Ministries (Often slow/heavy, but official) ---
     "Fed Ministry of Education": [
         "https://education.gov.ng/"
