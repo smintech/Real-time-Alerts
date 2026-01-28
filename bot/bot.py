@@ -359,7 +359,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                     entries.append({"url": url, "data": data})
             except Exception as e:
                 LOG.warning("Scrape failed for %s in group %s: %s", url, group_key, e)
-
+                continue
         if not entries:
             LOG.info("Group '%s': No successful scrapes — skipping", group_key)
             continue
@@ -724,11 +724,15 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
 # SCHOOL UPDATES POSTING
 # ═══════════════════════════════════════════════════════════════════════════
 
+# bot/scheduler.py - FIXES FOR FORCE MODE & JAMB SCRAPING
+
 async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     """
     Job: Scrapes school sources, extracts updates per source,
     and posts separate messages for sources with new/changed content.
     Uses dual-layer persistence with deduplication.
+    
+    FIXED: Force mode now properly bypasses recency checks
     """
     LOG.info("--- SCHOOL UPDATES JOB STARTED ---")
 
@@ -740,6 +744,11 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     send_delay = 15
     eligible_candidates = []
     now = datetime.now(TIMEZONE)
+    
+    # Check if force mode is enabled
+    force_mode = TEST_MODE or SCHOOL_FORCE_POST
+    if force_mode:
+        LOG.warning("🔴 FORCE MODE ENABLED - Bypassing recency and duplicate checks")
 
     # Scrape all sources
     for source_name, urls in DEFAULT_SCHOOL_SOURCES.items():
@@ -747,6 +756,10 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             continue
 
         try:
+            LOG.info(f"\n{'='*70}")
+            LOG.info(f"Processing: {source_name}")
+            LOG.info(f"{'='*70}")
+            
             # Use the improved scrape_school_news function
             items = await scrape_school_news(
                 urls,
@@ -757,6 +770,8 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             if not items:
                 LOG.info("No items for %s", source_name)
                 continue
+            
+            LOG.info(f"Found {len(items)} items for {source_name}")
 
             # Generate report
             report_lines = [
@@ -773,7 +788,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 report_lines.append(title_line)
 
                 snippet = item.get("snippet", "").strip()
-                if snippet:
+                if snippet and len(snippet) > 30:
                     # Clean up snippet
                     snippet = snippet.replace("Read More", "").replace("Click to read", "").strip()
                     report_lines.append(f"  └─ {snippet[:200]}... <a href=\"{item['link']}\">Read more</a>")
@@ -796,29 +811,32 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 "raw": {"items": items[:5]}  # Use first 5 for hash
             })
 
-            # Check if duplicate
+            # Check if duplicate (SKIP IF FORCE MODE)
             snapshot_key = f"school_{_slugify(source_name)}"
-            is_duplicate = await check_duplicate_post(
-                ref=snapshot_key,
-                content_hash=content_hash,
-                lookback_hours=24  # 24 hours for school updates
-            )
+            
+            if not force_mode:
+                is_duplicate = await check_duplicate_post(
+                    ref=snapshot_key,
+                    content_hash=content_hash,
+                    lookback_hours=24
+                )
 
-            if is_duplicate and not SCHOOL_FORCE_POST:
-                LOG.info("Skipping duplicate school update for %s", source_name)
-                continue
+                if is_duplicate:
+                    LOG.info("Skipping duplicate school update for %s", source_name)
+                    continue
 
-            # Check recency
-            snapshot = await load_channel_snapshot(snapshot_key)
-            if snapshot and snapshot.get("last_posted_at") and not TEST_MODE and not SCHOOL_FORCE_POST:
-                try:
-                    last_dt = datetime.fromisoformat(snapshot["last_posted_at"])
-                    hours_since = (now - last_dt).total_seconds() / 3600
-                    if hours_since < 12:  # Minimum 12 hours between posts
-                        LOG.info("Skipping %s — posted %.1f hours ago", source_name, hours_since)
-                        continue
-                except Exception:
-                    pass
+            # Check recency (SKIP IF FORCE MODE)
+            if not force_mode:
+                snapshot = await load_channel_snapshot(snapshot_key)
+                if snapshot and snapshot.get("last_posted_at"):
+                    try:
+                        last_dt = datetime.fromisoformat(snapshot["last_posted_at"])
+                        hours_since = (now - last_dt).total_seconds() / 3600
+                        if hours_since < 12:  # Minimum 12 hours between posts
+                            LOG.info("Skipping %s — posted %.1f hours ago", source_name, hours_since)
+                            continue
+                    except Exception:
+                        pass
 
             eligible_candidates.append({
                 "source_name": source_name,
@@ -843,7 +861,8 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     targets = CHANNEL_DEAL_CHAT_ID if isinstance(CHANNEL_DEAL_CHAT_ID, list) else [CHANNEL_DEAL_CHAT_ID]
 
     for item in to_post:
-        message = f"📚 <b>School Updates — {item['source_name']}</b>\n━━━━━━━━━━━━━━━━━━\n\n{item['report_text']}"
+        emoji = "🔴" if force_mode else ("🆕" if item.get("is_new") else "🔄")
+        message = f"{emoji} <b>School Updates — {item['source_name']}</b>\n━━━━━━━━━━━━━━━━━━\n\n{item['report_text']}"
 
         sent_successfully = False
         for chat_id in targets:
@@ -860,13 +879,17 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 LOG.error("Failed posting school update: %s", e)
 
         if sent_successfully:
-            snapshot_data = {
-                "content_hash": item["content_hash"],
-                "item_count": item["item_count"],
-                "site": item["source_name"],
-                "title": f"School Updates - {item['source_name']}",
-            }
-            await mark_as_posted(item["snapshot_key"], snapshot_data)
+            # Don't save snapshot in force mode (to allow re-posting)
+            if not force_mode:
+                snapshot_data = {
+                    "content_hash": item["content_hash"],
+                    "item_count": item["item_count"],
+                    "site": item["source_name"],
+                    "title": f"School Updates - {item['source_name']}",
+                }
+                await mark_as_posted(item["snapshot_key"], snapshot_data)
+            else:
+                LOG.info("Force mode: Skipping snapshot save for re-posting capability")
             
             posted_count += 1
             if posted_count < len(to_post):
@@ -1039,8 +1062,8 @@ async def run_bot():
             )
             application.job_queue.run_repeating(
                 callback=check_and_post_school_updates,
-                interval=120,  # 6 hours
-                first=10,
+                interval=300,  # 6 hours
+                first=30,
                 #time=time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
                 name="school_updates_poster"
             )
