@@ -1402,8 +1402,18 @@ async def fetch_article_details(article_url: str) -> Optional[Dict[str, Any]]:
         LOG.error(f"✗ Failed to fetch article: {str(e)[:50]}")
         return None
 
+# Utils/utils.py - SCHOOL NEWS SCRAPING (COMPREHENSIVE FIX)
+
 def extract_school_news_listings(html: str, base_url: str) -> List[Dict[str, Any]]:
-    """Extract news listings from a page with improved snippet extraction."""
+    """
+    Extract news listings from a page with improved content detection.
+    
+    FIXES:
+    - Excludes navigation menus
+    - Extracts real article content, not link text
+    - Validates snippet quality
+    - Prevents title/snippet duplication
+    """
     if not html or len(html) < 1000:
         return []
     
@@ -1411,127 +1421,329 @@ def extract_school_news_listings(html: str, base_url: str) -> List[Dict[str, Any
     items = []
     seen = set()
     
-    for a in soup.find_all("a", href=True):
-        title = a.get_text(" ", strip=True)
-        href = a.get("href", "").strip()
+    # === PHASE 1: REMOVE NAVIGATION & NOISE ===
+    # Remove these elements entirely to prevent false positives
+    noise_selectors = [
+        'nav', 'header', 'footer', 
+        '[class*="menu"]', '[id*="menu"]',
+        '[class*="sidebar"]', '[id*="sidebar"]',
+        '[class*="widget"]', '[class*="navigation"]',
+        '.search-form', 'form[role="search"]',
+        '[class*="social"]', '[class*="share"]',
+    ]
+    
+    for selector in noise_selectors:
+        for elem in soup.select(selector):
+            try:
+                elem.decompose()
+            except:
+                pass
+    
+    # === PHASE 2: IDENTIFY ARTICLE CONTAINERS ===
+    # Priority-ordered selectors for article containers
+    article_container_selectors = [
+        # Standard semantic HTML
+        'article',
         
-        if not title or len(title) < 10:
-            continue
+        # Common WordPress/CMS patterns
+        '.post', '.entry', '.article',
+        '[class*="post-"]', '[class*="article-"]',
+        '.news-item', '.story', '.content-item',
         
-        if _SCHOOL_KEYWORDS_RE and not _SCHOOL_KEYWORDS_RE.search(title):
-            continue
+        # Specific patterns for Nigerian news sites
+        '.tdb_single_post', '.td-post-content',
+        '.entry-content', '.post-content',
+        '.theiaStickySidebar article',
         
-        full_link = urljoin(base_url, href)
-        key = f"{title[:50]}|{full_link}"
-        if key in seen:
-            continue
-        seen.add(key)
-        
-        # Extract a better snippet (aim for 50-100 words)
-        snippet = ""
-        date_str = None
-        
-        container = a.find_parent(["li", "div", "article", "p", "td"])
-        if container:
-            container_text = container.get_text(" ", strip=True)
+        # Fallback: divs with article-like classes
+        'div[class*="news"]', 'div[class*="story"]',
+    ]
+    
+    article_containers = []
+    for selector in article_container_selectors:
+        found = soup.select(selector)
+        if found:
+            article_containers.extend(found)
+            if len(article_containers) >= 15:  # Stop after finding enough
+                break
+    
+    # === PHASE 3: EXTRACT FROM EACH CONTAINER ===
+    for container in article_containers[:20]:  # Limit processing
+        try:
+            # Find title (link with meaningful text)
+            title_elem = None
+            title_text = ""
+            article_url = ""
             
-            # Extract date
-            if _DATE_RE:
+            # Try to find title in heading tags first
+            for heading_tag in ['h1', 'h2', 'h3', 'h4']:
+                heading = container.find(heading_tag)
+                if heading:
+                    link = heading.find('a', href=True)
+                    if link:
+                        title_text = link.get_text(" ", strip=True)
+                        article_url = link.get('href', '')
+                        title_elem = link
+                        break
+                    else:
+                        # No link in heading, use heading text
+                        title_text = heading.get_text(" ", strip=True)
+            
+            # Fallback: find any prominent link
+            if not title_text:
+                # Look for links with substantial text
+                for link in container.find_all('a', href=True):
+                    link_text = link.get_text(" ", strip=True)
+                    if len(link_text) >= 20:  # Meaningful title length
+                        title_text = link_text
+                        article_url = link.get('href', '')
+                        title_elem = link
+                        break
+            
+            if not title_text or len(title_text) < 15:
+                continue
+            
+            # Clean title (remove dates, categories, "News" prefix)
+            title_text = re.sub(r'^(News|Update|Article)\s+', '', title_text, flags=re.I)
+            title_text = re.sub(r'\s+', ' ', title_text).strip()
+            
+            # Build full URL
+            if article_url:
+                full_url = urljoin(base_url, article_url)
+            else:
+                continue  # Skip if no URL
+            
+            # Dedup check
+            dedup_key = f"{title_text[:50]}|{full_url}"
+            if dedup_key in seen:
+                continue
+            seen.add(dedup_key)
+            
+            # === EXTRACT DATE ===
+            date_str = None
+            
+            # Try time/date tags first
+            time_elem = container.find(['time', 'span[class*="date"]', 'div[class*="date"]'])
+            if time_elem:
+                date_str = time_elem.get_text(" ", strip=True)
+            
+            # Fallback: regex search in container text
+            if not date_str and _DATE_RE:
+                container_text = container.get_text(" ", strip=True)[:500]
                 date_match = _DATE_RE.search(container_text)
                 if date_match:
                     date_str = date_match.group(0)
             
-            # Try to get snippet from siblings
-            siblings = a.find_next_siblings(["p", "div", "span"])
-            for sib in siblings[:3]:
-                sib_text = sib.get_text(" ", strip=True)
-                if len(sib_text) > 50:
-                    # Take first 100 words
-                    words = sib_text.split()
-                    if len(words) > 100:
-                        snippet = ' '.join(words[:100]) + "..."
-                    else:
-                        snippet = sib_text
+            # Clean date
+            if date_str:
+                # Remove "News" prefix if present
+                date_str = re.sub(r'^News\s+', '', date_str, flags=re.I)
+                date_str = date_str.strip()
+            
+            # === EXTRACT SNIPPET ===
+            snippet = ""
+            
+            # Strategy 1: Find article summary/excerpt div
+            excerpt_selectors = [
+                '.entry-summary', '.excerpt', '.post-excerpt',
+                '[class*="summary"]', '[class*="excerpt"]',
+                '.article-content p', '.post-content p',
+                '.entry-content p',
+            ]
+            
+            for sel in excerpt_selectors:
+                excerpt_elem = container.select_one(sel)
+                if excerpt_elem:
+                    snippet_text = excerpt_elem.get_text(" ", strip=True)
+                    if len(snippet_text) >= 50:
+                        snippet = snippet_text
+                        break
+            
+            # Strategy 2: Get first paragraph(s) after title
+            if not snippet:
+                paragraphs = container.find_all('p')
+                for p in paragraphs[:3]:
+                    p_text = p.get_text(" ", strip=True)
+                    # Skip if it's just metadata or same as title
+                    if len(p_text) < 30:
+                        continue
+                    if p_text.lower() == title_text.lower():
+                        continue
+                    if re.match(r'^(by|posted|published|source)', p_text, re.I):
+                        continue
+                    
+                    snippet = p_text
                     break
             
-            # Fallback to container text
-            if not snippet and len(container_text) > 100:
-                words = container_text.split()
-                if len(words) > 100:
-                    snippet = ' '.join(words[:100]) + "..."
-                else:
+            # Strategy 3: Get container text (excluding title)
+            if not snippet:
+                container_text = container.get_text(" ", strip=True)
+                # Remove title from container text
+                container_text = container_text.replace(title_text, '').strip()
+                # Take first 200 chars
+                if len(container_text) >= 50:
                     snippet = container_text[:300]
-        
-        if not snippet:
-            snippet = "Click to read full update..."
-        
-        items.append({
-            "title": title,
-            "snippet": snippet,
-            "date": date_str,
-            "link": full_link,
-            "source": urlparse(base_url).netloc,
-            "pdf": _is_pdf_link(full_link)
-        })
+            
+            # === VALIDATE SNIPPET QUALITY ===
+            if snippet:
+                # Clean snippet
+                snippet = re.sub(r'\s+', ' ', snippet)
+                snippet = snippet.replace("Read More", "").replace("Continue Reading", "").strip()
+                
+                # Skip if snippet is just the title repeated
+                if snippet.lower().strip() == title_text.lower().strip():
+                    snippet = "Click to read full update..."
+                
+                # Skip if snippet is mostly navigation text
+                nav_keywords = ['home', 'about us', 'contact', 'search', 'login', 'register', 'menu']
+                if sum(1 for kw in nav_keywords if kw in snippet.lower()) >= 3:
+                    continue
+                
+                # Truncate to reasonable length (100-200 words)
+                words = snippet.split()
+                if len(words) > 200:
+                    snippet = ' '.join(words[:200]) + "..."
+                elif len(words) < 10:
+                    snippet = "Click to read full update..."
+            else:
+                snippet = "Click to read full update..."
+            
+            # === BUILD ITEM ===
+            item = {
+                "title": title_text,
+                "snippet": snippet,
+                "date": date_str,
+                "link": full_url,
+                "source": urlparse(base_url).netloc,
+                "pdf": _is_pdf_link(full_url)
+            }
+            
+            items.append(item)
+            
+        except Exception as e:
+            LOG.debug("Failed to extract article from container: %s", e)
+            continue
     
-    # Sort by date and snippet quality
-    items.sort(key=lambda x: (x['date'] is None, -len(x['snippet'])))
+    # === PHASE 4: SORT & RETURN ===
+    # Sort: dated items first, then by snippet quality
+    items.sort(key=lambda x: (
+        x['date'] is None,  # Items with dates first
+        -len(x.get('snippet', '')),  # Longer snippets preferred
+    ))
+    
     return items[:15]
 
-async def scrape_school_news(urls: List[str], fetch_full_content: bool = True, max_articles: int = 5) -> List[Dict[str, Any]]:
+
+async def scrape_school_news(
+    urls: List[str], 
+    fetch_full_content: bool = False, 
+    max_articles: int = 10
+) -> List[Dict[str, Any]]:
     """
-    Scrape school news from URLs.
-    If fetch_full_content=True, fetches full articles for top items.
-    Otherwise returns listings with improved snippets.
+    Scrape school news from URLs with improved article detection.
+    
+    Args:
+        urls: List of URLs to scrape
+        fetch_full_content: If True, fetches full article content (slower)
+        max_articles: Maximum articles to fetch full content for
+    
+    Returns:
+        List of news items with improved snippets
     """
     all_news = []
     
     for url in urls:
         LOG.info(f"\n{'='*70}")
-        LOG.info(f"📰 {url}")
+        LOG.info(f"📰 Scraping: {url}")
         LOG.info(f"{'='*70}")
         
         try:
-            LOG.info(f"Fetching listings page…")
-            html = await fetch_html_ultimate(url)
+            LOG.info(f"  Fetching listings page...")
+            html = await _fetch_html(url)
+            
+            if not html or len(html) < 1000:
+                LOG.warning(f"  ✗ Insufficient content received (len={len(html)})")
+                continue
+            
             items = extract_school_news_listings(html, url)
-            LOG.info(f"✓ Found {len(items)} articles")
+            LOG.info(f"  ✓ Found {len(items)} articles")
             
-            if fetch_full_content:
-                LOG.info(f"\n📄 Fetching full content for top {max_articles} articles…")
-                for i, item in enumerate(items[:max_articles], 1):
-                    LOG.info(f"\n[{i}/{min(max_articles, len(items))}] {item['title'][:50]}…")
-                    details = await fetch_article_details(item['link'])
-                    if details:
-                        item['full_content'] = details['full_content']
-                        item['word_count'] = details['word_count']
-                        item['key_info'] = details['key_info']
-                        # Update snippet with better excerpt from full content
-                        item['snippet'] = details['content']
-                        if details['date'] and not item['date']:
-                            item['date'] = details['date']
-                    all_news.append(item)
-                    await asyncio.sleep(random.uniform(3, 6))
+            if not items:
+                continue
+            
+            # === OPTIONAL: FETCH FULL CONTENT ===
+            if fetch_full_content and max_articles > 0:
+                LOG.info(f"\n  📄 Fetching full content for top {max_articles} articles...")
                 
-                # Add remaining items without full fetch
-                for item in items[max_articles:]:
-                    item['full_content'] = item['snippet']
-                    item['word_count'] = len(item['snippet'].split())
-                    item['key_info'] = {}
-                    all_news.append(item)
-            else:
-                # Just use the improved snippets from listings
-                for item in items:
-                    item['full_content'] = item['snippet']
-                    item['word_count'] = len(item['snippet'].split())
-                    item['key_info'] = {}
-                all_news.extend(items)
+                for i, item in enumerate(items[:max_articles], 1):
+                    LOG.info(f"\n    [{i}/{min(max_articles, len(items))}] {item['title'][:60]}...")
+                    
+                    try:
+                        # Fetch full article
+                        article_html = await _fetch_html(item['link'])
+                        
+                        if article_html:
+                            # Extract article content
+                            article_soup = BeautifulSoup(article_html, 'lxml')
+                            
+                            # Remove noise
+                            for elem in article_soup.select('script, style, nav, header, footer, [class*="ad"]'):
+                                try:
+                                    elem.decompose()
+                                except:
+                                    pass
+                            
+                            # Find article body
+                            article_body = None
+                            for selector in [
+                                'article .entry-content',
+                                '.post-content',
+                                '.article-content',
+                                'article',
+                                '.content',
+                            ]:
+                                article_body = article_soup.select_one(selector)
+                                if article_body:
+                                    break
+                            
+                            if article_body:
+                                # Extract paragraphs
+                                paragraphs = article_body.find_all('p')
+                                full_text = "\n\n".join([
+                                    p.get_text(" ", strip=True) 
+                                    for p in paragraphs 
+                                    if len(p.get_text(" ", strip=True)) > 30
+                                ])
+                                
+                                if full_text:
+                                    # Update with better snippet (first 200 words)
+                                    words = full_text.split()
+                                    if len(words) > 200:
+                                        item['snippet'] = ' '.join(words[:200]) + "..."
+                                    else:
+                                        item['snippet'] = full_text
+                                    
+                                    item['full_content'] = full_text
+                                    item['word_count'] = len(words)
+                                    
+                                    LOG.info(f"      ✓ Extracted {len(words)} words")
+                        
+                        # Rate limiting
+                        await asyncio.sleep(random.uniform(2, 4))
+                        
+                    except Exception as e:
+                        LOG.warning(f"      ✗ Failed to fetch full content: {str(e)[:50]}")
+                        continue
             
-            LOG.info(f"\n✓ Processed {len(items)} articles from this source")
+            # Add all items (with or without full content)
+            all_news.extend(items)
+            
+            LOG.info(f"\n  ✓ Processed {len(items)} articles from this source")
+            
         except Exception as e:
-            LOG.error(f"\n✗ FAILED: {str(e)}\n")
+            LOG.error(f"\n  ✗ FAILED: {str(e)}")
         
         LOG.info("-" * 70)
-        await asyncio.sleep(8)
+        await asyncio.sleep(random.uniform(5, 8))  # Rate limiting between sources
     
     return all_news
