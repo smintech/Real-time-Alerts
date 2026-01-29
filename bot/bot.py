@@ -1138,12 +1138,14 @@ async def run_bot():
                 name="price_checker"
             )
             application.job_queue.run_repeating(
+            #application.job_queue.run_repeating(
                 callback=check_and_post_channel_deals,
                 interval=CHECK_INTERVAL_SECONDS,
                 first=10,
                 name="channel_deals"
             )
-            application.job_queue.run_daily(
+            application.job_queue.run_repeating(
+            #application.job_queue.run_daily(
                 callback=check_and_post_fuel_prices,
                 interval=CHECK_INTERVAL_SECONDS,
                 #time=time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
