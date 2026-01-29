@@ -108,19 +108,19 @@ def candidate_listing_urls(base_url: str) -> List[str]:
 # AGGRESSIVE CLOUDSCRAPER (fresh instance per attempt)
 # ═══════════════════════════════════════════════════════════════════════════
 
-def fetch_with_cloudscraper_aggressive(url: str, retries: int = 6) -> str:
+def fetch_with_cloudscraper_aggressive(url: str, retries: int = 5) -> str:  # Reduced retries for speed
     """Try cloudscraper repeatedly, creating a fresh scraper each attempt."""
     for attempt in range(1, retries + 1):
         LOG.debug("Cloudscraper attempt %d/%d for %s", attempt, retries, url)
         try:
-            time.sleep(random.uniform(2.5, 6.0))
+            time.sleep(random.uniform(1.5, 4.0))  # Reduced sleep for speed
             scraper = cloudscraper.create_scraper(
                 browser={
                     'browser': 'chrome',
                     'platform': random.choice(['windows', 'darwin', 'linux']),
                     'mobile': False
                 },
-                delay=random.randint(6, 14),
+                delay=random.randint(4, 10),  # Reduced delay range
             )
             headers = {
                 'User-Agent': random.choice(_USER_AGENTS),
@@ -132,7 +132,7 @@ def fetch_with_cloudscraper_aggressive(url: str, retries: int = 6) -> str:
                 'Connection': 'keep-alive',
                 'Upgrade-Insecure-Requests': '1',
             }
-            resp = scraper.get(url, headers=headers, timeout=60)
+            resp = scraper.get(url, headers=headers, timeout=45)  # Reduced timeout
             status = getattr(resp, "status_code", None)
             text = resp.text or ""
             
@@ -150,7 +150,7 @@ def fetch_with_cloudscraper_aggressive(url: str, retries: int = 6) -> str:
             LOG.debug("Cloudscraper attempt %d error for %s: %s", attempt, url, e)
         
         if attempt < retries:
-            time.sleep(random.uniform(4, 10))
+            time.sleep(random.uniform(2, 6))  # Reduced sleep
     
     raise Exception("Cloudscraper failed all attempts")
 
@@ -158,7 +158,7 @@ def fetch_with_cloudscraper_aggressive(url: str, retries: int = 6) -> str:
 # AGGRESSIVE PLAYWRIGHT (fresh browser/context each attempt with anti-detection)
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def fetch_with_playwright_aggressive(url: str, retries: int = 4) -> str:
+async def fetch_with_playwright_aggressive(url: str, retries: int = 3) -> str:  # Reduced retries for speed
     """Aggressive Playwright fetch: fresh browser/context each attempt with anti-detection steps."""
     for attempt in range(1, retries + 1):
         LOG.debug("Playwright attempt %d/%d for %s", attempt, retries, url)
@@ -188,14 +188,14 @@ async def fetch_with_playwright_aggressive(url: str, retries: int = 4) -> str:
                     window.chrome = { runtime: {} };
                 """)
                 
-                await asyncio.sleep(random.uniform(2.5, 6.0))
-                await page.goto(url, wait_until='domcontentloaded', timeout=60000)
+                await asyncio.sleep(random.uniform(1.5, 4.0))  # Reduced sleep
+                await page.goto(url, wait_until='domcontentloaded', timeout=45000)  # Reduced timeout
                 
                 # Wait and interact a bit
-                await page.wait_for_timeout(random.randint(2000, 5000))
+                await page.wait_for_timeout(random.randint(1000, 3000))  # Reduced wait
                 try:
                     await page.evaluate('window.scrollTo(0, document.body.scrollHeight/2)')
-                    await page.wait_for_timeout(800)
+                    await page.wait_for_timeout(500)  # Reduced
                 except Exception:
                     pass
                 
@@ -211,7 +211,7 @@ async def fetch_with_playwright_aggressive(url: str, retries: int = 4) -> str:
             LOG.debug("Playwright attempt %d exception for %s: %s", attempt, url, e)
         
         if attempt < retries:
-            await asyncio.sleep(random.uniform(4, 10))
+            await asyncio.sleep(random.uniform(2, 6))  # Reduced sleep
     
     raise Exception("Playwright failed all attempts")
 
@@ -244,7 +244,7 @@ async def fetch_html_ultimate(url: str) -> str:
 # RETRY DECORATOR
 # ═══════════════════════════════════════════════════════════════════════════
 
-def retry(max_attempts: int = 4, backoff: float = 2.0):
+def retry(max_attempts: int = 3, backoff: float = 1.5):  # Reduced for speed
     def decorator(fn):
         @wraps(fn)
         async def async_wrapper(*args, **kwargs):
@@ -291,7 +291,7 @@ def retry(max_attempts: int = 4, backoff: float = 2.0):
 # CORE FETCH FUNCTION
 # ═══════════════════════════════════════════════════════════════════════════
 
-@retry(max_attempts=4, backoff=2.0)
+@retry(max_attempts=3, backoff=1.5)  # Reduced for speed
 async def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False) -> str:
     domain = get_domain_from_url(url)
     tough_domains = ['konga', 'jumia', 'gov.ng', 'nysc', 'nuc', 'waec', 'neco', 'myschool', 'punchng', 'education']
@@ -567,7 +567,7 @@ def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain
     return best_guess
 
 # ═══════════════════════════════════════════════════════════════════════════
-# E-COMMERCE SCRAPERS
+# E-COMMERCE SCRAPERS (ENHANCED FOR KONGA WITH BETTER SELECTORS)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def scrape_binance_ref(ref: str) -> Dict[str, Any]:
@@ -765,7 +765,7 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
             if len(product["images"]) >= 6:
                 break
     
-    # CURRENT PRICE EXTRACTION
+    # CURRENT PRICE EXTRACTION (ENHANCED FOR KONGA)
     if product["current_price"] is None:
         if "jumia" in domain:
             selectors = ["span.-b", ".-fs24", ".prc", ".-prc", "div.prc"]
@@ -779,7 +779,7 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
                         break
         
         if "konga" in domain and product["current_price"] is None:
-            selectors = ["span._3e_22_199e7", "._3e_22_199e7", "h4._44738_3988u", "div.price", "[class*='price']"]
+            selectors = ["span._3e_22_199e7", "._3e_22_199e7", "h4._44738_3988u", "div.price", "[class*='price']", ".price-box .price"]  # Added more selectors for Konga
             for sel in selectors:
                 el = soup.select_one(sel)
                 if el:
@@ -814,13 +814,13 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
         product["previous_price"] = prev_price
         LOG.info("Found previous price: ₦%.0f for %s", prev_price, product["title"])
     
-    # Stock & title fallbacks
+    # Stock & title fallbacks (ENHANCED FOR KONGA)
     page_text_lower = soup.get_text().lower()
     if any(phrase in page_text_lower for phrase in ["out of stock", "sold out", "unavailable", "not available"]):
         product["stock_status"] = "out_of_stock"
     
     if product["title"] == "Product" or "Buy" in product["title"]:
-        h1 = soup.select_one("h1.-fs20, h1.-pb10, h1.brd, .v-p-hd h1, h1")
+        h1 = soup.select_one("h1.-fs20, h1.-pb10, h1.brd, .v-p-hd h1, h1, .product-title, h1.product-name")  # Added Konga-specific
         if h1:
             product["title"] = h1.get_text(strip=True)
         elif soup.title:
@@ -1035,7 +1035,7 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
         "last_updated": "Live data",
     }
 
-@retry(max_attempts=4, backoff=2.0)
+@retry(max_attempts=3, backoff=1.5)
 async def _fetch_lpg_html() -> str:
     url = "https://lpginnigeria.com/chart"
     return await _fetch_html(url)
@@ -1210,7 +1210,7 @@ async def scrape_lpg_prices() -> Dict[str, Any]:
     }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SCHOOL NEWS ARTICLE EXTRACTION (IMPROVED FOR BETTER SNIPPETS)
+# SCHOOL NEWS ARTICLE EXTRACTION (IMPROVED WITH SITE-SPECIFIC LOGIC)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def extract_key_information(content: str) -> Dict[str, Any]:
@@ -1267,8 +1267,8 @@ def clean_text(text: str) -> str:
 
 def extract_article_content(html: str, url: str) -> Dict[str, str]:
     """
-    Extract article content with improved snippet extraction.
-    Returns enough content to give users a good preview while encouraging clicks.
+    Extract article content with site-specific improvements.
+    Handles CSR/SSR via Playwright fetch (already done).
     """
     soup = BeautifulSoup(html, 'lxml')
     
@@ -1279,9 +1279,40 @@ def extract_article_content(html: str, url: str) -> Dict[str, str]:
         except Exception:
             pass
     
+    domain = get_domain_from_url(url)
+    
+    # Site-specific title selectors
+    title_selectors = {
+        'default': ['h1.entry-title', 'h1.post-title', 'h1', 'title', 'meta[property="og:title"]', 'h2', 'h3'],
+        'jamb.gov.ng': ['.article-title', 'h1', 'h2'],
+        'neco.gov.ng': ['.post-title', 'h1'],
+        'nuc.edu.ng': ['.page-title', 'h2 a'],
+        'myschool.ng': ['.news-title', 'h1', 'h2'],
+        'punchng.com': ['h1.entry-title', 'h1.post-title'],
+        'education.gov.ng': ['.article-header h1', 'h2'],
+        'lasubeb.lg.gov.ng': ['.news-headline', 'h3'],
+    }
+    
+    # Site-specific content selectors
+    content_selectors = {
+        'default': ['article.post-content', 'div.entry-content', 'div.post-content', 'div.article-content', 'div.content', 'article', 'div.post', 'div.article-body', 'div.main-content', 'section.article', 'div.body-text', 'div#article', 'div#content'],
+        'jamb.gov.ng': ['.article-body', 'div.content'],
+        'neco.gov.ng': ['.post-body', 'div.entry'],
+        'nuc.edu.ng': ['.page-content', 'div.article'],
+        'myschool.ng': ['.news-content', 'div.body'],
+        'punchng.com': ['.entry-content', 'div.post-content'],
+        'education.gov.ng': ['.article-content', 'div.main'],
+        'lasubeb.lg.gov.ng': ['.news-body', 'div.content'],
+    }
+    
+    # Select based on domain
+    site_key = next((k for k in content_selectors if k in domain), 'default')
+    selected_title_selectors = title_selectors.get(site_key, title_selectors['default'])
+    selected_content_selectors = content_selectors.get(site_key, content_selectors['default'])
+    
     # Extract title
     title = ""
-    for selector in ['h1.entry-title', 'h1.post-title', 'h1', 'title', 'meta[property="og:title"]', 'h2', 'h3']:
+    for selector in selected_title_selectors:
         elem = soup.select_one(selector)
         if elem:
             if selector.startswith('meta'):
@@ -1298,28 +1329,12 @@ def extract_article_content(html: str, url: str) -> Dict[str, str]:
         if date_match:
             date = date_match.group(0)
     
-    # Extract content with priority selectors
+    # Extract content
     content = ""
-    article_selectors = [
-        'article.post-content',
-        'div.entry-content',
-        'div.post-content',
-        'div.article-content',
-        'div.content',
-        'article',
-        'div.post',
-        'div.article-body',
-        'div.main-content',
-        'section.article',
-        'div.body-text',
-        'div#article',
-        'div#content',
-    ]
-    
-    for selector in article_selectors:
+    for selector in selected_content_selectors:
         article_elem = soup.select_one(selector)
         if article_elem:
-            # Remove ads within article
+            # Remove inner noise
             for inner_ad in article_elem.select('[class*="ad"], [id*="ad"], [class*="banner"], [id*="banner"]'):
                 try:
                     inner_ad.decompose()
@@ -1336,7 +1351,7 @@ def extract_article_content(html: str, url: str) -> Dict[str, str]:
                 content = "\n\n".join(content_parts)
                 break
     
-    # Fallback: extract from all paragraphs
+    # Fallback
     if not content or len(content) < 200:
         all_paragraphs = soup.find_all('p')
         content_parts = []
@@ -1346,19 +1361,16 @@ def extract_article_content(html: str, url: str) -> Dict[str, str]:
                 content_parts.append(text)
         content = "\n\n".join(content_parts[:20])
     
-    # Last resort: body text
     if not content:
         body = soup.select_one('body')
         if body:
             content = clean_text(body.get_text(separator="\n", strip=True))
     
-    # Extract key information
     key_info = extract_key_information(content)
     
-    # Create a compelling snippet (150-250 words to encourage "Read More")
+    # Create snippet
     snippet = ""
     if content:
-        # Take first 200 words as snippet
         words = content.split()
         if len(words) > 200:
             snippet = ' '.join(words[:200]) + "..."
@@ -1368,8 +1380,8 @@ def extract_article_content(html: str, url: str) -> Dict[str, str]:
     return {
         'title': title or "Untitled Article",
         'date': date,
-        'content': snippet,  # Preview snippet
-        'full_content': content,  # Full content if needed
+        'content': snippet,
+        'full_content': content,
         'key_info': key_info,
         'url': url,
         'word_count': len(content.split()) if content else 0
@@ -1442,7 +1454,7 @@ async def fetch_article_details(article_url: str) -> Optional[Dict[str, Any]]:
         return None
 
 # ═══════════════════════════════════════════════════════════════════════════
-# PUNCH-SPECIFIC EXTRACTOR (NEW)
+# SITE-SPECIFIC EXTRACTORS
 # ═══════════════════════════════════════════════════════════════════════════
 
 def extract_punch_items(html: str, base_url: str) -> List[Dict[str, Any]]:
@@ -1457,14 +1469,12 @@ def extract_punch_items(html: str, base_url: str) -> List[Dict[str, Any]]:
     date_selectors = ["time", ".td-post-date", ".entry-meta time", ".post-meta time"]
     excerpt_selectors = [".td-excerpt", ".entry-summary p", ".post-excerpt p", ".td-module-meta-info .td-excerpt"]
 
-    # gather containers
     containers = []
     for sel in container_selectors:
         found = soup.select(sel)
         if found:
             containers.extend(found)
     if not containers:
-        # fallback: try list-style blocks
         containers = soup.select("ul li, .latest-news li, .news-list li")
 
     for c in containers:
@@ -1480,10 +1490,8 @@ def extract_punch_items(html: str, base_url: str) -> List[Dict[str, Any]]:
             if not title:
                 continue
 
-            # normalize URL
             link = urljoin(base_url, link) if link else None
 
-            # date
             date = None
             for dsel in date_selectors:
                 d = c.select_one(dsel)
@@ -1491,7 +1499,6 @@ def extract_punch_items(html: str, base_url: str) -> List[Dict[str, Any]]:
                     date = d.get_text(" ", strip=True)
                     break
 
-            # excerpt
             snippet = None
             for es in excerpt_selectors:
                 e = c.select_one(es)
@@ -1500,11 +1507,10 @@ def extract_punch_items(html: str, base_url: str) -> List[Dict[str, Any]]:
                     if len(snippet) >= 40:
                         break
 
-            # if no snippet, placeholder
             if not snippet and link:
                 snippet = "Click to read full update..."
 
-            key = f"{title[:80]}|{link}"
+            key = f"{title[:50]}|{link}"
             if key in seen:
                 continue
             seen.add(key)
@@ -1522,51 +1528,85 @@ def extract_punch_items(html: str, base_url: str) -> List[Dict[str, Any]]:
 
     return items
 
+def extract_myschool_items(html: str, base_url: str) -> List[Dict[str, Any]]:
+    """MySchool.ng-specific extraction."""
+    soup = BeautifulSoup(html, "lxml")
+    items = []
+    seen = set()
+
+    containers = soup.select(".news-item, .post, .article")
+
+    for c in containers:
+        try:
+            title_elem = c.select_one("h2 a, h3 a, .title a")
+            if title_elem:
+                title = title_elem.get_text(strip=True)
+                link = urljoin(base_url, title_elem.get("href"))
+            else:
+                continue
+
+            date = c.select_one(".date, .post-date") and c.select_one(".date, .post-date").get_text(strip=True) or None
+
+            snippet = ""
+            p = c.select_one(".excerpt, p")
+            if p:
+                snippet = p.get_text(strip=True)
+
+            key = f"{title[:50]}|{link}"
+            if key in seen:
+                continue
+            seen.add(key)
+
+            items.append({
+                "title": title,
+                "snippet": snippet or "Click to read full update...",
+                "date": date,
+                "link": link,
+                "source": urlparse(base_url).netloc,
+                "pdf": False
+            })
+        except:
+            continue
+
+    return items
+
+# Add more site-specific if needed, e.g., for JAMB, NECO, etc.
+
 # ═══════════════════════════════════════════════════════════════════════════
-# IMPROVED SCHOOL NEWS LISTING EXTRACTOR
+# IMPROVED SCHOOL NEWS LISTING EXTRACTOR WITH SITE-SPECIFIC SUPPORT
 # ═══════════════════════════════════════════════════════════════════════════
 
 def extract_school_news_listings(html: str, base_url: str) -> List[Dict[str, Any]]:
     """
-    Extract news listings from a page with COMPREHENSIVE improvements:
-    - Tries Punch-specific extractor for punchng.com
-    - Safer noise removal (only nav/header/footer)
-    - Looser title length requirements
-    - List-style fallback detection
-    - Better snippet extraction with sibling paragraphs
-    - Debug logging when no items found
+    Extract news listings with site-specific improvements.
     """
     if not html or len(html) < 1000:
         LOG.debug("HTML too short (len=%d) for %s", len(html), base_url)
         return []
     
-    # === SITE-SPECIFIC EXTRACTORS ===
-    domain = urlparse(base_url).netloc.lower()
+    domain = get_domain_from_url(base_url)
     
-    # Punch-specific extractor
+    # Site-specific extractors
     if "punchng.com" in domain:
-        LOG.debug("Using Punch-specific extractor for %s", base_url)
-        punch_items = extract_punch_items(html, base_url)
-        if punch_items:
-            LOG.info("Punch extractor found %d items", len(punch_items))
-            return punch_items
-        LOG.debug("Punch extractor found 0 items, falling back to generic")
+        LOG.debug("Using Punch-specific extractor")
+        return extract_punch_items(html, base_url)
     
-    # === GENERIC EXTRACTOR (IMPROVED) ===
+    if "myschool.ng" in domain:
+        LOG.debug("Using MySchool-specific extractor")
+        return extract_myschool_items(html, base_url)
+    
+    # Generic extractor (as before, with improvements)
     soup = BeautifulSoup(html, 'lxml')
     items = []
     seen = set()
     
-    # === PHASE 1: SAFER NOISE REMOVAL ===
-    # Only remove top-level chrome, not arbitrary widgets
     for selector in ['nav', 'header', 'footer', '[id*="header"]', '[id*="footer"]']:
         for elem in soup.select(selector):
             try:
                 elem.decompose()
-            except Exception:
+            except:
                 pass
     
-    # === PHASE 2: IDENTIFY ARTICLE CONTAINERS ===
     article_container_selectors = [
         'article',
         '.post', '.entry', '.article',
@@ -1586,14 +1626,12 @@ def extract_school_news_listings(html: str, base_url: str) -> List[Dict[str, Any
             if len(article_containers) >= 15:
                 break
     
-    # === PHASE 3: EXTRACT FROM EACH CONTAINER ===
     for container in article_containers[:20]:
         try:
             title_elem = None
             title_text = ""
             article_url = ""
             
-            # Try to find title in heading tags first
             for heading_tag in ['h1', 'h2', 'h3', 'h4']:
                 heading = container.find(heading_tag)
                 if heading:
@@ -1606,19 +1644,16 @@ def extract_school_news_listings(html: str, base_url: str) -> List[Dict[str, Any
                     else:
                         title_text = heading.get_text(" ", strip=True)
             
-            # Fallback: find any prominent link
             if not title_text:
                 for link in container.find_all('a', href=True):
                     link_text = link.get_text(" ", strip=True)
-                    if len(link_text) >= 8:  # LOWERED from 20
+                    if len(link_text) >= 8:
                         title_text = link_text
                         article_url = link.get('href', '')
                         title_elem = link
                         break
             
-            # === NEW: LIST-STYLE FALLBACK ===
             if not title_text:
-                # look for <li> anchors
                 for li in container.select("li"):
                     a = li.find('a', href=True)
                     if a:
@@ -1629,7 +1664,6 @@ def extract_school_news_listings(html: str, base_url: str) -> List[Dict[str, Any
                             title_elem = a
                             break
                 
-                # fallback: any prominent anchor that looks like a news link
                 if not title_text:
                     for a in container.find_all('a', href=True):
                         txt = a.get_text(" ", strip=True)
@@ -1639,58 +1673,46 @@ def extract_school_news_listings(html: str, base_url: str) -> List[Dict[str, Any
                             title_elem = a
                             break
             
-            # === IMPROVED TITLE VALIDATION ===
             if not title_text:
                 continue
             
-            # Accept titles ≥ 8 characters; allow shorter if parent link has semantics
             if len(title_text) < 8:
                 if title_elem is not None:
                     alt = (title_elem.get('title') or title_elem.get('aria-label') or "").strip()
                     if alt and len(alt) >= 8:
                         title_text = alt
-                    # else: still accept short titles (gov sites often use terse headlines)
             
-            # Clean title
             title_text = re.sub(r'^(News|Update|Article)\s+', '', title_text, flags=re.I)
             title_text = re.sub(r'\s+', ' ', title_text).strip()
             
-            # Build full URL
             if article_url:
                 full_url = urljoin(base_url, article_url)
             else:
                 continue
             
-            # Dedup check
             dedup_key = f"{title_text[:50]}|{full_url}"
             if dedup_key in seen:
                 continue
             seen.add(dedup_key)
             
-            # === EXTRACT DATE ===
             date_str = None
             
-            # Try time/date tags first
             time_elem = container.find(['time', 'span[class*="date"]', 'div[class*="date"]'])
             if time_elem:
                 date_str = time_elem.get_text(" ", strip=True)
             
-            # Fallback: regex search in container text
             if not date_str and _DATE_RE:
                 container_text = container.get_text(" ", strip=True)[:500]
                 date_match = _DATE_RE.search(container_text)
                 if date_match:
                     date_str = date_match.group(0)
             
-            # Clean date
             if date_str:
                 date_str = re.sub(r'^News\s+', '', date_str, flags=re.I)
                 date_str = date_str.strip()
             
-            # === IMPROVED SNIPPET EXTRACTION ===
             snippet = ""
             
-            # Strategy 1: Find article summary/excerpt div
             excerpt_selectors = [
                 '.entry-summary', '.excerpt', '.post-excerpt',
                 '[class*="summary"]', '[class*="excerpt"]',
@@ -1706,7 +1728,6 @@ def extract_school_news_listings(html: str, base_url: str) -> List[Dict[str, Any
                         snippet = snippet_text
                         break
             
-            # Strategy 2: Get first paragraph(s) after title
             if not snippet:
                 paragraphs = container.find_all('p')
                 for p in paragraphs[:3]:
@@ -1721,10 +1742,8 @@ def extract_school_news_listings(html: str, base_url: str) -> List[Dict[str, Any
                     snippet = p_text
                     break
             
-            # === NEW: SIBLING PARAGRAPH FALLBACK ===
             if not snippet and title_elem is not None:
                 parent = title_elem.parent
-                # check next siblings for paragraphs
                 for sib in parent.find_next_siblings(limit=3):
                     if sib.name == 'p':
                         t = sib.get_text(" ", strip=True)
@@ -1732,14 +1751,12 @@ def extract_school_news_listings(html: str, base_url: str) -> List[Dict[str, Any
                             snippet = t
                             break
             
-            # Strategy 3: Get container text (excluding title)
             if not snippet:
                 container_text = container.get_text(" ", strip=True)
                 container_text = container_text.replace(title_text, '').strip()
                 if len(container_text) >= 50:
                     snippet = container_text[:300]
             
-            # === VALIDATE SNIPPET QUALITY ===
             if snippet:
                 snippet = re.sub(r'\s+', ' ', snippet)
                 snippet = snippet.replace("Read More", "").replace("Continue Reading", "").strip()
@@ -1759,7 +1776,6 @@ def extract_school_news_listings(html: str, base_url: str) -> List[Dict[str, Any
             else:
                 snippet = "Click to read full update..."
             
-            # === BUILD ITEM ===
             item = {
                 "title": title_text,
                 "snippet": snippet,
@@ -1775,13 +1791,11 @@ def extract_school_news_listings(html: str, base_url: str) -> List[Dict[str, Any
             LOG.debug("Failed to extract article from container: %s", e)
             continue
     
-    # === PHASE 4: DEBUG LOGGING ===
     if not items:
         body = soup.select_one('body')
         context = body.get_text(" ", strip=True)[:2000] if body else html[:2000]
         LOG.debug("No items extracted from %s — content sample: %s", base_url, context)
     
-    # === PHASE 5: SORT & RETURN ===
     items.sort(key=lambda x: (
         x['date'] is None,
         -len(x.get('snippet', '')),
@@ -1790,26 +1804,13 @@ def extract_school_news_listings(html: str, base_url: str) -> List[Dict[str, Any
     LOG.info("Extracted %d items from %s", len(items), base_url)
     return items[:15]
 
-
 async def scrape_school_news(
     urls: List[str], 
     fetch_full_content: bool = False, 
     max_articles: int = 10
 ) -> List[Dict[str, Any]]:
     """
-    Scrape school news from URLs with COMPREHENSIVE IMPROVEMENTS:
-    - Tries candidate listing URLs (news paths, subdomains)
-    - Uses improved extraction with Punch-specific support
-    - Optionally fetches full content
-    - Detailed logging for debugging
-    
-    Args:
-        urls: List of URLs to scrape
-        fetch_full_content: If True, fetches full article content (slower)
-        max_articles: Maximum articles to fetch full content for
-    
-    Returns:
-        List of news items with improved snippets
+    Scrape school news with parallel fetching for speed.
     """
     all_news = []
     
@@ -1818,7 +1819,6 @@ async def scrape_school_news(
         LOG.info(f"📰 Scraping: {base_url}")
         LOG.info(f"{'='*70}")
         
-        # === TRY CANDIDATE LISTING URLS ===
         candidates = candidate_listing_urls(base_url)
         LOG.info(f"  Trying {len(candidates)} candidate URLs...")
         
@@ -1831,7 +1831,6 @@ async def scrape_school_news(
                 test_html = await _fetch_html(candidate_url)
                 
                 if test_html and len(test_html) > 1000:
-                    # Quick test: does this page have news-like content?
                     test_items = extract_school_news_listings(test_html, candidate_url)
                     if test_items and len(test_items) > 0:
                         LOG.info(f"  ✓ SUCCESS with {candidate_url} ({len(test_items)} items)")
@@ -1843,7 +1842,6 @@ async def scrape_school_news(
                 else:
                     LOG.debug(f"    Insufficient content at {candidate_url} (len={len(test_html) if test_html else 0})")
                 
-                # Rate limit between attempts
                 await asyncio.sleep(random.uniform(1, 2))
                 
             except Exception as e:
@@ -1854,77 +1852,35 @@ async def scrape_school_news(
             LOG.warning(f"  ✗ All candidate URLs failed for {base_url}")
             continue
         
-        # === EXTRACT LISTINGS ===
         items = extract_school_news_listings(html, successful_url)
         LOG.info(f"  ✓ Found {len(items)} articles from {successful_url}")
         
         if not items:
             continue
         
-        # === OPTIONAL: FETCH FULL CONTENT ===
         if fetch_full_content and max_articles > 0:
-            LOG.info(f"\n  📄 Fetching full content for top {max_articles} articles...")
+            LOG.info(f"\n  📄 Fetching full content for top {max_articles} articles in parallel...")
             
-            for i, item in enumerate(items[:max_articles], 1):
-                LOG.info(f"\n    [{i}/{min(max_articles, len(items))}] {item['title'][:60]}...")
-                
-                try:
-                    article_html = await _fetch_html(item['link'])
-                    
-                    if article_html:
-                        article_soup = BeautifulSoup(article_html, 'lxml')
-                        
-                        # Remove noise
-                        for elem in article_soup.select('script, style, nav, header, footer, [class*="ad"]'):
-                            try:
-                                elem.decompose()
-                            except:
-                                pass
-                        
-                        # Find article body
-                        article_body = None
-                        for selector in [
-                            'article .entry-content',
-                            '.post-content',
-                            '.article-content',
-                            'article',
-                            '.content',
-                        ]:
-                            article_body = article_soup.select_one(selector)
-                            if article_body:
-                                break
-                        
-                        if article_body:
-                            paragraphs = article_body.find_all('p')
-                            full_text = "\n\n".join([
-                                p.get_text(" ", strip=True) 
-                                for p in paragraphs 
-                                if len(p.get_text(" ", strip=True)) > 30
-                            ])
-                            
-                            if full_text:
-                                words = full_text.split()
-                                if len(words) > 200:
-                                    item['snippet'] = ' '.join(words[:200]) + "..."
-                                else:
-                                    item['snippet'] = full_text
-                                
-                                item['full_content'] = full_text
-                                item['word_count'] = len(words)
-                                
-                                LOG.info(f"      ✓ Extracted {len(words)} words")
-                    
-                    await asyncio.sleep(random.uniform(2, 4))
-                    
-                except Exception as e:
-                    LOG.warning(f"      ✗ Failed to fetch full content: {str(e)[:50]}")
-                    continue
+            # Parallel fetch
+            tasks = [fetch_article_details(item['link']) for item in items[:max_articles]]
+            details_list = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for item, details in zip(items[:max_articles], details_list):
+                if not isinstance(details, Exception) and details:
+                    item['snippet'] = details['content']
+                    item['full_content'] = details['full_content']
+                    item['word_count'] = details['word_count']
+                    item['key_info'] = details['key_info']
+                    if details['date'] and not item['date']:
+                        item['date'] = details['date']
+                else:
+                    LOG.warning(f"Failed parallel fetch for {item['title'][:30]}")
         
         all_news.extend(items)
         LOG.info(f"\n  ✓ Processed {len(items)} articles from {successful_url}")
         
         LOG.info("-" * 70)
-        await asyncio.sleep(random.uniform(5, 8))
+        await asyncio.sleep(random.uniform(3, 6))  # Reduced
     
     LOG.info(f"\n{'='*70}")
     LOG.info(f"📊 TOTAL: {len(all_news)} articles from {len(urls)} sources")
