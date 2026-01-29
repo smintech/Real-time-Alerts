@@ -779,7 +779,7 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
                         break
         
         if "konga" in domain and product["current_price"] is None:
-            selectors = ["span._3e_22_199e7", "._3e_22_199e7", "h4._44738_3988u", "div.price", "[class*='price']", ".price-box .price"]  # Added more selectors for Konga
+            selectors = ["span._3e_22_199e7", "._3e_22_199e7", "h4._44738_3988u", "div.price", "[class*='price']", "span:contains('₦')"]  # Enhanced
             for sel in selectors:
                 el = soup.select_one(sel)
                 if el:
@@ -820,7 +820,7 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
         product["stock_status"] = "out_of_stock"
     
     if product["title"] == "Product" or "Buy" in product["title"]:
-        h1 = soup.select_one("h1.-fs20, h1.-pb10, h1.brd, .v-p-hd h1, h1, .product-title, h1.product-name")  # Added Konga-specific
+        h1 = soup.select_one("h1.-fs20, h1.-pb10, h1.brd, .v-p-hd h1, h1, .product-title, h1.product-name")  # Enhanced
         if h1:
             product["title"] = h1.get_text(strip=True)
         elif soup.title:
@@ -874,7 +874,7 @@ def safe_scrape_product(url: str) -> Tuple[bool, Optional[Dict], Optional[str]]:
         return False, None, f"Error: {e}"
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CHANGE DETECTION & DEAL SCORING
+# CHANGE DETECTION & DEAL SCORING (FIXED TYPE ERROR)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def compute_changes(old_data: Optional[Dict], new_data: Dict) -> Dict[str, Any]:
@@ -896,23 +896,14 @@ def compute_changes(old_data: Optional[Dict], new_data: Dict) -> Dict[str, Any]:
     old_price = old_data.get("current_price")
     new_price = new_data.get("current_price")
     
-    try:
-        old_price_num = float(old_price) if old_price is not None else None
-    except (ValueError, TypeError):
-        old_price_num = None
-    
-    try:
-        new_price_num = float(new_price) if new_price is not None else None
-    except (ValueError, TypeError):
-        new_price_num = None
+    old_price_num = float(old_price or 0)
+    new_price_num = float(new_price or 0)
     
     if old_price_num != new_price_num:
         changed = True
         what_changed.append("price")
-        if old_price_num and old_price_num > 0 and new_price_num is not None:
+        if old_price_num > 0:
             price_diff_percent = round(((old_price_num - new_price_num) / old_price_num) * 100, 2)
-        else:
-            price_diff_percent = 0.0
     
     old_stock = old_data.get("stock_status")
     new_stock = new_data.get("stock_status")
@@ -1454,7 +1445,7 @@ async def fetch_article_details(article_url: str) -> Optional[Dict[str, Any]]:
         return None
 
 # ═══════════════════════════════════════════════════════════════════════════
-# SITE-SPECIFIC EXTRACTORS
+# SITE-SPECIFIC EXTRACTORS (UPDATED FOR ALL SOURCES)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def extract_punch_items(html: str, base_url: str) -> List[Dict[str, Any]]:
@@ -1570,7 +1561,195 @@ def extract_myschool_items(html: str, base_url: str) -> List[Dict[str, Any]]:
 
     return items
 
-# Add more site-specific if needed, e.g., for JAMB, NECO, etc.
+def extract_jamb_items(html: str, base_url: str) -> List[Dict[str, Any]]:
+    """JAMB-specific extraction (flat p tags)."""
+    soup = BeautifulSoup(html, "lxml")
+    items = []
+    seen = set()
+
+    paragraphs = soup.find_all('p')
+    i = 0
+    while i < len(paragraphs) - 3:
+        title_p = paragraphs[i]
+        snippet_p = paragraphs[i+1]
+        link_p = paragraphs[i+2]
+        date_p = paragraphs[i+3]
+
+        title = title_p.get_text(strip=True)
+        if not title or len(title) < 10:
+            i += 1
+            continue
+
+        snippet = snippet_p.get_text(strip=True)
+        link_elem = link_p.find('a', href=True)
+        link = urljoin(base_url, link_elem.get('href')) if link_elem else None
+        date = date_p.get_text(strip=True)
+
+        key = f"{title[:50]}|{link}"
+        if key in seen:
+            i += 4
+            continue
+        seen.add(key)
+
+        items.append({
+            "title": title,
+            "snippet": snippet or "Click to read full update...",
+            "date": date,
+            "link": link,
+            "source": "jamb.gov.ng",
+            "pdf": _is_pdf_link(link) if link else False
+        })
+        i += 4
+
+    return items
+
+def extract_neco_items(html: str, base_url: str) -> List[Dict[str, Any]]:
+    """NECO-specific extraction."""
+    soup = BeautifulSoup(html, "lxml")
+    items = []
+    seen = set()
+
+    containers = soup.select(".news-item")
+    for c in containers:
+        title = c.select_one(".news-title, h3").get_text(strip=True) if c.select_one(".news-title, h3") else None
+        if not title:
+            continue
+
+        date = c.select_one(".news-date, span").get_text(strip=True) if c.select_one(".news-date, span") else None
+        snippet = c.select_one(".news-snippet, p").get_text(strip=True) if c.select_one(".news-snippet, p") else "Click to read full update..."
+        link_elem = c.select_one(".read-more-link, a")
+        link = urljoin(base_url, link_elem.get("href")) if link_elem else None
+
+        key = f"{title[:50]}|{link}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        items.append({
+            "title": title,
+            "snippet": snippet,
+            "date": date,
+            "link": link,
+            "source": "neco.gov.ng",
+            "pdf": _is_pdf_link(link) if link else False
+        })
+
+    return items
+
+def extract_nuc_items(html: str, base_url: str) -> List[Dict[str, Any]]:
+    """NUC-specific extraction (markdown-like)."""
+    soup = BeautifulSoup(html, "lxml")
+    items = []
+    seen = set()
+
+    headings = soup.select("h2")
+    for h2 in headings:
+        title_a = h2.find("a")
+        title = title_a.get_text(strip=True) if title_a else h2.get_text(strip=True)
+        link = urljoin(base_url, title_a.get("href")) if title_a else None
+
+        next_p = h2.find_next("p")
+        date = None
+        if next_p and "by |" in next_p.get_text():
+            date_match = re.search(r"by \|\s*(.+?)\s*\|", next_p.get_text())
+            date = date_match.group(1) if date_match else None
+
+        excerpt_p = next_p.find_next("p") if next_p else None
+        snippet = excerpt_p.get_text(strip=True) if excerpt_p else "Click to read full update..."
+
+        read_more_a = excerpt_p.find_next("a") if excerpt_p else None
+        read_more_link = urljoin(base_url, read_more_a.get("href")) if read_more_a and "read more" in read_more_a.get_text().lower() else link
+
+        key = f"{title[:50]}|{read_more_link}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        items.append({
+            "title": title,
+            "snippet": snippet,
+            "date": date,
+            "link": read_more_link,
+            "source": "nuc.edu.ng",
+            "pdf": _is_pdf_link(read_more_link) if read_more_link else False
+        })
+
+    return items
+
+def extract_education_items(html: str, base_url: str) -> List[Dict[str, Any]]:
+    """Education.gov.ng-specific extraction."""
+    soup = BeautifulSoup(html, "lxml")
+    items = []
+    seen = set()
+
+    containers = soup.select(".news-item")
+    for c in containers:
+        title_h3 = c.select_one("h3")
+        title = title_h3.get_text(strip=True) if title_h3 else None
+        if not title:
+            continue
+
+        link_a = c.select_one("a")
+        link = urljoin(base_url, link_a.get("href")) if link_a else None
+
+        snippet_p = c.select_one("p")
+        snippet = snippet_p.get_text(strip=True) if snippet_p else "Click to read full update..."
+
+        date = None  # No explicit date in structure; parse from snippet if needed
+        date_match = _DATE_RE.search(snippet) if _DATE_RE else None
+        date = date_match.group(0) if date_match else None
+
+        key = f"{title[:50]}|{link}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        items.append({
+            "title": title,
+            "snippet": snippet,
+            "date": date,
+            "link": link,
+            "source": "education.gov.ng",
+            "pdf": _is_pdf_link(link) if link else False
+        })
+
+    return items
+
+def extract_lasubeb_items(html: str, base_url: str) -> List[Dict[str, Any]]:
+    """LASUBEB-specific extraction (h2 + p)."""
+    soup = BeautifulSoup(html, "lxml")
+    items = []
+    seen = set()
+
+    headings = soup.select("h2")
+    for h2 in headings:
+        title = h2.get_text(strip=True)
+        if not title or len(title) < 10:
+            continue
+
+        date_p = h2.find_next("p")
+        date = date_p.get_text(strip=True) if date_p and re.match(r"^[A-z]+ \d{1,2}(?:st|nd|rd|th) \d{4}$", date_p.get_text(strip=True)) else None
+
+        snippet_p = date_p.find_next("p") if date_p else h2.find_next("p")
+        snippet = snippet_p.get_text(strip=True) if snippet_p else "Click to read full update..."
+
+        link = None  # No links in structure; assume base or none
+
+        key = f"{title[:50]}|{link}"
+        if key in seen:
+            continue
+        seen.add(key)
+
+        items.append({
+            "title": title,
+            "snippet": snippet,
+            "date": date,
+            "link": link,
+            "source": "lasubeb.lg.gov.ng",
+            "pdf": False
+        })
+
+    return items
 
 # ═══════════════════════════════════════════════════════════════════════════
 # IMPROVED SCHOOL NEWS LISTING EXTRACTOR WITH SITE-SPECIFIC SUPPORT
@@ -1594,6 +1773,26 @@ def extract_school_news_listings(html: str, base_url: str) -> List[Dict[str, Any
     if "myschool.ng" in domain:
         LOG.debug("Using MySchool-specific extractor")
         return extract_myschool_items(html, base_url)
+    
+    if "jamb.gov.ng" in domain:
+        LOG.debug("Using JAMB-specific extractor")
+        return extract_jamb_items(html, base_url)
+    
+    if "neco.gov.ng" in domain:
+        LOG.debug("Using NECO-specific extractor")
+        return extract_neco_items(html, base_url)
+    
+    if "nuc.edu.ng" in domain:
+        LOG.debug("Using NUC-specific extractor")
+        return extract_nuc_items(html, base_url)
+    
+    if "education.gov.ng" in domain:
+        LOG.debug("Using Education.gov.ng-specific extractor")
+        return extract_education_items(html, base_url)
+    
+    if "lasubeb.lg.gov.ng" in domain:
+        LOG.debug("Using LASUBEB-specific extractor")
+        return extract_lasubeb_items(html, base_url)
     
     # Generic extractor (as before, with improvements)
     soup = BeautifulSoup(html, 'lxml')
@@ -1862,7 +2061,7 @@ async def scrape_school_news(
             LOG.info(f"\n  📄 Fetching full content for top {max_articles} articles in parallel...")
             
             # Parallel fetch
-            tasks = [fetch_article_details(item['link']) for item in items[:max_articles]]
+            tasks = [fetch_article_details(item['link']) for item in items[:max_articles] if item['link']]
             details_list = await asyncio.gather(*tasks, return_exceptions=True)
             
             for item, details in zip(items[:max_articles], details_list):
