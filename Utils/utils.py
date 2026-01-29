@@ -66,7 +66,7 @@ if not _SCRAPER_PROXIES:
     LOG.debug("No proxies configured — running proxy-free mode")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# NEWS PATH DETECTION (NEW)
+# NEWS PATH DETECTION (IMPROVED - REMOVED SUBDOMAIN GUESS)
 # ═══════════════════════════════════════════════════════════════════════════
 
 COMMON_NEWS_PATHS = [
@@ -78,11 +78,12 @@ COMMON_NEWS_PATHS = [
 
 def candidate_listing_urls(base_url: str) -> List[str]:
     """
-    Yield candidate URLs to try for a site: base root, common news paths, and news.<domain>.
+    Yield candidate URLs to try for a site: base root + common news paths.
+    REMOVED unreliable news.<domain> guess to prevent wrong URLs like news.myschool.ng
     """
     u = urlparse(base_url)
     scheme = u.scheme or "https"
-    netloc = u.netloc or u.path  # handle if base_url is just a domain
+    netloc = u.netloc or u.path
     roots = [
         f"{scheme}://{netloc}",
         f"{scheme}://{netloc}/",
@@ -92,9 +93,6 @@ def candidate_listing_urls(base_url: str) -> List[str]:
         candidates.append(root)
         for p in COMMON_NEWS_PATHS:
             candidates.append(root.rstrip("/") + p)
-    # also try news.<domain>
-    if not netloc.startswith("news."):
-        candidates.append(f"{scheme}://news.{netloc}")
     # dedup while preserving order
     seen = set()
     out = []
@@ -105,22 +103,21 @@ def candidate_listing_urls(base_url: str) -> List[str]:
     return out
 
 # ═══════════════════════════════════════════════════════════════════════════
-# AGGRESSIVE CLOUDSCRAPER (fresh instance per attempt)
+# AGGRESSIVE CLOUDSCRAPER
 # ═══════════════════════════════════════════════════════════════════════════
 
-def fetch_with_cloudscraper_aggressive(url: str, retries: int = 5) -> str:  # Reduced retries for speed
-    """Try cloudscraper repeatedly, creating a fresh scraper each attempt."""
+def fetch_with_cloudscraper_aggressive(url: str, retries: int = 5) -> str:
     for attempt in range(1, retries + 1):
         LOG.debug("Cloudscraper attempt %d/%d for %s", attempt, retries, url)
         try:
-            time.sleep(random.uniform(1.5, 4.0))  # Reduced sleep for speed
+            time.sleep(random.uniform(1.5, 4.0))
             scraper = cloudscraper.create_scraper(
                 browser={
                     'browser': 'chrome',
                     'platform': random.choice(['windows', 'darwin', 'linux']),
                     'mobile': False
                 },
-                delay=random.randint(4, 10),  # Reduced delay range
+                delay=random.randint(4, 10),
             )
             headers = {
                 'User-Agent': random.choice(_USER_AGENTS),
@@ -132,7 +129,7 @@ def fetch_with_cloudscraper_aggressive(url: str, retries: int = 5) -> str:  # Re
                 'Connection': 'keep-alive',
                 'Upgrade-Insecure-Requests': '1',
             }
-            resp = scraper.get(url, headers=headers, timeout=45)  # Reduced timeout
+            resp = scraper.get(url, headers=headers, timeout=45)
             status = getattr(resp, "status_code", None)
             text = resp.text or ""
             
@@ -142,26 +139,23 @@ def fetch_with_cloudscraper_aggressive(url: str, retries: int = 5) -> str:  # Re
                 if not any(k in text.lower() for k in blocked_kw):
                     LOG.debug("Cloudscraper returned content for %s", url)
                     return text
-                else:
-                    LOG.debug("Cloudscraper appears blocked (attempt %d) for %s", attempt, url)
-            else:
-                LOG.debug("Cloudscraper status %s or small content (len=%d)", status, len(text))
         except Exception as e:
             LOG.debug("Cloudscraper attempt %d error for %s: %s", attempt, url, e)
         
         if attempt < retries:
-            time.sleep(random.uniform(2, 6))  # Reduced sleep
+            time.sleep(random.uniform(2, 6))
     
     raise Exception("Cloudscraper failed all attempts")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# AGGRESSIVE PLAYWRIGHT (fresh browser/context each attempt with anti-detection)
+# AGGRESSIVE PLAYWRIGHT (IMPROVED CLEANUP + NETWORKIDLE)
 # ═══════════════════════════════════════════════════════════════════════════
 
-async def fetch_with_playwright_aggressive(url: str, retries: int = 3) -> str:  # Reduced retries for speed
-    """Aggressive Playwright fetch: fresh browser/context each attempt with anti-detection steps."""
+async def fetch_with_playwright_aggressive(url: str, retries: int = 3) -> str:
     for attempt in range(1, retries + 1):
         LOG.debug("Playwright attempt %d/%d for %s", attempt, retries, url)
+        browser = None
+        context = None
         try:
             async with async_playwright() as p:
                 browser = await p.chromium.launch(headless=True, args=[
@@ -180,7 +174,6 @@ async def fetch_with_playwright_aggressive(url: str, retries: int = 3) -> str:  
                 )
                 page = await context.new_page()
                 
-                # anti-detection
                 await page.add_init_script("""
                     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                     Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
@@ -188,42 +181,43 @@ async def fetch_with_playwright_aggressive(url: str, retries: int = 3) -> str:  
                     window.chrome = { runtime: {} };
                 """)
                 
-                await asyncio.sleep(random.uniform(1.5, 4.0))  # Reduced sleep
-                await page.goto(url, wait_until='domcontentloaded', timeout=45000)  # Reduced timeout
+                await asyncio.sleep(random.uniform(1.5, 4.0))
+                await page.goto(url, wait_until='networkidle', timeout=60000)  # networkidle + higher timeout
                 
-                # Wait and interact a bit
-                await page.wait_for_timeout(random.randint(1000, 3000))  # Reduced wait
+                await page.wait_for_load_state('networkidle', timeout=30000)
+                await page.wait_for_timeout(random.randint(2000, 4000))
+                
                 try:
                     await page.evaluate('window.scrollTo(0, document.body.scrollHeight/2)')
-                    await page.wait_for_timeout(500)  # Reduced
+                    await page.wait_for_timeout(800)
                 except Exception:
                     pass
                 
                 html = await page.content()
-                await browser.close()
                 
                 if len(html) > 3000 and 'cloudflare' not in html.lower() and 'just a moment' not in html.lower():
                     LOG.debug("Playwright succeeded for %s", url)
                     return html
-                else:
-                    LOG.debug("Playwright produced blocked/insufficient content for %s (len=%d)", url, len(html))
         except Exception as e:
             LOG.debug("Playwright attempt %d exception for %s: %s", attempt, url, e)
+        finally:
+            if context:
+                await context.close()
+            if browser:
+                await browser.close()
         
         if attempt < retries:
-            await asyncio.sleep(random.uniform(2, 6))  # Reduced sleep
+            await asyncio.sleep(random.uniform(3, 8))
     
     raise Exception("Playwright failed all attempts")
 
 # ═══════════════════════════════════════════════════════════════════════════
-# ULTIMATE FETCH (combines both strategies)
+# ULTIMATE FETCH
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def fetch_html_ultimate(url: str) -> str:
-    """Ultimate fetch: Cloudscraper attempts first, then Playwright aggressive."""
     LOG.info("fetch_html_ultimate: fetching %s", url)
     
-    # 1) cloudscraper aggressive
     try:
         loop = asyncio.get_running_loop()
         html = await loop.run_in_executor(None, fetch_with_cloudscraper_aggressive, url, 5)
@@ -231,7 +225,6 @@ async def fetch_html_ultimate(url: str) -> str:
     except Exception as e:
         LOG.debug("Cloudscraper exhausted for %s: %s", url, e)
     
-    # 2) Playwright aggressive
     try:
         html = await fetch_with_playwright_aggressive(url, retries=3)
         return html
@@ -244,7 +237,7 @@ async def fetch_html_ultimate(url: str) -> str:
 # RETRY DECORATOR
 # ═══════════════════════════════════════════════════════════════════════════
 
-def retry(max_attempts: int = 3, backoff: float = 1.5):  # Reduced for speed
+def retry(max_attempts: int = 3, backoff: float = 1.5):
     def decorator(fn):
         @wraps(fn)
         async def async_wrapper(*args, **kwargs):
@@ -288,18 +281,18 @@ def retry(max_attempts: int = 3, backoff: float = 1.5):  # Reduced for speed
     return decorator
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CORE FETCH FUNCTION
+# CORE FETCH FUNCTION (KONGA USES CLOUDSCRAPER FIRST)
 # ═══════════════════════════════════════════════════════════════════════════
 
-@retry(max_attempts=3, backoff=1.5)  # Reduced for speed
+@retry(max_attempts=3, backoff=1.5)
 async def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False) -> str:
     domain = get_domain_from_url(url)
-    tough_domains = ['konga', 'jumia', 'gov.ng', 'nysc', 'nuc', 'waec', 'neco', 'myschool', 'punchng', 'education']
+    # Removed 'konga' from tough_domains — Cloudscraper first (faster, less timeout)
+    tough_domains = ['jumia', 'gov.ng', 'nysc', 'nuc', 'waec', 'neco', 'myschool', 'punchng', 'education']
     
     if any(d in domain for d in tough_domains):
         prefer_playwright_on_first_try = True
     
-    # If prefer_playwright_on_first_try, try playwright aggressive directly
     if prefer_playwright_on_first_try:
         try:
             html = await fetch_with_playwright_aggressive(url, retries=3)
@@ -309,7 +302,6 @@ async def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False) ->
         except Exception as e:
             LOG.debug("Playwright primary failed for %s: %s", url, e)
     
-    # Try cloudscraper first (fast)
     try:
         loop = asyncio.get_running_loop()
         html = await loop.run_in_executor(None, fetch_with_cloudscraper_aggressive, url, 4)
@@ -318,7 +310,6 @@ async def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False) ->
     except Exception:
         pass
     
-    # Ultimate fallback - aggressive try both
     try:
         html = await fetch_html_ultimate(url)
         return html
