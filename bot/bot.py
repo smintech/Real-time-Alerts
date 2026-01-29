@@ -355,49 +355,48 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
     LOG.info("\n📦 PHASE 1: Scraping %d product groups...", len(CHANNEL_MONITORED_URLS))
     
     for group_key, urls in CHANNEL_MONITORED_URLS.items():
-        LOG.info("\n  ┌─ Processing group: '%s' (%d URLs)", group_key, len(urls))
-        entries = []
-        
-        for idx, url in enumerate(urls, 1):
-            LOG.info("    ├─ [%d/%d] Attempting: %s", idx, len(urls), url[:80] + "..." if len(url) > 80 else url)
+        try:
+            LOG.info("\n  ┌─ Processing group: '%s' (%d URLs)", group_key, len(urls))
+            entries = []
             
-            try:
-                # Scrape with timeout
-                data = await asyncio.wait_for(scrape_product(url), timeout=90.0)
+            for idx, url in enumerate(urls, 1):
+                try:
+                    LOG.info("    ├─ [%d/%d] Attempting: %s", idx, len(urls), url[:80] + "..." if len(url) > 80 else url)
+                    
+                    data = await asyncio.wait_for(scrape_product(url), timeout=60.0)
+                    
+                    if not data:
+                        LOG.warning("    │   ✗ No data returned")
+                        continue
+                    
+                    current_price = data.get("current_price")
+                    if current_price is None:
+                        LOG.warning("    │   ✗ No price found (status: %s)", data.get("stock_status", "unknown"))
+                        continue
+                    
+                    entries.append({"url": url, "data": data})
+                    LOG.info("    │   ✓ Success: ₦%s - %s", 
+                            f"{current_price:,.0f}",
+                            data.get("title", "Unknown")[:60])
+                    
+                    # Small delay between URLs
+                    if idx < len(urls):
+                        await asyncio.sleep(2)
                 
-                if not data:
-                    LOG.warning("    │   ✗ No data returned")
-                    continue
+                except asyncio.TimeoutError:
+                    LOG.error("    │   ✗ TIMEOUT after 60s")
+                    continue  # Skip this URL
                 
-                current_price = data.get("current_price")
-                if current_price is None:
-                    LOG.warning("    │   ✗ No price found (status: %s)", data.get("stock_status", "unknown"))
-                    continue
-                
-                entries.append({"url": url, "data": data})
-                LOG.info("    │   ✓ Success: ₦%s - %s", 
-                        f"{current_price:,.0f}",
-                        data.get("title", "Unknown")[:60])
-                
-            except asyncio.TimeoutError:
-                LOG.error("    │   ✗ TIMEOUT after 90s")
-                continue
-                
-            except Exception as e:
-                LOG.error("    │   ✗ Exception: %s", str(e)[:100])
-                LOG.exception("    │      Full trace:")
+                except Exception as e:
+                    LOG.error("    │   ✗ Exception: %s", str(e)[:100])
+                    LOG.exception("    │      Full trace:")
+                    continue  # Skip this URL
+            
+            if not entries:
+                LOG.warning("  └─ ⚠️  NO SUCCESSFUL SCRAPES for '%s' - SKIPPING GROUP", group_key)
                 continue
             
-            finally:
-                # Small delay between URLs in same group to avoid rate limiting
-                if idx < len(urls):
-                    await asyncio.sleep(2)
-        
-        if not entries:
-            LOG.warning("  └─ ⚠️  NO SUCCESSFUL SCRAPES for '%s' - SKIPPING GROUP", group_key)
-            continue
-        
-        LOG.info("  └─ ✓ Scraped %d/%d URLs successfully for '%s'", len(entries), len(urls), group_key)
+            LOG.info("  └─ ✓ Scraped %d/%d URLs successfully for '%s'", len(entries), len(urls), group_key)
 
         # --- PHASE 2: DETERMINE BEST PRICE & HISTORY ---
         try:
