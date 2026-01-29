@@ -331,13 +331,15 @@ async def check_all_watches(context: ContextTypes.DEFAULT_TYPE):
 
 async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
     """
-    Job: Scrapes monitored URLs, groups them, finds the best deal, 
+    Job: Scrapes monitored URLs, groups them, finds the best deal,
     and posts to Telegram channels if a drop is detected or if it's a new item.
     Uses dual-layer persistence with deduplication.
     """
     start_time = std_time.time()
-    LOG.info("--- CHANNEL DEALS JOB STARTED ---")
-    
+    LOG.info("═══════════════════════════════════════════════════════════")
+    LOG.info("🔍 CHANNEL DEALS JOB STARTED")
+    LOG.info("═══════════════════════════════════════════════════════════")
+
     await update_exchange_rate()
 
     if not AUTO_POST_TO_CHANNEL or not CHANNEL_DEAL_CHAT_ID:
@@ -350,25 +352,61 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(timezone.utc)
 
     # --- PHASE 1: SCRAPE EVERYTHING ---
+    LOG.info("\n📦 PHASE 1: Scraping %d product groups...", len(CHANNEL_MONITORED_URLS))
+    
     for group_key, urls in CHANNEL_MONITORED_URLS.items():
+        LOG.info("\n  ┌─ Processing group: '%s' (%d URLs)", group_key, len(urls))
         entries = []
-        for url in urls:
+        
+        for idx, url in enumerate(urls, 1):
+            LOG.info("    ├─ [%d/%d] Attempting: %s", idx, len(urls), url[:80] + "..." if len(url) > 80 else url)
+            
             try:
-                data = await scrape_product(url)
-                if data and data.get("current_price") is not None:
-                    entries.append({"url": url, "data": data})
-            except Exception as e:
-                LOG.warning("Scrape failed for %s in group %s: %s", url, group_key, e)
+                # Scrape with timeout
+                data = await asyncio.wait_for(scrape_product(url), timeout=90.0)
+                
+                if not data:
+                    LOG.warning("    │   ✗ No data returned")
+                    continue
+                
+                current_price = data.get("current_price")
+                if current_price is None:
+                    LOG.warning("    │   ✗ No price found (status: %s)", data.get("stock_status", "unknown"))
+                    continue
+                
+                entries.append({"url": url, "data": data})
+                LOG.info("    │   ✓ Success: ₦%s - %s", 
+                        f"{current_price:,.0f}",
+                        data.get("title", "Unknown")[:60])
+                
+            except asyncio.TimeoutError:
+                LOG.error("    │   ✗ TIMEOUT after 90s")
                 continue
+                
+            except Exception as e:
+                LOG.error("    │   ✗ Exception: %s", str(e)[:100])
+                LOG.exception("    │      Full trace:")
+                continue
+            
+            finally:
+                # Small delay between URLs in same group to avoid rate limiting
+                if idx < len(urls):
+                    await asyncio.sleep(2)
+        
         if not entries:
-            LOG.info("Group '%s': No successful scrapes — skipping", group_key)
+            LOG.warning("  └─ ⚠️  NO SUCCESSFUL SCRAPES for '%s' - SKIPPING GROUP", group_key)
             continue
+        
+        LOG.info("  └─ ✓ Scraped %d/%d URLs successfully for '%s'", len(entries), len(urls), group_key)
 
         # --- PHASE 2: DETERMINE BEST PRICE & HISTORY ---
         try:
             best_entry = min(entries, key=lambda e: float(e["data"]["current_price"]))
-        except Exception:
-            LOG.warning("Could not determine best price for group %s", group_key)
+            LOG.info("       → Best price: ₦%s at %s", 
+                    f"{best_entry['data']['current_price']:,.0f}",
+                    best_entry['data'].get('site', 'unknown'))
+        except Exception as e:
+            LOG.error("  └─ ✗ Could not determine best price: %s", e)
             continue
 
         current_price = float(best_entry["data"]["current_price"])
@@ -385,24 +423,41 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
         # Compute content hash for deduplication
         content_hash = compute_content_hash(snapshot_data)
         
-        # Check if we already posted this exact content recently (48 hours)
-        is_duplicate = await check_duplicate_post(
-            ref=best_entry["url"],
-            content_hash=content_hash,
-            lookback_hours=48
-        )
-        
-        if is_duplicate and not TEST_MODE:
-            LOG.info("Skipping duplicate content for group %s (hash=%s)", group_key, content_hash[:8])
-            continue
-
         # Load history for this URL
-        history = await load_channel_snapshot(best_entry["url"])
+        try:
+            history = await load_channel_snapshot(best_entry["url"])
+        except Exception as e:
+            LOG.warning("       ⚠️  Failed to load snapshot: %s", str(e)[:50])
+            history = None
+            
         last_posted_price = history.get("last_posted_price") if history else None
         last_posted_at = history.get("last_posted_at") if history else None
+        last_content_hash = history.get("content_hash") if history else None
 
         is_crypto = "binance" in (best_entry["data"].get("site", "").lower()) or "SYMBOL:" in best_entry["url"]
         is_new = last_posted_price is None
+
+        # --- IMPROVED DUPLICATE DETECTION ---
+        if content_hash == last_content_hash and not TEST_MODE:
+            LOG.debug("       ℹ️  Content hash matches last post")
+            
+            if is_new:
+                LOG.info("       → New item - posting despite hash match")
+            elif last_posted_at:
+                try:
+                    last_dt = datetime.fromisoformat(last_posted_at.replace("Z", "+00:00") if "Z" in last_posted_at else last_posted_at)
+                    hours_since = (now - last_dt).total_seconds() / 3600
+                    
+                    min_hours = 24 if is_crypto else 48
+                    
+                    if hours_since < min_hours:
+                        LOG.info("       ⏭️  SKIPPING: posted %.1fh ago (need %dh minimum)", 
+                                hours_since, min_hours)
+                        continue
+                    else:
+                        LOG.info("       → Hash matches but %dh passed - re-checking", int(hours_since))
+                except Exception as e:
+                    LOG.warning("       ⚠️  Error parsing timestamp: %s", e)
 
         # --- PHASE 3: ELIGIBILITY CHECK ---
         ref_price = last_posted_price if last_posted_price is not None else current_price
@@ -411,25 +466,44 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
         drop_pct = round(((ref_price - current_price) / ref_price) * 100, 1) if ref_price > current_price else 0.0
         savings = max(ref_price - current_price, 0)
 
+        LOG.info("       💰 Current: ₦%s | Last: %s", 
+                f"{current_price:,.0f}", 
+                f"₦{ref_price:,.0f}" if last_posted_price else "NEW")
+        LOG.info("       📊 Change: %+.1f%% | Drop: %.1f%% | Savings: ₦%s",
+                price_change, drop_pct, f"{savings:,.0f}")
+
         should_post = is_new or TEST_MODE
 
         if not is_new and not TEST_MODE:
             if abs_change > 0:
                 if is_crypto:
                     if abs_change >= 1.0:
-                        # Check time since last post
                         if last_posted_at:
                             try:
                                 last_dt = datetime.fromisoformat(last_posted_at.replace("Z", "+00:00") if "Z" in last_posted_at else last_posted_at)
                                 hours_since = (now - last_dt).total_seconds() / 3600
-                                if hours_since >= 6:  # At least 6 hours for crypto
+                                if hours_since >= 6:
                                     should_post = True
+                                    LOG.info("       ✓ Crypto: %.1f%% change + %dh elapsed", abs_change, int(hours_since))
+                                else:
+                                    LOG.info("       ⏭️  Crypto: %.1f%% change but only %.1fh elapsed", abs_change, hours_since)
                             except:
                                 should_post = True
+                        else:
+                            should_post = True
+                    else:
+                        LOG.info("       ⏭️  Crypto change too small: %.1f%% < 1.0%%", abs_change)
                 else:
                     if price_change < 0 and -price_change >= MIN_DROP_PERCENT_FOR_CHANNEL and savings >= MIN_SAVINGS_FOR_CHANNEL:
                         should_post = True
-
+                        LOG.info("       ✓ Drop qualifies: %.1f%% + ₦%s savings", -price_change, f"{savings:,.0f}")
+                    else:
+                        LOG.info("       ⏭️  Drop insufficient: %.1f%% or ₦%s savings (need %.1f%% + ₦%s)",
+                                -price_change if price_change < 0 else 0, 
+                                f"{savings:,.0f}",
+                                MIN_DROP_PERCENT_FOR_CHANNEL,
+                                f"{MIN_SAVINGS_FOR_CHANNEL:,.0f}")
+        
         if should_post:
             eligible_candidates.append({
                 "group_key": group_key,
@@ -444,25 +518,37 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                     "savings": savings
                 }
             })
+            LOG.info("       ✅ ELIGIBLE for posting")
+        else:
+            LOG.info("       ⏭️  NOT eligible")
 
     # --- PHASE 4: PRIORITIZE & POST ---
+    LOG.info("\n═══════════════════════════════════════════════════════════")
+    LOG.info("📊 SUMMARY: %d eligible deals from %d groups", 
+             len(eligible_candidates), len(CHANNEL_MONITORED_URLS))
+    LOG.info("═══════════════════════════════════════════════════════════")
+    
+    if not eligible_candidates:
+        LOG.info("  └─ No eligible deals to post")
+        return
+
     eligible_candidates.sort(key=lambda x: (
         -x["stats"]["drop_pct"],
         -x["stats"]["savings"],
     ))
     to_post = eligible_candidates[:max_posts]
-    
-    if not to_post:
-        LOG.info("No eligible deals found to post.")
-        return
+
+    LOG.info("\n📤 POSTING PHASE: Sending %d deals (max: %d)...", len(to_post), max_posts)
 
     posted_count = 0
     targets = CHANNEL_DEAL_CHAT_ID if isinstance(CHANNEL_DEAL_CHAT_ID, list) else [CHANNEL_DEAL_CHAT_ID]
 
-    for item in to_post:
+    for idx, item in enumerate(to_post, 1):
         best_entry = item["best_entry"]
         stats = item["stats"]
         group_key = item["group_key"]
+
+        LOG.info("\n  [%d/%d] Posting: %s", idx, len(to_post), group_key)
 
         price = float(best_entry["data"]["current_price"])
         site = best_entry["data"].get("site", "unknown").upper()
@@ -529,27 +615,35 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
                 else:
                     await context.bot.send_message(chat_id=chat_id, text=caption, parse_mode="HTML", disable_web_page_preview=True)
                 sent_successfully = True
-                LOG.info("Posted %s to %s", group_key, chat_id)
+                LOG.info("        ✓ Posted to %s", chat_id)
             except Exception as e:
-                LOG.error("Failed post %s to %s: %s", group_key, chat_id, e)
+                LOG.error("        ✗ Failed to post to %s: %s", chat_id, str(e)[:60])
 
-        # Update snapshot with mark_as_posted
+        # Update snapshot
         if sent_successfully:
-            snapshot_to_save = {
-                "site": best_entry["data"].get("site"),
-                "title": title,
-                "url": best_entry["url"],
-                "current_price": price,
-                "content_hash": item["content_hash"],
-                "raw": best_entry["data"].get("raw", {}),
-            }
-            await mark_as_posted(best_entry["url"], snapshot_to_save)
+            try:
+                snapshot_to_save = {
+                    "site": best_entry["data"].get("site"),
+                    "title": title,
+                    "url": best_entry["url"],
+                    "current_price": price,
+                    "content_hash": item["content_hash"],
+                    "raw": best_entry["data"].get("raw", {}),
+                }
+                await mark_as_posted(best_entry["url"], snapshot_to_save)
+                LOG.info("        💾 Snapshot saved")
+            except Exception as e:
+                LOG.error("        ⚠️  Failed to save snapshot: %s", str(e)[:60])
             
             posted_count += 1
             if posted_count < len(to_post):
+                LOG.info("        ⏳ Waiting %ds...", send_delay)
                 await asyncio.sleep(send_delay)
 
-    LOG.info("--- JOB FINISHED: %d deals posted ---", posted_count)
+    elapsed = std_time.time() - start_time
+    LOG.info("\n═══════════════════════════════════════════════════════════")
+    LOG.info("✅ JOB COMPLETE: %d/%d deals posted in %.1fs", posted_count, len(to_post), elapsed)
+    LOG.info("═══════════════════════════════════════════════════════════\n")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # FUEL PRICES POSTING
