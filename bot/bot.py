@@ -1145,8 +1145,10 @@ async def run_bot():
             )
             application.job_queue.run_daily(
                 callback=check_and_post_fuel_prices,
-                time=time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
+                interval=CHECK_INTERVAL_SECONDS,
+                #time=time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
                 name="check_fuel_prices",
+                first=20,
             )
             application.job_queue.run_repeating(
                 callback=check_trials,
@@ -1159,7 +1161,8 @@ async def run_bot():
                 interval=300,  # 6 hours
                 first=30,
                 #time=time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
-                name="school_updates_poster"
+                name="school_updates_poster",
+                max_instance=2,
             )
             # Cleanup job
             application.job_queue.run_daily(
