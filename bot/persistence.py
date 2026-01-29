@@ -1,4 +1,4 @@
-# bot/persistence.py - COMPLETE DUAL-LAYER PERSISTENCE SYSTEM
+# persistence.py - FIXED DECIMAL/FLOAT CONVERSION + IMPROVED CLEANUP
 
 import os
 import json
@@ -11,6 +11,7 @@ import redis  # pip install redis
 from psycopg2 import pool
 import psycopg2.extras
 from typing import Optional, Dict, List, Any
+from decimal import Decimal  # For handling Postgres NUMERIC
 
 from Utils.config import DB_URL
 from Utils.utils import normalize_product_key
@@ -31,6 +32,20 @@ CHANNEL_DEDUP_PREFIX = "channel:dedup:"        # Content hash for dedup
 CHANNEL_RECENT_PREFIX = "channel:recent:"      # Recent post timestamps (sorted set)
 PRODUCT_SNAP_PREFIX = "snapshot:url:"          # Product snapshots
 PRODUCT_SITE_PREFIX = "product:"               # Product alternatives index
+
+# ═══════════════════════════════════════════════════════════════════════════
+# DECIMAL/FLOAT CONVERTER
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _convert_decimals(obj):
+    """Recursively convert Decimal to float in dict/list."""
+    if isinstance(obj, dict):
+        return {k: _convert_decimals(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_convert_decimals(i) for i in obj]
+    elif isinstance(obj, Decimal):
+        return float(obj)
+    return obj
 
 # ═══════════════════════════════════════════════════════════════════════════
 # REDIS CONNECTION
@@ -250,7 +265,7 @@ def _db_get_product_snapshot(url: str) -> Optional[Dict]:
         """, (url,))
         row = cur.fetchone()
         cur.close()
-        return dict(row) if row else None
+        return _convert_decimals(dict(row)) if row else None  # Convert Decimal
     finally:
         if conn:
             pool_obj.putconn(conn)
@@ -404,7 +419,7 @@ def _db_get_channel_snapshot(ref: str) -> Optional[Dict]:
         if row.get("expires_at") and row["expires_at"] <= datetime.now(timezone.utc):
             return None
         
-        return dict(row)
+        return _convert_decimals(dict(row))  # Convert Decimal
     finally:
         if conn:
             pool_obj.putconn(conn)
