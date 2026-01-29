@@ -1160,11 +1160,10 @@ async def run_bot():
             )
             application.job_queue.run_repeating(
                 callback=check_and_post_school_updates,
-                interval=300,  # 6 hours
+                interval=600,  # 6 hours
                 first=30,
                 #time=time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
                 name="school_updates_poster",
-                max_instance=2,
             )
             # Cleanup job
             application.job_queue.run_daily(
