@@ -69,14 +69,6 @@ CHANNEL_MONITORED_URLS = {
     ],
 
     # New helpful / real product pages
-    "tecno-camon-30": [
-        "https://www.jumia.com.ng/camon-30-5g-6.78-512gb88gb-dual-sim-5000mah-dark-tecno-mpg8184353.html"
-    ],
-    "powerbank-20k": [
-        "https://www.konga.com/product/oraimo-powernova-q21-20000mah-22-5w-6898183",
-        "https://www.konga.com/product/anker-prime-power-bank-20000mah-portable-charger-with-200w-output-smart-digital-display-6571853"
-    ],
-    # ...add more real product URLs under new groups as needed...
 }
 
 MIN_DROP_PERCENT_FOR_CHANNEL = 3.0   # % price drop
