@@ -182,9 +182,8 @@ async def fetch_with_playwright_aggressive(url: str, retries: int = 3) -> str:
                 """)
                 
                 await asyncio.sleep(random.uniform(1.5, 4.0))
-                await page.goto(url, wait_until='networkidle', timeout=60000)  # networkidle + higher timeout
+                await page.goto(url, wait_until='domcontentloaded', timeout=60000)  # networkidle + higher timeout
                 
-                await page.wait_for_load_state('networkidle', timeout=30000)
                 await page.wait_for_timeout(random.randint(2000, 4000))
                 
                 try:
@@ -288,7 +287,7 @@ def retry(max_attempts: int = 3, backoff: float = 1.5):
 async def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False) -> str:
     domain = get_domain_from_url(url)
     # Removed 'konga' from tough_domains — Cloudscraper first (faster, less timeout)
-    tough_domains = ['jumia', 'gov.ng', 'nysc', 'nuc', 'waec', 'neco', 'myschool', 'punchng', 'education']
+    tough_domains = ['konga', 'jumia', 'gov.ng', 'nysc', 'nuc', 'waec', 'neco', 'myschool', 'punchng', 'education']
     
     if any(d in domain for d in tough_domains):
         prefer_playwright_on_first_try = True
@@ -770,7 +769,7 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
                         break
         
         if "konga" in domain and product["current_price"] is None:
-            selectors = ["span._3e_22_199e7", "._3e_22_199e7", "h4._44738_3988u", "div.price", "[class*='price']", "span:contains('₦')"]  # Enhanced
+            selectors = ["span._3e_22_199e7", "._3e_22_199e7", "h4._44738_3988u", "div.price", "[class*='price']"]
             for sel in selectors:
                 el = soup.select_one(sel)
                 if el:
