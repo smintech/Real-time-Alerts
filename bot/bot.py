@@ -355,7 +355,7 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
     LOG.info("\n📦 PHASE 1: Scraping %d product groups...", len(CHANNEL_MONITORED_URLS))
     
     for group_key, urls in CHANNEL_MONITORED_URLS.items():
-        LOG.info("\n  ┌─ Processing group: '%s' (% d URLs)", group_key, len(urls))
+        LOG.info("\n  ┌─ Processing group: '%s' (%d URLs)", group_key, len(urls))
         entries = []
         
         for idx, url in enumerate(urls, 1):
