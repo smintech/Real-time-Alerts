@@ -106,9 +106,6 @@ DEFAULT_SCHOOL_SOURCES = {
     "JAMB": [
         "https://www.jamb.gov.ng/"
     ],
-    "NECO": [
-        "https://www.neco.gov.ng/"
-    ],
     # --- Higher Education Regulators ---
     "NUC (Universities)": [
         "https://www.nuc.edu.ng/"
