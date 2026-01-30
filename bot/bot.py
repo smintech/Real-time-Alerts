@@ -1,4 +1,3 @@
-# bot/scheduler.py - UPDATED FOR DUAL-LAYER PERSISTENCE
 
 import logging
 import asyncio
