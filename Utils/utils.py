@@ -609,7 +609,7 @@ def _extract_konga_current_price(soup: BeautifulSoup, page_text: str) -> Optiona
 
     # 5) selector-based scan (common Konga / e-comm class patterns plus fallbacks)
     selectors = [
-        "span.price", "span.prc", "div.price", "div.prc", ".product-price",
+        "span.price", "span.prc", "div.price", "div.prc", ".product-price","span._3e_22_199e7","._3e_22_199e7",
         ".price", ".prc", ".price--amount", ".price-amount", ".amount",
         ".price-main", ".product-pricing .price", "[class*='konga-price']",
         "[data-testid*='price']", "[class*='price']", "[id*='price']"
@@ -1606,24 +1606,21 @@ def extract_punch_items(html: str, base_url: str) -> List[Dict[str, Any]]:
     return items
 
 def extract_myschool_items(html: str, base_url: str) -> List[Dict[str, Any]]:
-    """MySchool.ng-specific extraction (with broader selectors and fallback)."""
+    """MySchool.ng-specific extraction with broader fallbacks."""
     soup = BeautifulSoup(html, "lxml")
     items = []
     seen = set()
 
-    # Broad selector set to catch different templates
+    # Broadened container selectors (added more from generic for resilience)
     containers = soup.select(
-        ".news-item, .post, .article, .news, .news-list, .news-listing, li.news, div[class*='news']"
+        ".news-item, .post, .article, .news, .news-list, .news-listing, li.news, div[class*='news'], "
+        "article, .post, .entry, li, .content-item, .story, .td_module_wrap, div[class*='post'], div[class*='item']"
     )
-
-    # If none found, fall back to the generic approach: look for article-like containers
-    if not containers:
-        containers = soup.select("article, .post, .entry, li, .content-item, .story, .td_module_wrap")
 
     for c in containers:
         try:
-            # Title element candidates
-            title_elem = c.select_one("h2 a, h3 a, .title a, a, h2, h3")
+            # Title element candidates (expanded for more matches)
+            title_elem = c.select_one("h2 a, h3 a, .title a, a.title, a, h2, h3, .news-title a")
             if not title_elem:
                 continue
             title = title_elem.get_text(" ", strip=True)
@@ -1633,12 +1630,12 @@ def extract_myschool_items(html: str, base_url: str) -> List[Dict[str, Any]]:
             link = urljoin(base_url, link)
 
             date = None
-            date_elem = c.select_one(".date, .post-date, time, span.date")
+            date_elem = c.select_one(".date, .post-date, time, span.date, .news-date")
             if date_elem:
                 date = date_elem.get_text(" ", strip=True)
 
             snippet = None
-            for sel in (".excerpt, .summary, .post-excerpt, p"):
+            for sel in (".excerpt, .summary, .post-excerpt, .news-snippet, p, div.description"):
                 s = c.select_one(sel)
                 if s:
                     snippet = s.get_text(" ", strip=True)
@@ -1664,8 +1661,47 @@ def extract_myschool_items(html: str, base_url: str) -> List[Dict[str, Any]]:
         except Exception:
             continue
 
-    # If still nothing, return empty list (calling function will try other candidates)
-    return items[:20]
+    # New: Fallback to generic a-tag scan if few items found (mimics Colab's working approach)
+    if len(items) < 3:  # Threshold to trigger fallback if specific selectors miss
+        LOG.debug("MySchool fallback: Using generic a-tag extraction due to low yield (%d items)", len(items))
+        for a in soup.find_all("a", href=True):
+            title = a.get_text(" ", strip=True)
+            href = a.get("href", "").strip()
+            if not title or len(title) < 10:
+                continue
+            if _SCHOOL_KEYWORDS_RE and not _SCHOOL_KEYWORDS_RE.search(title):
+                continue
+            full_link = urljoin(base_url, href)
+            key = f"{title[:50]}|{full_link}"
+            if key in seen:
+                continue
+            seen.add(key)
+            snippet = "Click link for details."
+            date_str = None
+            container = a.find_parent(["li", "div", "article", "p", "td"])
+            if container:
+                container_text = container.get_text(" ", strip=True)
+                if _DATE_RE:
+                    date_match = _DATE_RE.search(container_text)
+                    if date_match:
+                        date_str = date_match.group(0)
+                siblings = a.find_next_siblings(["p", "div", "span"])
+                for sib in siblings[:3]:
+                    sib_text = sib.get_text(" ", strip=True)
+                    if len(sib_text) > 30:
+                        snippet = sib_text[:300]
+                        break
+            items.append({
+                "title": title,
+                "snippet": snippet,
+                "date": date_str,
+                "link": full_link,
+                "source": urlparse(base_url).netloc,
+                "pdf": _is_pdf_link(full_link)
+            })
+
+    items.sort(key=lambda x: (x['date'] is None, -len(x['snippet'])))
+    return items[:10]
 
 def extract_jamb_items(html: str, base_url: str) -> List[Dict[str, Any]]:
     """JAMB-specific extraction (flat p tags)."""
