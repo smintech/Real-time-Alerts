@@ -419,16 +419,49 @@ def _split_concatenated_numeric_token(token: str) -> List[float]:
     return [float(best[0]), float(best[1])]
 
 def _gather_price_candidates_from_dom(soup: BeautifulSoup) -> List[float]:
-    selectors = [
-        "span.prc", "span.price", "div.price", "div.prc", ".product-price",
-        ".price", ".prc", "span[class*='price']", "div[class*='price']",
-        "span[class*='prc']", "span[class*='old-price']", ".price--was",
-        "span[class*='_3e_22_199e7']", "[data-testid*='price']"
-    ]
-    found: List[float] = []
-    seen_texts = set()
+    """
+    Enhanced DOM price candidate gathering with:
+    - Site-specific selector prioritization (Konga/Jumia focus)
+    - Container-based scoring (prices near title/description are preferred)
+    - Strict filtering (ignore tiny/irrelevant numbers like ratings, counts)
+    - Size-based prioritization (largest realistic price wins)
+    - Concatenated token splitting with validation
+    - Depth/container heuristics to avoid footers/ads
+    """
+    domain = soup.find("meta", property="og:site_name") or soup.find("meta", attrs={"name": "application-name"})
+    domain = domain["content"].lower() if domain and domain.get("content") else ""
     
-    for sel in selectors:
+    # Site-specific high-priority selectors (hashed/obfuscated classes for Konga/Jumia)
+    high_priority_selectors = [
+        "span._3e_22_199e7", "._3e_22_199e7", "h4._44738_3988u",  # Konga current
+        "span.-b", ".-fs24", ".prc", ".-prc", "div.prc",          # Jumia current
+        "[data-testid*='price']", "[class*='price']", "[class*='prc']",
+        ".price", ".product-price", ".amount", ".price--amount"
+    ]
+    
+    # General selectors (lower priority)
+    general_selectors = [
+        "span.price", "div.price", "div.prc", ".product-price",
+        "span[class*='price']", "div[class*='price']",
+        "span[class*='old-price']", ".price--was",
+        "[class*='konga-price']", "[id*='price']"
+    ]
+
+    found: List[Tuple[float, int]] = []  # (price, score) - higher score = better
+    seen_texts = set()
+
+    def add_candidate(p: float, score: int = 0):
+        if p is None or p <= 0:
+            return
+        # Strict filter: ignore tiny prices (ratings, counts, pagination, etc.)
+        if p < 5000:  # Adjust threshold based on site (phones >500k, but safe lower)
+            return
+        if p > 100_000_000:  # Ignore absurdly large (e.g., timestamps)
+            return
+        found.append((p, score))
+
+    # Phase 1: High-priority selectors with high score
+    for sel in high_priority_selectors:
         for el in soup.select(sel):
             txt = el.get_text(" ", strip=True)
             if not txt or txt in seen_texts:
@@ -436,226 +469,276 @@ def _gather_price_candidates_from_dom(soup: BeautifulSoup) -> List[float]:
             seen_texts.add(txt)
             p = _parse_price_string(txt)
             if p:
-                found.append(p)
+                add_candidate(p, score=100)  # High confidence
             else:
                 for token in re.findall(r"[\d.,]{6,}", txt):
                     split = _split_concatenated_numeric_token(token)
                     if split:
-                        found.extend(split)
-    
-    for container in soup.select("div, section, li"):
+                        add_candidate(min(split), score=90)
+
+    # Phase 2: General selectors with medium score
+    for sel in general_selectors:
+        for el in soup.select(sel):
+            txt = el.get_text(" ", strip=True)
+            if not txt or txt in seen_texts:
+                continue
+            seen_texts.add(txt)
+            p = _parse_price_string(txt)
+            if p:
+                add_candidate(p, score=50)
+            else:
+                for token in re.findall(r"[\d.,]{6,}", txt):
+                    split = _split_concatenated_numeric_token(token)
+                    if split:
+                        add_candidate(min(split), score=40)
+
+    # Phase 3: Container-based search with proximity scoring
+    # Find main product containers (near title/description)
+    title_selectors = ["h1", "h2", "[class*='title']", "[class*='name']", "meta[property='og:title']"]
+    main_containers = set()
+    for ts in title_selectors:
+        title_el = soup.select_one(ts)
+        if title_el:
+            parent = title_el.find_parent(["div", "section", "article"])
+            if parent:
+                main_containers.add(parent)
+            # Add siblings/ancestors
+            for anc in title_el.parents:
+                if anc.name in ["div", "section", "article"]:
+                    main_containers.add(anc)
+                    if len(main_containers) >= 5:
+                        break
+
+    for container in soup.select("div, section, article, li"):
+        if not container.get_text(strip=True):
+            continue
+        
+        # Skip obvious non-product areas
+        container_text = container.get_text().lower()
+        if any(kw in container_text for kw in ["footer", "advert", "sidebar", "related", "recommended"]):
+            continue
+        
         price_children = []
+        is_main = any(container is mc or container in mc.descendants for mc in main_containers)
+        base_score = 80 if is_main else 30
+        
         for child in container.find_all(True, recursive=False):
             txt = child.get_text(" ", strip=True)
             if not txt:
                 continue
-            if ('₦' in txt or 'NGN' in txt or re.search(r"[\d\.,]{6,}", txt)):
+            if any(curr in txt for curr in ["₦", "NGN", "price", "now", "was"]):
                 p = _parse_price_string(txt)
                 if p:
-                    price_children.append(p)
+                    price_children.append((p, base_score + 20))
                 else:
-                    for token in re.findall(r"[\d\.,]{6,}", txt):
+                    for token in re.findall(r"[\d.,]{6,}", txt):
                         split = _split_concatenated_numeric_token(token)
                         if split:
-                            price_children.extend(split)
+                            price_children.extend([(sp, base_score + 10) for sp in split])
+        
+        # If multiple prices in container, boost score
         if len(price_children) >= 2:
-            found.extend(price_children)
+            for pc, sc in price_children:
+                add_candidate(pc, sc + 30)
+        elif price_children:
+            pc, sc = price_children[0]
+            add_candidate(pc, sc)
+
+    # Final: Sort by score desc, then price desc (prefer larger realistic prices)
+    if found:
+        found.sort(key=lambda x: (-x[1], -x[0]))  # Score first, then price
+        best_price = found[0][0]
+        # Return list of top candidates (for previous price logic)
+        return [p for p, s in found[:10]]
     
-    return found
+    return []
 
 def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain: str, 
                            page_text: str, current_price: Optional[float]) -> Optional[float]:
-    candidates: List[float] = []
-    
+    """
+    Enhanced previous price extraction with:
+    - Strict prioritization of 'old/was/strikethrough' indicators
+    - Scoring system (higher for explicit 'old-price' markers)
+    - Filtering: must be > current_price (or significantly different)
+    - Validation: realistic range, ignore tiny/irrelevant numbers
+    - Container proximity to current price element
+    - Fallback to largest candidate only if no better indicators
+    """
+    candidates: List[Tuple[float, int]] = []  # (price, score) - higher score = more likely previous
+
+    def add_candidate(p: float, score: int = 0):
+        if p is None or p <= 0:
+            return
+        # Ignore tiny/irrelevant (ratings, counts, etc.)
+        if p < 5000:
+            return
+        if p > 100_000_000:
+            return
+        # Must be higher than current (or at least different by >5%)
+        if current_price and current_price > 0:
+            if p <= current_price:
+                if p < (current_price * 1.05):  # Allow slight variance but not lower/same
+                    return
+        candidates.append((p, score))
+
+    # Phase 1: JSON-LD (highest confidence)
     try:
         if isinstance(json_ld, dict):
             offers = json_ld.get("offers")
             if offers:
                 offers_list = offers if isinstance(offers, list) else [offers]
                 for offer in offers_list:
-                    for key in ("priceBeforeDiscount", "listPrice", "originalPrice", "highPrice"):
+                    for key in ("priceBeforeDiscount", "listPrice", "originalPrice", "highPrice", "wasPrice"):
                         v = offer.get(key)
                         if isinstance(v, (int, float)):
-                            candidates.append(float(v))
+                            add_candidate(float(v), score=200)
                         elif isinstance(v, str):
                             p = _parse_price_string(v)
-                            if p: candidates.append(p)
+                            if p:
+                                add_candidate(p, score=200)
                     ps = offer.get("priceSpecification")
                     if isinstance(ps, dict):
-                        v = ps.get("price") or ps.get("value")
-                        p = _parse_price_string(str(v))
-                        if p: candidates.append(p)
+                        for spec_key in ("price", "value", "originalPrice"):
+                            v = ps.get(spec_key)
+                            p = _parse_price_string(str(v))
+                            if p:
+                                add_candidate(p, score=180)
     except Exception:
         pass
-    
-    try:
-        dom_prices = _gather_price_candidates_from_dom(soup)
-        if dom_prices:
-            candidates.extend(dom_prices)
-    except Exception:
-        pass
-    
-    for tag in ("del", "s", "strike"):
-        for el in soup.find_all(tag):
+
+    # Phase 2: Explicit 'old/was' markup (strikethrough, del, s) - very high score
+    for tag in ("del", "s", "strike", "span[class*='old']", "span[class*='was']", "div[class*='old-price']"):
+        for el in soup.select(tag):
             txt = el.get_text(" ", strip=True)
             p = _parse_price_string(txt)
             if p:
-                candidates.append(p)
-    
-    class_selectors = [
+                add_candidate(p, score=150)
+            else:
+                for token in re.findall(r"[\d.,]{6,}", txt):
+                    split = _split_concatenated_numeric_token(token)
+                    if split:
+                        add_candidate(max(split), score=140)  # Previous likely larger
+
+    # Phase 3: Class-based 'old-price' selectors
+    old_class_selectors = [
         "[class*='old-price']", "[class*='was-price']", "[class*='wasprice']",
         "[class*='strike']", "[class*='list-price']", "[class*='regular-price']",
         "[class*='price--was']", "[class*='price-old']", "[class*='previous-price']",
-        "span.-old", "div.-old"
+        "span.-old", "div.-old", "[class*='oldPrice']", "[class*='compare']"
     ]
-    for sel in class_selectors:
+    for sel in old_class_selectors:
         for el in soup.select(sel):
             txt = el.get_text(" ", strip=True)
             p = _parse_price_string(txt)
-            if p: candidates.append(p)
-    
+            if p:
+                add_candidate(p, score=120)
+
+    # Phase 4: Label patterns with context (was/old/list near price)
     label_patterns = [
-        r"(?:was|old|list|rrp)\s*[:\-\u2014]?\s*(?:₦|NGN|N)?\s*([\d\.,]+)",
-        r"(?:₦|NGN|N)\s*([\d\.,]+)",
+        r"(?:was|old|list|rrp|before|strikethrough)\s*[:\-\u2014]?\s*(?:₦|NGN|N)?\s*([\d\.,]+)",
+        r"old\s*price\s*[:\-\u2014]?\s*(?:₦|NGN|N)?\s*([\d\.,]+)",
     ]
     for pat in label_patterns:
         for m in re.findall(pat, page_text, flags=re.IGNORECASE):
             p = _parse_price_string(m)
-            if p: candidates.append(p)
+            if p:
+                add_candidate(p, score=100)
+
+    # Phase 5: DOM candidates from enhanced gather (medium score)
+    dom_prices = _gather_price_candidates_from_dom(soup)
+    for p in dom_prices:
+        if current_price and p > current_price:
+            add_candidate(p, score=50)
+        elif not current_price:
+            add_candidate(p, score=40)
+
+    # Phase 6: Proximity to current price element
+    if current_price:
+        # Find current price elements
+        current_els = soup.select("[class*='price'], [class*='prc'], span.-b, ._3e_22_199e7")
+        for cur_el in current_els:
+            # Look nearby (siblings/parent)
+            for nearby in cur_el.find_previous_siblings() + cur_el.find_next_siblings() + list(cur_el.parents):
+                txt = nearby.get_text(" ", strip=True)
+                p = _parse_price_string(txt)
+                if p and p > current_price:
+                    add_candidate(p, score=80)
+
+    # Final selection
+    if not candidates:
+        return None
+
+    # Sort by score desc, then by price desc (prefer clearly higher previous)
+    candidates.sort(key=lambda x: (-x[1], -x[0]))
     
-    for m in re.findall(r"(?:₦|NGN|N)\s*[\d\.,]+\s*(?:₦|NGN|N)\s*[\d\.,]+", page_text):
-        parts = re.findall(r"[\d\.,]+", m)
-        if len(parts) >= 2:
-            p1 = _parse_price_string(parts[0])
-            p2 = _parse_price_string(parts[1])
-            if p1: candidates.append(p1)
-            if p2: candidates.append(p2)
+    best_guess = candidates[0][0]
     
-    cleaned: List[float] = []
-    limit_multiplier = 10.0
-    
-    for c in candidates:
-        try:
-            v = float(c)
-            if v <= 0 or v < 10:
-                continue
-            if current_price and current_price > 0:
-                if v > (current_price * limit_multiplier):
-                    continue
-                if v > 1_000_000_000:
-                    continue
-            cleaned.append(v)
-        except Exception:
-            continue
-    
-    if not cleaned:
+    # Final validation: must be meaningfully higher than current
+    if current_price and best_guess <= (current_price * 1.05):
+        # If not significantly higher, discard
         return None
     
-    best_guess = max(cleaned)
-    if current_price and abs(best_guess - current_price) < 1.0:
-        return None
+    LOG.debug("Previous price candidates: %s → Selected: %.0f (score: %d)", 
+              [f"₦{p:.0f}" for p, s in candidates[:5]], best_guess, candidates[0][1])
+    
     return best_guess
 
 def _extract_konga_current_price(soup: BeautifulSoup, page_text: str) -> Optional[float]:
     """
-    Robust Konga price extraction:
-    - checks JSON-LD (already handled earlier, but double-checks attributes)
-    - checks meta tags (og:price, product:price:amount)
-    - checks itemprop="price" and common data-price attributes
-    - tries a set of likely selectors and attribute names
-    - splits large concatenated numeric tokens (e.g. '24999000') when necessary
-    - validates price ranges (>= 50, below absurd upper bound)
+    Robust Konga current price extraction with enhanced gathering:
+    - Reuses the fully enhanced _gather_price_candidates_from_dom for all DOM candidates
+    - Prioritizes high-confidence candidates (hashed classes, main container proximity)
+    - Strict validation: realistic range for high-value items (e.g., phones >500k typical)
+    - Falls back to meta/JSON/itemprop first (structured data highest confidence)
+    - Returns largest realistic price from scored candidates
+    - Returns None on suspicious/low values to trigger retry
     """
-    # 1) meta tags
-    meta_amount = None
+    # 1) Structured data first (highest confidence, unchanged)
     for meta_prop in ("og:price:amount", "product:price:amount", "price:amount", "twitter:data1"):
         m = soup.find("meta", property=meta_prop) or soup.find("meta", attrs={"name": meta_prop})
         if m and m.get("content"):
             p = _parse_price_string(m["content"])
-            if p:
+            if p and p >= 50000:  # Realistic lower bound for Konga products
                 return p
 
-    # 2) itemprop / meta itemprop
     ip = soup.find(attrs={"itemprop": "price"})
     if ip:
         if ip.get("content"):
             p = _parse_price_string(ip.get("content"))
-            if p:
+            if p and p >= 50000:
                 return p
         text = ip.get_text(" ", strip=True)
         p = _parse_price_string(text)
-        if p:
+        if p and p >= 50000:
             return p
 
-    # 3) common data attributes that may contain price
     attr_names = ["data-price", "data-offer-price", "data-offerprice", "data-amount", "data-product-price", "data-price-amount"]
     for a in attr_names:
         el = soup.find(attrs={a: True})
         if el:
             val = el.get(a) or el.get("content") or el.get("value")
             p = _parse_price_string(str(val))
-            if p:
+            if p and p >= 50000:
                 return p
 
-    # 4) look for inputs or script JSON containing price keys
-    # quick search for common keys in page_text (cheap but effective)
-    for key in ('"offerPrice"', '"product_price"', '"price":"', '"price":', '"salePrice"', '"discountedPrice"', '"amount":'):
-        if key in page_text:
-            # pull numeric-like tokens nearby
-            for m in re.finditer(r"(?:₦|NGN|N)?\s*([0-9][0-9,\.]{1,})", page_text):
-                p = _parse_price_string(m.group(0))
-                if p and 50 <= p < 1_000_000_000:
-                    return p
+    # 2) Use enhanced DOM gathering (replaces old selector loop)
+    candidates = _gather_price_candidates_from_dom(soup)
+    
+    if not candidates:
+        return None
 
-    # 5) selector-based scan (common Konga / e-comm class patterns plus fallbacks)
-    selectors = [
-        "span.price", "span.prc", "div.price", "div.prc", ".product-price","span._3e_22_199e7","._3e_22_199e7",
-        ".price", ".prc", ".price--amount", ".price-amount", ".amount",
-        ".price-main", ".product-pricing .price", "[class*='konga-price']",
-        "[data-testid*='price']", "[class*='price']", "[id*='price']"
-    ]
-    seen_texts = set()
-    for sel in selectors:
-        for el in soup.select(sel):
-            txt = None
-            # prefer attributes that hold numeric values
-            for attr in ("data-price", "data-offer-price", "content", "value", "data-amount"):
-                if el.get(attr):
-                    txt = el.get(attr)
-                    break
-            if not txt:
-                txt = el.get_text(" ", strip=True)
-            if not txt or txt in seen_texts:
-                continue
-            seen_texts.add(txt)
-            p = _parse_price_string(txt)
-            if p and 50 <= p < 1_000_000_000:
-                return p
-            # if the text contains a very long numeric token, try to split it
-            for token in re.findall(r"[\d]{6,}", txt.replace(",", "")):
-                split = _split_concatenated_numeric_token(token)
-                if split:
-                    # split returns [smaller, larger] - prefer smaller (likely the real price when concatenated)
-                    candidate = float(min(split))
-                    if 50 <= candidate < 1_000_000_000:
-                        return candidate
+    # Filter and sort: largest first (current price is usually the prominent/large one)
+    valid_candidates = [p for p in candidates if 50000 <= p < 100_000_000]  # Tight range for realism
+    if not valid_candidates:
+        LOG.debug("Konga current price: No valid candidates after filtering (all too low/high)")
+        return None
 
-    # 6) fallback: regex search near words "price" or "offer" — find the nearest NGN token
-    price_matches = []
-    for m in re.finditer(r"(?:(?:price|offer|sale|was|now|special)[^\d]{0,30})(?:₦|NGN|N)?\s*([\d,\.]+)", page_text, re.I):
-        p = _parse_price_string(m.group(1))
-        if p and 50 <= p < 1_000_000_000:
-            price_matches.append(p)
-    if price_matches:
-        return max(price_matches)
-
-    # 7) last resort: any NGN token on the page (already in other code, but keep here as safety)
-    for m in re.finditer(r"(?:₦|NGN|N)\s*([\d,\.]+)", page_text):
-        p = _parse_price_string(m.group(1))
-        if p and 50 <= p < 1_000_000_000:
-            return p
-
-    return None
+    best_price = max(valid_candidates)
+    
+    LOG.debug("Konga current price candidates: %s → Selected: %.0f", 
+              [f"₦{p:,.0f}" for p in valid_candidates[:10]], best_price)
+    
+    return best_price
 
 # ═══════════════════════════════════════════════════════════════════════════
 # E-COMMERCE SCRAPERS (ENHANCED FOR KONGA WITH BETTER SELECTORS)
