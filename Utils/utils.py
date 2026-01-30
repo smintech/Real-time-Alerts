@@ -1606,28 +1606,47 @@ def extract_punch_items(html: str, base_url: str) -> List[Dict[str, Any]]:
     return items
 
 def extract_myschool_items(html: str, base_url: str) -> List[Dict[str, Any]]:
-    """MySchool.ng-specific extraction."""
+    """MySchool.ng-specific extraction (with broader selectors and fallback)."""
     soup = BeautifulSoup(html, "lxml")
     items = []
     seen = set()
 
-    containers = soup.select(".news-item, .post, .article")
+    # Broad selector set to catch different templates
+    containers = soup.select(
+        ".news-item, .post, .article, .news, .news-list, .news-listing, li.news, div[class*='news']"
+    )
+
+    # If none found, fall back to the generic approach: look for article-like containers
+    if not containers:
+        containers = soup.select("article, .post, .entry, li, .content-item, .story, .td_module_wrap")
 
     for c in containers:
         try:
-            title_elem = c.select_one("h2 a, h3 a, .title a")
-            if title_elem:
-                title = title_elem.get_text(strip=True)
-                link = urljoin(base_url, title_elem.get("href"))
-            else:
+            # Title element candidates
+            title_elem = c.select_one("h2 a, h3 a, .title a, a, h2, h3")
+            if not title_elem:
                 continue
+            title = title_elem.get_text(" ", strip=True)
+            link = title_elem.get("href") or title_elem.get("data-href") or None
+            if not title or not link:
+                continue
+            link = urljoin(base_url, link)
 
-            date = c.select_one(".date, .post-date") and c.select_one(".date, .post-date").get_text(strip=True) or None
+            date = None
+            date_elem = c.select_one(".date, .post-date, time, span.date")
+            if date_elem:
+                date = date_elem.get_text(" ", strip=True)
 
-            snippet = ""
-            p = c.select_one(".excerpt, p")
-            if p:
-                snippet = p.get_text(strip=True)
+            snippet = None
+            for sel in (".excerpt, .summary, .post-excerpt, p"):
+                s = c.select_one(sel)
+                if s:
+                    snippet = s.get_text(" ", strip=True)
+                    if len(snippet) >= 40:
+                        break
+
+            if not snippet:
+                snippet = "Click to read full update..."
 
             key = f"{title[:50]}|{link}"
             if key in seen:
@@ -1635,17 +1654,18 @@ def extract_myschool_items(html: str, base_url: str) -> List[Dict[str, Any]]:
             seen.add(key)
 
             items.append({
-                "title": title,
-                "snippet": snippet or "Click to read full update...",
+                "title": re.sub(r'\s+', ' ', title).strip(),
+                "snippet": snippet,
                 "date": date,
                 "link": link,
                 "source": urlparse(base_url).netloc,
-                "pdf": False
+                "pdf": _is_pdf_link(link)
             })
-        except:
+        except Exception:
             continue
 
-    return items
+    # If still nothing, return empty list (calling function will try other candidates)
+    return items[:20]
 
 def extract_jamb_items(html: str, base_url: str) -> List[Dict[str, Any]]:
     """JAMB-specific extraction (flat p tags)."""
