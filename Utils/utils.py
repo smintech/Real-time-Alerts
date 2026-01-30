@@ -769,7 +769,7 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
                         break
         
         if "konga" in domain and product["current_price"] is None:
-            selectors = ["span._3e_22_199e7", "._3e_22_199e7", "h4._44738_3988u", "div.price", "[class*='price']"]
+            selectors = ["span.price", "p.price", "h4.price", "div.price", "[class*='price']"]
             for sel in selectors:
                 el = soup.select_one(sel)
                 if el:
