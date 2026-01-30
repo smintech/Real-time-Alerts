@@ -556,6 +556,107 @@ def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain
         return None
     return best_guess
 
+def _extract_konga_current_price(soup: BeautifulSoup, page_text: str) -> Optional[float]:
+    """
+    Robust Konga price extraction:
+    - checks JSON-LD (already handled earlier, but double-checks attributes)
+    - checks meta tags (og:price, product:price:amount)
+    - checks itemprop="price" and common data-price attributes
+    - tries a set of likely selectors and attribute names
+    - splits large concatenated numeric tokens (e.g. '24999000') when necessary
+    - validates price ranges (>= 50, below absurd upper bound)
+    """
+    # 1) meta tags
+    meta_amount = None
+    for meta_prop in ("og:price:amount", "product:price:amount", "price:amount", "twitter:data1"):
+        m = soup.find("meta", property=meta_prop) or soup.find("meta", attrs={"name": meta_prop})
+        if m and m.get("content"):
+            p = _parse_price_string(m["content"])
+            if p:
+                return p
+
+    # 2) itemprop / meta itemprop
+    ip = soup.find(attrs={"itemprop": "price"})
+    if ip:
+        if ip.get("content"):
+            p = _parse_price_string(ip.get("content"))
+            if p:
+                return p
+        text = ip.get_text(" ", strip=True)
+        p = _parse_price_string(text)
+        if p:
+            return p
+
+    # 3) common data attributes that may contain price
+    attr_names = ["data-price", "data-offer-price", "data-offerprice", "data-amount", "data-product-price", "data-price-amount"]
+    for a in attr_names:
+        el = soup.find(attrs={a: True})
+        if el:
+            val = el.get(a) or el.get("content") or el.get("value")
+            p = _parse_price_string(str(val))
+            if p:
+                return p
+
+    # 4) look for inputs or script JSON containing price keys
+    # quick search for common keys in page_text (cheap but effective)
+    for key in ('"offerPrice"', '"product_price"', '"price":"', '"price":', '"salePrice"', '"discountedPrice"', '"amount":'):
+        if key in page_text:
+            # pull numeric-like tokens nearby
+            for m in re.finditer(r"(?:₦|NGN|N)?\s*([0-9][0-9,\.]{1,})", page_text):
+                p = _parse_price_string(m.group(0))
+                if p and 50 <= p < 1_000_000_000:
+                    return p
+
+    # 5) selector-based scan (common Konga / e-comm class patterns plus fallbacks)
+    selectors = [
+        "span.price", "span.prc", "div.price", "div.prc", ".product-price",
+        ".price", ".prc", ".price--amount", ".price-amount", ".amount",
+        ".price-main", ".product-pricing .price", "[class*='konga-price']",
+        "[data-testid*='price']", "[class*='price']", "[id*='price']"
+    ]
+    seen_texts = set()
+    for sel in selectors:
+        for el in soup.select(sel):
+            txt = None
+            # prefer attributes that hold numeric values
+            for attr in ("data-price", "data-offer-price", "content", "value", "data-amount"):
+                if el.get(attr):
+                    txt = el.get(attr)
+                    break
+            if not txt:
+                txt = el.get_text(" ", strip=True)
+            if not txt or txt in seen_texts:
+                continue
+            seen_texts.add(txt)
+            p = _parse_price_string(txt)
+            if p and 50 <= p < 1_000_000_000:
+                return p
+            # if the text contains a very long numeric token, try to split it
+            for token in re.findall(r"[\d]{6,}", txt.replace(",", "")):
+                split = _split_concatenated_numeric_token(token)
+                if split:
+                    # split returns [smaller, larger] - prefer smaller (likely the real price when concatenated)
+                    candidate = float(min(split))
+                    if 50 <= candidate < 1_000_000_000:
+                        return candidate
+
+    # 6) fallback: regex search near words "price" or "offer" — find the nearest NGN token
+    price_matches = []
+    for m in re.finditer(r"(?:(?:price|offer|sale|was|now|special)[^\d]{0,30})(?:₦|NGN|N)?\s*([\d,\.]+)", page_text, re.I):
+        p = _parse_price_string(m.group(1))
+        if p and 50 <= p < 1_000_000_000:
+            price_matches.append(p)
+    if price_matches:
+        return max(price_matches)
+
+    # 7) last resort: any NGN token on the page (already in other code, but keep here as safety)
+    for m in re.finditer(r"(?:₦|NGN|N)\s*([\d,\.]+)", page_text):
+        p = _parse_price_string(m.group(1))
+        if p and 50 <= p < 1_000_000_000:
+            return p
+
+    return None
+
 # ═══════════════════════════════════════════════════════════════════════════
 # E-COMMERCE SCRAPERS (ENHANCED FOR KONGA WITH BETTER SELECTORS)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -769,19 +870,14 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
                         break
         
         if "konga" in domain and product["current_price"] is None:
-            selectors = ["span.price", "p.price", "h4.price", "div.price", "[class*='price']"]
-            for sel in selectors:
-                el = soup.select_one(sel)
-                if el:
-                    text = el.get_text(" ", strip=True)
-                    p = _parse_price_string(text)
-                    if p and p > 100_000_000:
-                        split = _split_concatenated_numeric_token(str(int(p)))
-                        if split:
-                            p = min(split)
-                    if p:
-                        product["current_price"] = p
-                        break
+            page_text = soup.get_text(" ", strip=True)
+            try:
+               p = _extract_konga_current_price(soup, page_text)
+               if p:
+                    product["current_price"] = p
+            except Exception as e:
+                LOG.debug("Konga price extractor exception: %s", e)
+                        
         
         if product["current_price"] is None:
             page_text = soup.get_text(" ", strip=True)
