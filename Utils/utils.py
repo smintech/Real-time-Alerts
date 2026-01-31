@@ -183,7 +183,7 @@ async def fetch_with_playwright_aggressive(url: str, retries: int = 3) -> str:
                 """)
 
                 await page.goto(url, wait_until='domcontentloaded', timeout=90000)
-                 await page.wait_for_load_state("networkidle", timeout=90000)
+                await page.wait_for_load_state("networkidle", timeout=90000)
                 await page.wait_for_timeout(random.randint(3000, 7000))
                 
                 # Full scroll to trigger lazy-loaded prices
