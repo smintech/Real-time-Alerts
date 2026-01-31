@@ -168,7 +168,7 @@ async def fetch_with_playwright_aggressive(url: str, retries: int = 3) -> str:
                 ])
                 context = await browser.new_context(
                     user_agent=random.choice(_USER_AGENTS),
-                    viewport={'width': 1280, 'height’: 800},
+                    viewport={'width': 1280, 'height': 800},
                     locale='en-US',
                     timezone_id='Africa/Lagos',
                 )
