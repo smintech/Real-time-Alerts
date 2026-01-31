@@ -395,32 +395,52 @@ def _parse_price_string(s: str) -> Optional[float]:
     except Exception:
         return None
 
-def _split_concatenated_numeric_token(token: str) -> List[float]:
-    """Split concatenated prices like '115000002000000' into [1150000, 2000000]"""
-    cleaned = re.sub(r"[^\d]", "", str(token))
-    n = len(cleaned)
-    results = []
-    if n < 6:
-        return []
-    # Try splitting at various positions
-    for i in range(3, n - 2):
-        a = cleaned[:i]
-        b = cleaned[i:]
-        try:
-            va = float(a)
-            vb = float(b)
-        except Exception:
+def split_concatenated_price(text: str, min_price: float = 50000) -> Tuple[Optional[float], Optional[float]]:
+    """
+    PRODUCTION FIX: Split concatenated prices like '18500002100000' -> (old: 2.1M, current: 1.85M)
+    Logic: Tries multiple split points, selects best ratio match (60-100% range)
+    """
+    digits = re.sub(r'[^\d]', '', str(text))
+    
+    if len(digits) < 12 or len(digits) > 16:
+        return None, None
+    
+    mid = len(digits) // 2
+    best_split = None
+    min_diff = float('inf')
+    
+    # Try split points around middle
+    for offset in range(-3, 4):
+        split_point = mid + offset
+        if split_point < 6 or split_point > len(digits) - 6:
             continue
-        # Both parts should be reasonable prices (>= 1000 to avoid splitting dates/codes)
-        if va >= 1000 and vb >= 1000:
-            results.append((va, vb))
+        
+        try:
+            left = float(digits[:split_point])
+            right = float(digits[split_point:])
+            
+            # Realistic price ranges (phones/electronics: 50k - 10M)
+            if not (min_price <= left <= 10000000 and min_price <= right <= 10000000):
+                continue
+            
+            larger = max(left, right)
+            smaller = min(left, right)
+            
+            if larger == 0:
+                continue
+            
+            # Current price is usually 60-100% of old price
+            ratio = smaller / larger
+            if 0.6 <= ratio <= 1.0:
+                diff = larger - smaller
+                if diff < min_diff:
+                    min_diff = diff
+                    best_split = (larger, smaller)  # (old, current)
+        except:
+            continue
     
-    if not results:
-        return []
-    
-    # Return the pair with smallest difference (most likely concatenated prices)
-    best = min(results, key=lambda p: abs(p[0] - p[1]))
-    return [float(best[0]), float(best[1])]
+    return best_split if best_split else (None, None)
+
 
 def _gather_price_candidates_from_dom(soup: BeautifulSoup, domain_hint: str = "") -> List[float]:
     """
