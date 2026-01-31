@@ -126,12 +126,15 @@ DEFAULT_SCHOOL_SOURCES = {
     ],  # Replaced OEQA with LASUBEB (more active)
 }
 
+# bot/settings.py - Additions for School News
+import re
+
+# ENHANCED: Broader keyword detection (handles plurals/ed forms)
 _SCHOOL_KEYWORDS_RE = re.compile(
-    r"\b(resum(?:ption|ed|e)|reschedule|academic\s+calendar|holiday|exam(?:ination)?|postpone|cancel|strike|suspend|closure|announcement|notice|circular|scholarship|admission|registration|result|mock|timetable|portal|deadline)\b",
+    r"\b(resum(?:ption|ed|e)|reschedule|academic\s+calendar|holiday|exam(?:s|ination)?|postponed?|cancel|strike|suspend|closur|announcement|notice|circular|scholarship|admission|registration|results?|mock|timetable|portal|deadline)\b",
     flags=re.I
 )
 
-# Matches standard dates (e.g., "Jan 24, 2026", "24-01-2026", "2026-01-24")
 _DATE_RE = re.compile(
     r"(\b\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[a-z,.]*\s*\d{4}\b)|"
     r"(\b\d{4}-\d{2}-\d{2}\b)|"
