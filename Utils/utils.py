@@ -19,7 +19,7 @@ from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup, Tag
 import cloudscraper
 from requests.exceptions import RequestException
-from typing import Dict, Optional, Any, Tuple, Callable, List, Set
+from typing import Dict, Optional, Any, Tuple, Callable, List, Set, Union
 
 # Settings / thresholds
 from bot.settings import (
@@ -150,8 +150,64 @@ def fetch_with_cloudscraper_aggressive(url: str, retries: int = 6) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 # AGGRESSIVE PLAYWRIGHT (IMPROVED CLEANUP + NETWORKIDLE)
 # ═══════════════════════════════════════════════════════════════════════════
+async def get_visible_text_from_playwright_page(page, timeout: int = 5000) -> str:
+    """
+    Evaluate JS in-page to return visible human text only (document order).
+    Conservative: checks display/visibility/opacity/clientRects and aria-hidden.
+    Returns a cleaned single-string with collapsed whitespace.
+    """
+    js = r"""
+    () => {
+      const isElementVisible = (el) => {
+        if (!el) return false;
+        try {
+          const style = window.getComputedStyle(el);
+          if (!style || style.visibility === 'hidden' || style.display === 'none' || parseFloat(style.opacity) === 0) return false;
+        } catch (e) {}
+        let node = el;
+        while (node && node !== document.body) {
+          if (node.hasAttribute && node.hasAttribute('aria-hidden') && node.getAttribute('aria-hidden') === 'true') return false;
+          node = node.parentElement;
+        }
+        const rects = el.getClientRects();
+        if (rects && rects.length) return true;
+        return false;
+      };
 
-async def fetch_with_playwright_aggressive(url: str, retries: int = 3) -> str:
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
+      const parts = [];
+      let node;
+      while ((node = walker.nextNode())) {
+        const text = node.textContent || '';
+        const trimmed = text.replace(/\s+/g, ' ').trim();
+        if (!trimmed) continue;
+        const parent = node.parentElement;
+        if (!parent) continue;
+        if (isElementVisible(parent)) {
+          parts.push(trimmed);
+        }
+      }
+      return parts.join(' ');
+    }
+    """
+    try:
+        visible = await page.evaluate(js, timeout=timeout)
+        if visible and isinstance(visible, str):
+            visible = re.sub(r"\s+", " ", visible).strip()
+            return visible
+    except Exception as e:
+        LOG.debug("get_visible_text_from_playwright_page evaluate failed: %s", e)
+    return ""
+
+async def fetch_with_playwright_aggressive(
+    url: str,
+    retries: int = 3,
+    return_visible_text: bool = False
+) -> Union[str, Tuple[str, str]]:
+    """
+    Aggressive Playwright fetch. If return_visible_text=True returns (html, visible_text)
+    otherwise returns html (preserves backwards compatibility).
+    """
     for attempt in range(1, retries + 1):
         LOG.debug("Playwright attempt %d/%d for %s", attempt, retries, url)
         browser = None
@@ -174,6 +230,7 @@ async def fetch_with_playwright_aggressive(url: str, retries: int = 3) -> str:
                 )
                 page = await context.new_page()
 
+                # anti-detect tweaks
                 await page.add_init_script("""
                     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                     Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
@@ -185,24 +242,33 @@ async def fetch_with_playwright_aggressive(url: str, retries: int = 3) -> str:
                 await page.goto(url, wait_until='domcontentloaded', timeout=90000)
                 await page.wait_for_load_state("networkidle", timeout=90000)
                 await page.wait_for_timeout(random.randint(3000, 7000))
-                
-                # Full scroll to trigger lazy-loaded prices
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(2000)
-                await page.evaluate("window.scrollTo(0, 0)")
-                await page.wait_for_timeout(1000)
-                
-                # Original half-scroll
+
+                # full scroll to trigger lazy load
                 try:
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await page.wait_for_timeout(2000)
+                    await page.evaluate("window.scrollTo(0, 0)")
+                    await page.wait_for_timeout(1000)
                     await page.evaluate('window.scrollTo(0, document.body.scrollHeight/2)')
                     await page.wait_for_timeout(800)
                 except Exception:
                     pass
-                
+
+                visible_text = None
+                if return_visible_text:
+                    try:
+                        visible_text = await get_visible_text_from_playwright_page(page)
+                        LOG.debug("Collected visible text (len=%d) for %s", len(visible_text or ""), url)
+                    except Exception as e:
+                        LOG.debug("Visible text collection failed: %s", e)
+
                 html = await page.content()
-                
+
+                # basic sanity checks
                 if len(html) > 8000 and 'cloudflare' not in html.lower() and 'just a moment' not in html.lower():
                     LOG.debug("Playwright succeeded for %s", url)
+                    if return_visible_text:
+                        return html, visible_text or ""
                     return html
         except Exception as e:
             LOG.debug("Playwright attempt %d exception for %s: %s", attempt, url, e)
@@ -210,14 +276,14 @@ async def fetch_with_playwright_aggressive(url: str, retries: int = 3) -> str:
             if context:
                 try:
                     await context.close()
-                except:
+                except Exception:
                     pass
             if browser:
                 try:
                     await browser.close()
-                except:
+                except Exception:
                     pass
-        
+
         if attempt < retries:
             await asyncio.sleep(random.uniform(5, 10))
 
@@ -709,55 +775,90 @@ def _extract_konga_current_price(soup: BeautifulSoup, page_text: str) -> Optiona
 
 def extract_prices_from_visible_text(
     page_text: str,
-    currency_prefixes: str = r"₦|N|NGN",
-    min_price: float = 10000,
-    max_price: float = 20000000
+    currency_prefixes: str = r"₦|NGN|N",
+    min_price: float = 10_000.0,
+    max_price: float = 20_000_000.0
 ) -> Tuple[Optional[float], Optional[float]]:
     """
-    Pure visible-text fallback:
-    - Scans the flat rendered page text in document order
-    - Finds prices starting with ₦/N/NGN followed by numbers
-    - First valid price → current
-    - If second price exists and is lower → second = current, first = previous (common discount pattern)
-    - Otherwise second = previous if different
+    Parse visible-only page_text for prices. Returns (current, previous).
+    Handles ₦ / NGN / N prefixes, commas, decimals, and k/K suffix.
+    Uses heuristics to decide which is current vs previous.
     """
-    pattern = rf"({currency_prefixes})\s*([\d,]+(?:\.\d+)?)"
-    matches = list(re.finditer(pattern, page_text, re.IGNORECASE))
+    if not page_text or not isinstance(page_text, str):
+        return None, None
 
-    valid_prices = []
-    for m in matches:
-        num_part = m.group(2).replace(",", "").strip()
+    # collapse whitespace
+    txt = re.sub(r"\s+", " ", page_text)
+
+    # capture patterns like "₦ 12,000", "NGN12k", "N 12.5k"
+    # We capture the numeric part (may include trailing k)
+    pattern = rf"(?i)(?:{currency_prefixes})\s*[:\-]?\s*([0-9][0-9,\.]*\s*[kK]?|\d+(?:\.\d+)?\s*[kK])"
+    raw_matches = re.findall(pattern, txt)
+
+    def normalize_num(s: str) -> Optional[float]:
+        if not s:
+            return None
+        s = s.strip().replace(" ", "")
+        mul = 1.0
+        if s[-1] in ("k", "K"):
+            mul = 1_000.0
+            s = s[:-1]
+        s = s.replace(",", "")
         try:
-            value = float(num_part)
-            if min_price <= value <= max_price:
-                valid_prices.append(value)
-        except ValueError:
+            val = float(s) * mul
+            return val
+        except Exception:
+            return None
+
+    candidates: List[float] = []
+    for raw in raw_matches:
+        val = normalize_num(raw)
+        if val is None:
             continue
+        # enforce sane bounds
+        if val < min_price or val > max_price:
+            continue
+        candidates.append(val)
+
+    # deduplicate while preserving order
+    seen = set()
+    valid_prices = []
+    for p in candidates:
+        if p not in seen:
+            seen.add(p)
+            valid_prices.append(p)
 
     if not valid_prices:
-        LOG.debug("No valid prices found in rendered page text")
+        LOG.debug("No valid visible prices extracted from visible-text")
         return None, None
 
     first = valid_prices[0]
-    second = valid_prices[1] if len(valid_prices) >= 2 else None
+    second = valid_prices[1] if len(valid_prices) > 1 else None
 
+    # Heuristics:
+    # - If first > second by a meaningful margin -> previous = first, current = second
+    # - If nearly identical -> single price
+    # - Else prefer lower as current if substantially lower (>=5%)
     if second is None:
         return first, None
 
-    # Common case: old price appears first (higher), then discounted price
-    if first > second and (first - second) > 500:  # meaningful discount
-        current = second
-        previous = first
+    if first > second and (first - second) > 500:
+        current, previous = second, first
     else:
-        current = first
-        previous = second if abs(second - first) > 500 else None  # avoid same price twice
+        # nearly equal -> treat as single
+        if abs(first - second) <= max(1.0, 0.01 * first):
+            current, previous = first, None
+        else:
+            if second < first and (first - second) / first >= 0.05:
+                current, previous = second, first
+            else:
+                current, previous = first, second
 
     LOG.info(
-        "Visible-text fallback → current: ₦%.0f | previous: %s",
+        "Visible-text extractor → current: ₦%.0f | previous: %s",
         current,
         f"₦{previous:.0f}" if previous is not None else "None"
     )
-
     return current, previous
 # ═══════════════════════════════════════════════════════════════════════════
 # E-COMMERCE SCRAPERS (ENHANCED FOR KONGA WITH BETTER SELECTORS)
@@ -809,24 +910,40 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
     domain = get_domain_from_url(url)
     if not any(s in domain for s in SUPPORTED_SITES):
         raise NotImplementedError(f"Unsupported site: {domain}. Add to SUPPORTED_SITES.")
-    
+
+    html = None
+    visible_text = None
+
+    # Primary fetch: Playwright for dynamic content
     try:
         if any(d in domain for d in ("jumia", "konga")):
             try:
-                html = await fetch_with_playwright_aggressive(url, retries=3)
-            except Exception:
-                html = await _fetch_html(url)
+                res = await fetch_with_playwright_aggressive(url, retries=3, return_visible_text=True)
+                if isinstance(res, tuple):
+                    html, visible_text = res
+                else:
+                    html = res
+            except Exception as e:
+                LOG.debug("Playwright primary fetch failed for %s: %s", url, e)
         else:
             html = await _fetch_html(url)
     except Exception as e:
-        raise NoDataError(f"Failed to fetch page: {e}")
+        LOG.warning(f"Primary fetch failed for {url}: {e} - Falling back to cloudscraper")
     
+    # Fallback fetch: cloudscraper if primary failed
+    if html is None:
+        try:
+            loop = asyncio.get_running_loop()
+            html = await loop.run_in_executor(None, fetch_with_cloudscraper_aggressive, url, 5)
+        except Exception as e:
+            raise NoDataError(f"All fetch methods failed for {url}: {e}")
+
     soup = BeautifulSoup(html, "lxml")
-    
+
     title_str = soup.title.string.lower() if soup.title else ""
     if any(kw in title_str for kw in ["just a moment", "verify", "cloudflare", "attention required", "challenge"]):
         raise NoDataError("Blocked by Cloudflare/anti-bot protection")
-    
+
     product = {
         "title": "Product",
         "current_price": None,
@@ -840,7 +957,7 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
         "image": None,
         "description": "",
     }
-    
+
     json_ld_data = None
     for script in soup.find_all("script", type="application/ld+json"):
         try:
@@ -878,12 +995,12 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
                     break
         except Exception:
             continue
-    
+
     if product["title"] == "Product":
         og_title = soup.find("meta", property="og:title")
         if og_title and og_title.get("content"):
             product["title"] = og_title["content"].strip()
-    
+
     if product["current_price"] is None:
         og_price = soup.find("meta", property="og:price:amount")
         if og_price and og_price.get("content"):
@@ -891,12 +1008,12 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
                 product["current_price"] = float(og_price["content"])
             except:
                 pass
-    
+
     if not product["description"]:
         meta_desc = soup.find("meta", attrs={"name": "description"})
         if meta_desc and meta_desc.get("content"):
             product["description"] = meta_desc["content"].strip()
-    
+
     if not product["description"]:
         if "jumia" in domain:
             desc_sel = soup.select_one("div.markup, div.-pvs, section.-phm.-pvxl, div.-hr.-mtm.-pvs")
@@ -906,7 +1023,7 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
             desc_sel = soup.select_one("div.description, div._2f369_2Dp2R, div.product-description")
             if desc_sel:
                 product["description"] = desc_sel.get_text(separator="\n", strip=True)
-    
+
     def _add_image_candidate(src):
         if not src:
             return
@@ -916,11 +1033,11 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
                 product["images"].append(abs_url)
         except Exception:
             pass
-    
+
     og_image = soup.find("meta", property="og:image") or soup.find("meta", attrs={"name": "og:image"})
     if og_image and og_image.get("content"):
         _add_image_candidate(og_image["content"])
-    
+
     if "jumia" in domain:
         possible = soup.select("img[class*='prd-img'], img[class*='image'], img[class*='gallery'], img")
         for img in possible:
@@ -933,7 +1050,7 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
             src = img.get("data-src") or img.get("src") or img.get("data-original")
             if src and len(product["images"]) < 6:
                 _add_image_candidate(src)
-    
+
     if not product["images"]:
         img_tags = soup.find_all("img")
         seen = set()
@@ -957,7 +1074,7 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
             product["images"].append(src)
             if len(product["images"]) >= 6:
                 break
-    
+
     # CURRENT PRICE EXTRACTION (ENHANCED FOR KONGA)
     if product["current_price"] is None:
         if "jumia" in domain:
@@ -979,28 +1096,8 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
                     product["current_price"] = p
             except Exception as e:
                 LOG.debug("Konga price extractor exception: %s", e)
-        
-        if "konga" in domain and product["current_price"] is None:
-            try:
-                if len(page_text) > 1500:  # minimal sanity check
-                    curr, prev = extract_prices_from_visible_text(page_text)
-                    if curr is not None:
-                        product["current_price"] = curr
-                        # Only set previous if it makes sense (higher than current)
-                        if prev is not None and prev > curr:
-                            product["previous_price"] = prev
-                        LOG.info(
-                            "Konga visible-text fallback → current ₦%.0f (prev %s)",
-                            curr,
-                            f"₦{prev:.0f}" if prev else "None"
-                        )
-                    else:
-                        LOG.debug("Visible-text fallback found no valid prices on Konga")
-                else:
-                    LOG.warning("Page text too short for Konga fallback (%d chars)", len(page_text))
-            except Exception as ex:
-                LOG.exception("Konga visible-text fallback error: %s", ex)
-        
+                    
+    
         if product["current_price"] is None:
             page_text = soup.get_text(" ", strip=True)
             matches = re.findall(r"(?:₦|NGN)[\s]?([\d,]+\.?\d*)", page_text)
@@ -1014,58 +1111,38 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
                         pass
                 if prices:
                     product["current_price"] = max(prices)
-    
+
     # PREVIOUS PRICE EXTRACTION
     page_text = soup.get_text(" ", strip=True)
     prev_price = _extract_previous_price(soup, json_ld_data, domain, page_text, product["current_price"])
     if prev_price:
         product["previous_price"] = prev_price
         LOG.info("Found previous price: ₦%.0f for %s", prev_price, product["title"])
-    
+
     # Stock & title fallbacks (ENHANCED FOR KONGA)
     page_text_lower = soup.get_text().lower()
     if any(phrase in page_text_lower for phrase in ["out of stock", "sold out", "unavailable", "not available"]):
         product["stock_status"] = "out_of_stock"
-    
+
     if product["title"] == "Product" or "Buy" in product["title"]:
         h1 = soup.select_one("h1.-fs20, h1.-pb10, h1.brd, .v-p-hd h1, h1, .product-title, h1.product-name")  # Enhanced
         if h1:
             product["title"] = h1.get_text(strip=True)
         elif soup.title:
             product["title"] = soup.title.string.strip()
-    
-    if product["current_price"] is None:
-        # Fallback 1: DOM candidates (often catches discounted prices)
-        candidates = _gather_price_candidates_from_dom(soup, domain)
-        if candidates:
-            unique = sorted(set(candidates), reverse=True)
-            if len(unique) >= 2 and unique[1] / unique[0] >= 0.6:
-                product["current_price"] = unique[1]  # lower = current (discount)
-                LOG.info("Fallback DOM: selected discounted current price ₦%.0f", product["current_price"])
-            elif unique:
-                product["current_price"] = unique[0]
-                LOG.info("Fallback DOM: selected price ₦%.0f", product["current_price"])
 
-    if product["current_price"] is None:
-        # Fallback 2: Regex on full page text
-        page_text = soup.get_text(" ", strip=True)
-        matches = re.findall(r"(?:₦|NGN)[\s]*([\d,]+\.?\d*)", page_text)
-        prices = []
-        for m in matches:
-            clean = m.replace(",", "").strip()
-            try:
-                val = float(clean)
-                if 10000 <= val <= 20000000:
-                    prices.append(val)
-            except:
-                pass
-        if prices:
-            unique = sorted(set(prices), reverse=True)
-            if len(unique) >= 2 and unique[1] / unique[0] >= 0.6:
-                product["current_price"] = unique[1]
-            elif unique:
-                product["current_price"] = unique[0]
-            LOG.info("Fallback regex: selected current price ₦%.0f", product["current_price"])
+    # VISIBLE-TEXT FALLBACK (KONGA ONLY) - applied if no price yet
+    if "konga" in domain and product["current_price"] is None:
+        page_text_visible = visible_text or soup.get_text(" ", strip=True)
+        try:
+            curr, prev = extract_prices_from_visible_text(page_text_visible)
+            if curr is not None:
+                product["current_price"] = curr
+                if prev is not None:
+                    product["previous_price"] = prev
+                LOG.info("Konga visible-text fallback → current ₦%.0f (prev %s)", curr, f"₦{prev:.0f}" if prev else "None")
+        except Exception as e:
+            LOG.debug("Konga visible-text fallback failed: %s", e)
 
     if product["current_price"] is None:
         raise NoDataError("No price found after all extraction methods")
@@ -1083,10 +1160,10 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
             continue
     product["images"] = cleaned[:6]
     product["image"] = cleaned[0] if cleaned else None
-    
+
     product["description"] = product["description"][:1500].strip()
     product["raw"] = {"json_ld": json_ld_data} if json_ld_data else {"snippet": product["title"]}
-    
+
     LOG.info("Successfully scraped %s — ₦%.0f — %s (desc len=%d)", 
              product["title"], product["current_price"], domain, len(product["description"]))
     return product
