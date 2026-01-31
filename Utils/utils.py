@@ -33,6 +33,14 @@ from bot.settings import (
 )
 
 LOG = logging.getLogger(__name__)
+if not LOG.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter(
+        '%(asctime)s - %(name)s - %(levelname)s - [%(funcName)s:%(lineno)d] - %(message)s'
+    )
+    handler.setFormatter(formatter)
+    LOG.addHandler(handler)
+    LOG.setLevel(logging.DEBUG)
 
 class ScrapeError(Exception):
     """Generic scraping failure."""
@@ -150,36 +158,89 @@ def fetch_with_cloudscraper_aggressive(url: str, retries: int = 6) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 # AGGRESSIVE PLAYWRIGHT (IMPROVED CLEANUP + NETWORKIDLE)
 # ═══════════════════════════════════════════════════════════════════════════
+def _log_dom_snapshot(soup: BeautifulSoup, context: str = "", max_elements: int = 10):
+    """Log a snapshot of interesting DOM elements for debugging."""
+    LOG.debug("=== DOM SNAPSHOT [%s] ===", context)
+    
+    # Check for data attributes commonly used for pricing
+    price_attrs = ['data-price', 'data-final-price', 'data-price-amount', 
+                   'data-selling-price', 'data-offer-price', 'content']
+    found_attrs = {}
+    
+    for attr in price_attrs:
+        elements = soup.find_all(attrs={attr: True})
+        if elements:
+            found_attrs[attr] = len(elements)
+            sample = elements[:3]
+            values = [el.get(attr, 'N/A')[:50] for el in sample]
+            LOG.debug("  Found %d elements with [%s]: samples=%s", len(elements), attr, values)
+    
+    if not found_attrs:
+        LOG.debug("  No standard price attributes found in DOM")
+    
+    # Check for meta tags
+    meta_prices = soup.find_all("meta", attrs={"property": re.compile(r'.*price.*', re.I)})
+    if meta_prices:
+        LOG.debug("  Found %d meta price tags", len(meta_prices))
+        for meta in meta_prices[:3]:
+            LOG.debug("    meta[property=%s]: content=%s", 
+                     meta.get('property'), meta.get('content', 'N/A')[:50])
+    
+    # Check for specific Konga classes mentioned in selectors
+    konga_classes = ['_3e_22_199e7', '-b', '-ubpt', 'prc', '-fs24']
+    found_classes = {}
+    for cls in konga_classes:
+        count = len(soup.find_all(class_=re.compile(cls)))
+        if count:
+            found_classes[cls] = count
+    
+    if found_classes:
+        LOG.debug("  Konga-specific classes found: %s", found_classes)
+    else:
+        LOG.debug("  No Konga-specific classes found")
+
+def _log_selector_attempt(selector: str, elements_found: int, sample_text: str = ""):
+    """Log what we searched for vs what we found."""
+    status = "✓ HIT" if elements_found > 0 else "✗ MISS"
+    LOG.debug("    [%s] Selector '%s' -> %d elements %s", 
+             status, selector, elements_found, 
+             f"| Sample: {sample_text[:60]}..." if sample_text else "")
+
+def _log_extraction_attempt(source: str, raw_value: str, parsed_value: Optional[float], 
+                           constraints: Tuple[float, float] = (5000, 100_000_000)):
+    """Log price extraction attempt with validation result."""
+    min_val, max_val = constraints
+    if parsed_value:
+        status = "✓ VALID" if min_val <= parsed_value <= max_val else "✗ OUT_OF_RANGE"
+        LOG.debug("      [%s] %s: raw='%s' -> parsed=%.2f", status, source, raw_value[:50], parsed_value)
+    else:
+        LOG.debug("      [✗ PARSE_FAIL] %s: raw='%s'", source, raw_value[:50])
+
+# -------------------------------------------------------------------
+# 1) Enhanced visible-text + attribute + pseudo-content extractor
+# -------------------------------------------------------------------
 async def get_visible_text_from_playwright_page(page, timeout: int = 5000) -> str:
     """
-    FIXED: Better visibility checks with timeout protection
-    Evaluates JS in-page to return visible human text only
+    Return visible text *plus* attribute-based text hints and pseudo-element content.
+    This is a Playwright page.evaluate wrapper that collects:
+      - visible text nodes (existing logic)
+      - element attributes commonly holding prices (data-price, data-final-price, aria-label, title, alt)
+      - ::before/::after computed content when present (quoted)
+    Returns a single collapsed string; logs internal counts via LOG.debug where available.
     """
+    LOG.debug("Starting visible text extraction (timeout=%dms)...", timeout)
+    
     js = r"""
     () => {
-      const isElementVisible = (el) => {
+      function isElementVisible(el) {
         if (!el) return false;
-        
         try {
           const style = window.getComputedStyle(el);
           if (!style) return false;
-          
-          const visibility = style.visibility;
-          const display = style.display;
-          const opacity = parseFloat(style.opacity);
-          
-          if (visibility === 'hidden' || display === 'none' || opacity === 0) {
-            return false;
-          }
-          
+          if (style.visibility === 'hidden' || style.display === 'none' || parseFloat(style.opacity) === 0) return false;
           const rect = el.getBoundingClientRect();
-          if (rect.width === 0 || rect.height === 0) {
-            return false;
-          }
-        } catch (e) {
-          return false;
-        }
-        
+          if (rect.width === 0 || rect.height === 0) return false;
+        } catch (e) { return false; }
         let node = el;
         while (node && node !== document.body) {
           try {
@@ -189,73 +250,148 @@ async def get_visible_text_from_playwright_page(page, timeout: int = 5000) -> st
           } catch (e) {}
           node = node.parentElement;
         }
-        
         return true;
-      };
+      }
 
-      const walker = document.createTreeWalker(
-        document.body, 
-        NodeFilter.SHOW_TEXT, 
-        null, 
-        false
-      );
-      
+      // Collect visible text nodes (same as before)
+      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
       const parts = [];
       let node;
-      
       while ((node = walker.nextNode())) {
         const text = node.textContent || '';
         const trimmed = text.replace(/\s+/g, ' ').trim();
-        
         if (!trimmed) continue;
-        
         const parent = node.parentElement;
         if (!parent) continue;
-        
-        if (isElementVisible(parent)) {
-          parts.push(trimmed);
-        }
+        if (isElementVisible(parent)) parts.push(trimmed);
       }
-      
-      return parts.join(' ');
+
+      // Collect attribute-based tokens from likely price-holders
+      const attrTokens = [];
+      const attrSelectors = ['[data-price]', '[data-final-price]', '[data-price-amount]', '[data-amount]', '[data-selling-price]', '[data-offer-price]'];
+      attrSelectors.forEach(sel => {
+        document.querySelectorAll(sel).forEach(el => {
+          try {
+            const vals = [];
+            const a = el.getAttribute('data-price') || el.getAttribute('data-final-price') || el.getAttribute('data-price-amount') || el.getAttribute('data-amount') || el.getAttribute('data-selling-price') || el.getAttribute('data-offer-price');
+            if (a) vals.push(a);
+            if (el.title) vals.push(el.title);
+            if (el.alt) vals.push(el.alt);
+            if (el.getAttribute('aria-label')) vals.push(el.getAttribute('aria-label'));
+            vals.forEach(v => { if (v && v.trim()) attrTokens.push(v.trim()); });
+          } catch (e){}
+        });
+      });
+
+      // Generic attribute scan for common attributes on any visible element
+      document.querySelectorAll('*').forEach(el => {
+        try {
+          if (!isElementVisible(el)) return;
+          if (el.getAttribute && el.getAttribute('data-price')) attrTokens.push(el.getAttribute('data-price'));
+          if (el.getAttribute && el.getAttribute('data-final-price')) attrTokens.push(el.getAttribute('data-final-price'));
+          if (el.getAttribute && el.getAttribute('data-price-amount')) attrTokens.push(el.getAttribute('data-price-amount'));
+          if (el.title) attrTokens.push(el.title);
+          if (el.alt) attrTokens.push(el.alt);
+          if (el.getAttribute && el.getAttribute('aria-label')) attrTokens.push(el.getAttribute('aria-label'));
+        } catch(e){}
+      });
+
+      // Capture pseudo-element content for a few selectors (if any)
+      const pseudoTokens = [];
+      try {
+        // limited to first 20 elements for performance
+        const elems = Array.from(document.querySelectorAll('span,div')) .slice(0, 20);
+        elems.forEach(el => {
+          try {
+            const before = window.getComputedStyle(el, '::before').getPropertyValue('content');
+            const after  = window.getComputedStyle(el, '::after').getPropertyValue('content');
+            if (before && before !== 'none') pseudoTokens.push(before.replace(/^["']|["']$/g, ''));
+            if (after  && after !== 'none') pseudoTokens.push(after.replace(/^["']|["']$/g, ''));
+          } catch(e){}
+        });
+      } catch(e){}
+
+      // Combine and dedupe tokens, preserve order
+      const combined = [];
+      const seen = new Set();
+      parts.concat(attrTokens, pseudoTokens).forEach(t => {
+        if (!t) return;
+        const normal = t.replace(/\s+/g, ' ').trim();
+        if (!normal) return;
+        if (!seen.has(normal)) { seen.add(normal); combined.push(normal); }
+      });
+
+      return {
+        text: combined.join(' '),
+        stats: {
+          visibleNodes: parts.length,
+          attrTokens: attrTokens.length,
+          pseudoTokens: pseudoTokens.length,
+          totalUnique: combined.length
+        }
+      };
     }
     """
     try:
-        visible = await page.evaluate(js, timeout=timeout)
-        if visible and isinstance(visible, str):
-            visible = re.sub(r"\s+", " ", visible).strip()
-            return visible
+        start = time.time()
+        ret = await page.evaluate(js, timeout=timeout)
+        duration = time.time() - start
+        
+        if ret and isinstance(ret, dict):
+            text = ret.get('text', '')
+            stats = ret.get('stats', {})
+            cleaned = re.sub(r"\s+", " ", text).strip()
+            LOG.debug("Visible text extraction completed: nodes=%d, attrTokens=%d, pseudo=%d, "
+                     "unique=%d, chars=%d, time=%.2fs",
+                     stats.get('visibleNodes', 0), stats.get('attrTokens', 0),
+                     stats.get('pseudoTokens', 0), stats.get('totalUnique', 0),
+                     len(cleaned), duration)
+            return cleaned
+        elif isinstance(ret, str):
+            # Fallback for older return format
+            cleaned = re.sub(r"\s+", " ", ret).strip()
+            LOG.debug("Visible text extraction completed (legacy format): chars=%d, time=%.2fs", 
+                     len(cleaned), duration)
+            return cleaned
+            
     except Exception as e:
-        LOG.debug("get_visible_text_from_playwright_page failed: %s", str(e)[:50])
-    
+        LOG.error("Visible text extraction failed: %s", str(e)[:200])
     return ""
 
-
-# ═══════════════════════════════════════════════════════════════════════════
-# 2. FIXED: fetch_with_playwright_aggressive()
-# ═══════════════════════════════════════════════════════════════════════════
-
+# -------------------------------------------------------------------
+# 2) Fully improved fetch_with_playwright_aggressive (with XHR capture + price_js)
+# -------------------------------------------------------------------
 async def fetch_with_playwright_aggressive(
     url: str,
     retries: int = 3,
     return_visible_text: bool = False
 ) -> Union[str, Tuple[str, str]]:
     """
-    FIXED: Handles Konga timeouts and browser closure properly
-    - Reduced networkidle timeout from 90s to 15-20s
-    - Graceful timeout handling
-    - Proper browser cleanup
-    - Konga-specific timeout handling
+    Aggressive Playwright fetch with:
+      - response capture for product/price APIs (captured_responses)
+      - explicit wait-for price selectors for konga domain
+      - in-page price extraction (price_js)
+      - improved logging and timing
+    Returns html or (html, visible_text) to preserve compatibility.
     """
+    LOG.info("Starting aggressive fetch for URL: %s (retries=%d, return_text=%s)", 
+            url, retries, return_visible_text)
+    
     for attempt in range(1, retries + 1):
-        LOG.debug("Playwright attempt %d/%d for %s", attempt, retries, url)
+        LOG.info("=== ATTEMPT %d/%d for %s ===", attempt, retries, url)
         browser = None
         context = None
         page = None
-        
+        responses_captured: List[Tuple[str, str]] = []
+        price_js_result: Optional[str] = None
+
         try:
             async with async_playwright() as p:
-                # Launch browser with timeout
+                start_total = time.time()
+                
+                # Browser launch
+                LOG.debug("[Attempt %d] Launching browser...", attempt)
+                launch_start = time.time()
                 browser = await asyncio.wait_for(
                     p.chromium.launch(headless=True, args=[
                         '--no-sandbox',
@@ -265,9 +401,12 @@ async def fetch_with_playwright_aggressive(
                         '--disable-features=IsolateOrigins,site-per-process',
                         '--disable-setuid-sandbox',
                     ]),
-                    timeout=15.0
+                    timeout=20.0
                 )
-                
+                LOG.debug("[Attempt %d] Browser launched in %.2fs", attempt, time.time() - launch_start)
+
+                # Context creation
+                LOG.debug("[Attempt %d] Creating browser context...", attempt)
                 context = await asyncio.wait_for(
                     browser.new_context(
                         user_agent=random.choice([
@@ -279,22 +418,57 @@ async def fetch_with_playwright_aggressive(
                         locale='en-US',
                         timezone_id='Africa/Lagos',
                     ),
-                    timeout=10.0
+                    timeout=12.0
                 )
-                
-                page = await context.new_page()
+                LOG.debug("[Attempt %d] Context created", attempt)
 
-                # CRITICAL: Set timeouts based on domain
-                if 'konga' in url.lower():
-                    # Konga is slow - use shorter timeouts
-                    LOG.debug("Konga URL detected - using 30s timeout")
-                    page.set_default_timeout(30000)      # 30 seconds
-                    page.set_default_navigation_timeout(30000)
+                page = await context.new_page()
+                LOG.debug("[Attempt %d] New page created", attempt)
+
+                # Response capture: schedule async tasks to read JSON/text bodies for debugging
+                async def _capture_response_body(resp):
+                    try:
+                        rurl = resp.url
+                        low = rurl.lower()
+                        if any(k in low for k in ('product', 'price', 'selling', 'offer', '/api/')):
+                            ct = (resp.headers.get('content-type') or '').lower()
+                            LOG.debug("      [Response Capture] Checking %s (type: %s)", rurl[:80], ct[:30])
+                            if 'application/json' in ct or 'text/json' in ct or low.endswith('.json'):
+                                try:
+                                    body = await resp.text()
+                                    if body:
+                                        LOG.debug("      [Response Capture] ✓ Captured JSON from %s (len=%d)", 
+                                                 rurl[:60], len(body))
+                                        responses_captured.append((rurl, body[:2000]))
+                                except Exception as e:
+                                    LOG.debug("      [Response Capture] Failed to read body: %s", str(e)[:100])
+                            else:
+                                # capture small text snippets for readable responses
+                                try:
+                                    text = await resp.text()
+                                    if text and len(text) < 2000 and any(ch.isdigit() for ch in text[:200]):
+                                        LOG.debug("      [Response Capture] ✓ Captured text from %s", rurl[:60])
+                                        responses_captured.append((rurl, text[:1200]))
+                                except Exception:
+                                    pass
+                    except Exception as e:
+                        LOG.debug("capture_response_body error for %s: %s", getattr(resp, "url", "?"), str(e)[:200])
+
+                page.on("response", lambda r: asyncio.create_task(_capture_response_body(r)))
+                LOG.debug("[Attempt %d] Response handler attached", attempt)
+
+                # Timeouts per-domain
+                is_konga = 'konga' in url.lower()
+                if is_konga:
+                    LOG.info("[Attempt %d] Konga domain detected - using targeted timeouts (45s)", attempt)
+                    page.set_default_timeout(45000)      # 45 seconds default
+                    page.set_default_navigation_timeout(45000)
                 else:
-                    page.set_default_timeout(45000)      # 45 seconds for others
+                    page.set_default_timeout(45000)
                     page.set_default_navigation_timeout(45000)
 
                 # Anti-detect tweaks
+                LOG.debug("[Attempt %d] Injecting anti-detection scripts...", attempt)
                 await page.add_init_script("""
                     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                     Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
@@ -302,123 +476,226 @@ async def fetch_with_playwright_aggressive(
                     window.chrome = { runtime: {} };
                     Object.defineProperty(navigator, 'permissions', {get: () => ({ query: () => Promise.resolve({state: 'granted'}) })});
                 """)
+                LOG.debug("[Attempt %d] Anti-detection scripts injected", attempt)
 
-                # Navigate with timeout
+                # Navigate
                 try:
+                    LOG.info("[Attempt %d] Navigating to %s...", attempt, url)
+                    nav_start = time.time()
                     await asyncio.wait_for(
                         page.goto(url, wait_until='domcontentloaded', timeout=30000),
-                        timeout=35.0
+                        timeout=40.0
                     )
+                    nav_time = time.time() - nav_start
+                    LOG.info("[Attempt %d] Navigation completed (domcontentloaded) in %.2fs", attempt, nav_time)
                 except asyncio.TimeoutError:
-                    LOG.warning("Page goto timeout for %s, continuing with current state", url)
-                
-                # CRITICAL FIX: Shorter networkidle timeout for Konga
-                try:
-                    if 'konga' in url.lower():
-                        # Konga: 15 second max for networkidle (was 90s!)
-                        await asyncio.wait_for(
-                            page.wait_for_load_state("networkidle", timeout=15000),
-                            timeout=20.0
-                        )
-                    else:
-                        # Others: 30 second max
-                        await asyncio.wait_for(
-                            page.wait_for_load_state("networkidle", timeout=30000),
-                            timeout=35.0
-                        )
-                except asyncio.TimeoutError:
-                    LOG.warning("Network idle timeout for %s, continuing with available content", url)
-                
-                # Shorter random wait
-                await page.wait_for_timeout(random.randint(1500, 3000))
+                    LOG.warning("[Attempt %d] Page goto timeout for %s, continuing with current state", attempt, url)
 
-                # Full scroll to trigger lazy load
+                # For Konga: try to wait for likely price selectors (gracefully)
+                if is_konga:
+                    selectors_to_wait = [
+                        "span[data-testid='current-price']", 
+                        "div[data-testid='price-current']", 
+                        "meta[property='og:price:amount']"
+                    ]
+                    LOG.info("[Attempt %d] Konga: Waiting for price selectors: %s", attempt, selectors_to_wait)
+                    try:
+                        sel = ", ".join(selectors_to_wait)
+                        await page.wait_for_selector(sel, timeout=40000)
+                        LOG.info("[Attempt %d] Konga: Price selector appeared!", attempt)
+                    except Exception as e:
+                        LOG.warning("[Attempt %d] Konga: Price selectors did not appear before timeout (%s); proceeding", 
+                                   attempt, str(e)[:100])
+
+                # networkidle wait (short) but allow continuation if it times out
                 try:
+                    LOG.debug("[Attempt %d] Waiting for networkidle...", attempt)
+                    idle_start = time.time()
+                    await asyncio.wait_for(
+                        page.wait_for_load_state("networkidle", timeout=25000),
+                        timeout=30.0
+                    )
+                    LOG.debug("[Attempt %d] Networkidle reached in %.2fs", attempt, time.time() - idle_start)
+                except asyncio.TimeoutError:
+                    LOG.warning("[Attempt %d] networkidle timeout - continuing", attempt)
+
+                # short random wait to allow late XHRs to complete
+                wait_ms = random.randint(1200, 2600)
+                LOG.debug("[Attempt %d] Waiting additional %dms for late XHRs...", attempt, wait_ms)
+                await page.wait_for_timeout(wait_ms)
+
+                # Run in-page price extraction (tries attributes, selectors, scripts)
+                LOG.info("[Attempt %d] Running in-page price extraction...", attempt)
+                price_js = r"""
+                () => {
+                  const selectors = [
+                    "span[data-testid='current-price']",
+                    "div[data-testid='price-current']",
+                    "span[data-testid='product-price']",
+                    "span._3e_22_199e7",
+                    "span.-b.-ubpt",
+                    "span.prc.-fs24",
+                    "[data-price]",
+                    "[data-final-price]",
+                    "meta[property='og:price:amount']",
+                    "meta[itemprop=price]"
+                  ];
+                  const results = { attempts: [], found: null };
+                  
+                  for (const sel of selectors) {
+                    const el = document.querySelector(sel);
+                    if (el) {
+                      let val = null;
+                      if (el.getAttribute && el.getAttribute('data-price')) val = el.getAttribute('data-price');
+                      else if (el.content) val = el.content;
+                      else if (el.innerText && el.innerText.trim()) val = el.innerText.trim();
+                      
+                      results.attempts.push({selector: sel, found: true, value: val});
+                      if (val && !results.found) results.found = val;
+                    } else {
+                      results.attempts.push({selector: sel, found: false});
+                    }
+                  }
+                  
+                  // Search scripts for common tokens
+                  const scripts = Array.from(document.querySelectorAll('script')).map(s=>s.innerText).join(' ');
+                  const m = scripts.match(/"sellingPrice"\s*[:=]\s*([0-9]{3,}|[0-9]+\.[0-9]+)/i) || 
+                           scripts.match(/"price"\s*[:=]\s*["']?([0-9]{3,}(?:\.[0-9]+)?)["']?/i);
+                  if (m) {
+                    results.scriptMatch = m[1];
+                    if (!results.found) results.found = m[1];
+                  }
+                  
+                  return results;
+                }
+                """
+                try:
+                    start_eval = time.time()
+                    price_result = await page.evaluate(price_js)
+                    price_js_result = price_result.get('found') if isinstance(price_result, dict) else None
+                    
+                    if isinstance(price_result, dict):
+                        LOG.debug("[Attempt %d] Price JS detailed results:", attempt)
+                        for att in price_result.get('attempts', []):
+                            status = "✓" if att.get('found') else "✗"
+                            val = att.get('value', 'N/A')
+                            LOG.debug("      [%s] Selector '%s': %s", status, att.get('selector'), 
+                                     val[:40] if val else 'null')
+                        if price_result.get('scriptMatch'):
+                            LOG.debug("      [✓] Script regex match: %s", price_result['scriptMatch'])
+                    
+                    LOG.info("[Attempt %d] In-page price extraction completed in %.2fs -> result=%s", 
+                            attempt, time.time() - start_eval, str(price_js_result)[:50])
+                except Exception as e:
+                    LOG.error("[Attempt %d] Price JS eval failed: %s", attempt, str(e)[:200])
+
+                # Full scroll to trigger lazy loads (robust but bounded)
+                try:
+                    LOG.debug("[Attempt %d] Scrolling page to trigger lazy loads...", attempt)
+                    scroll_start = time.time()
                     await asyncio.wait_for(
                         page.evaluate("""
                             async () => {
                                 await new Promise((resolve) => {
                                     let totalHeight = 0;
-                                    const distance = 300;
+                                    const distance = 400;
                                     const timer = setInterval(() => {
                                         const scrollHeight = document.body.scrollHeight;
                                         window.scrollBy(0, distance);
                                         totalHeight += distance;
-                                        if(totalHeight >= scrollHeight){
+                                        if(totalHeight >= scrollHeight - 1000){
                                             clearInterval(timer);
                                             resolve();
                                         }
-                                    }, 300);
+                                    }, 250);
                                 });
                                 window.scrollTo(0, 0);
                             }
                         """),
-                        timeout=10.0
+                        timeout=12000
                     )
+                    LOG.debug("[Attempt %d] Scroll completed in %.2fs", attempt, time.time() - scroll_start)
                 except Exception as e:
-                    LOG.debug("Scroll failed gracefully: %s", str(e)[:50])
+                    LOG.warning("[Attempt %d] Scroll failed gracefully: %s", attempt, str(e)[:200])
 
                 # Collect visible text if requested
-                visible_text = None
+                visible_text = ""
                 if return_visible_text:
                     try:
+                        LOG.debug("[Attempt %d] Collecting visible text...", attempt)
+                        text_start = time.time()
                         visible_text = await asyncio.wait_for(
                             get_visible_text_from_playwright_page(page, timeout=5000),
-                            timeout=6.0
+                            timeout=8.0
                         )
-                        LOG.debug("Collected visible text (len=%d) for %s", len(visible_text or ""), url)
+                        LOG.info("[Attempt %d] Visible text collected: %d chars in %.2fs", 
+                                attempt, len(visible_text or ""), time.time() - text_start)
                     except Exception as e:
-                        LOG.debug("Visible text collection failed: %s", str(e)[:50])
+                        LOG.error("[Attempt %d] Visible text collection failed: %s", attempt, str(e)[:200])
                         visible_text = ""
 
-                # Get page content
+                # Get page content (HTML)
                 try:
-                    html = await asyncio.wait_for(
-                        page.content(),
-                        timeout=10.0
-                    )
+                    LOG.debug("[Attempt %d] Extracting page HTML...", attempt)
+                    html_start = time.time()
+                    html = await asyncio.wait_for(page.content(), timeout=10000)
+                    LOG.info("[Attempt %d] HTML extracted: %d chars in %.2fs", 
+                            attempt, len(html or ""), time.time() - html_start)
                 except asyncio.TimeoutError:
-                    LOG.warning("Content extraction timeout for %s", url)
+                    LOG.error("[Attempt %d] Content extraction timeout", attempt)
                     html = ""
 
-                # Basic sanity checks
-                if html and len(html) > 5000:
-                    blocked_kw = ['just a moment', 'verify you are human', 'cloudflare challenge', 
-                                 'attention required', 'checking your browser']
-                    if not any(k in html.lower() for k in blocked_kw):
-                        LOG.debug("Playwright succeeded for %s (size=%d bytes)", url, len(html))
-                        if return_visible_text:
-                            return html, visible_text or ""
-                        return html
+                elapsed = time.time() - start_total
+                LOG.info("[Attempt %d] SUCCESS in %.2fs: html_len=%d, visible_len=%d, captured_responses=%d",
+                        attempt, elapsed, len(html or ""), len(visible_text or ""), len(responses_captured))
                 
-                LOG.debug("Playwright: HTML too small or blocked (%d bytes)", len(html) if html else 0)
-        
+                # Log captured responses summary
+                if responses_captured:
+                    LOG.debug("Captured API responses:")
+                    for idx, (rurl, body) in enumerate(responses_captured[:3], 1):
+                        LOG.debug("  [%d] %s -> %d chars", idx, rurl[:70], len(body))
+
+                # Attach price_js_result to visible_text to help downstream extractors (marker)
+                if price_js_result:
+                    visible_text = (visible_text or "") + f"\n__PLAYWRIGHT_PRICE_JS__:{price_js_result}"
+                    LOG.debug("Appended PLAYWRIGHT_PRICE_JS marker: %s", price_js_result)
+
+                # If caller expects both html and visible_text, return tuple
+                if return_visible_text:
+                    return html, visible_text or ""
+
+                return html
+
         except asyncio.TimeoutError as e:
-            LOG.debug("Playwright attempt %d TIMEOUT for %s (total attempt took >50s)", attempt, url)
+            LOG.error("[Attempt %d] TIMEOUT ERROR: %s", attempt, str(e)[:200])
         except Exception as e:
-            LOG.debug("Playwright attempt %d exception for %s: %s", attempt, url, str(e)[:100])
-        
+            LOG.error("[Attempt %d] EXCEPTION: %s", attempt, str(e)[:400])
         finally:
-            # CRITICAL FIX: Proper cleanup with error handling
+            # Cleanup
+            LOG.debug("[Attempt %d] Cleaning up browser resources...", attempt)
             if page:
                 try:
                     await asyncio.wait_for(page.close(), timeout=2.0)
+                    LOG.debug("[Attempt %d] Page closed", attempt)
                 except Exception:
                     pass
             if context:
                 try:
                     await asyncio.wait_for(context.close(), timeout=2.0)
+                    LOG.debug("[Attempt %d] Context closed", attempt)
                 except Exception:
                     pass
             if browser:
                 try:
                     await asyncio.wait_for(browser.close(), timeout=2.0)
+                    LOG.debug("[Attempt %d] Browser closed", attempt)
                 except Exception:
                     pass
 
+        # backoff before next attempt
         if attempt < retries:
-            wait_time = random.uniform(2, 4)
-            LOG.debug("Playwright: waiting %.1fs before retry", wait_time)
+            wait_time = random.uniform(2.0, 4.0)
+            LOG.info("[Attempt %d] Retrying in %.2fs...", attempt, wait_time)
             await asyncio.sleep(wait_time)
 
     raise Exception(f"Playwright failed all {retries} attempts for {url}")
@@ -851,114 +1128,230 @@ def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain
 
 def _extract_konga_current_price(soup: BeautifulSoup, page_text: str) -> Optional[float]:
     """
-    FIX: Konga-specific extraction for 2026 with aggressive anti-rating/review logic.
-    Updated selectors, better visibility checks, fallback to visible text parsing.
+    Attempt many strategies to find a product price on Konga pages:
+      - direct selectors (existing)
+      - attribute searches (data-price, data-final-price, meta tags)
+      - JSON/script scanning for 'sellingPrice', 'price', 'finalPrice'
+      - visible-text heuristics
+    Extensive debug LOGs to understand which path succeeded.
     """
+    LOG.info("Starting Konga price extraction...")
+    LOG.debug("Page text length: %d chars", len(page_text or ""))
+    _log_dom_snapshot(soup, "konga_extraction_start")
     
-    # CRITICAL: Enhanced selectors based on latest Konga HTML (2026)
     konga_selectors = [
-        # Primary: Konga's main price display elements
-        "span[data-testid='current-price']", 
+        "span[data-testid='current-price']",
         "div[data-testid='price-current']",
         "span[data-testid='product-price']",
         "div[data-testid='selling-price']",
-        
-        # Secondary: CSS class-based (from inspection)
-        "span._3e_22_199e7",           # Main price container (class name varies)
-        "span.-b.-ubpt",                # Bold price element
-        "span.prc.-fs24",               # Large price display
-        "span[class*='price'][class*='-b']",  # Bold price variations
-        
-        # Tertiary: Attribute-based
-        "[data-price-type='final']",
-        "[data-price-type='selling']",
+        "span._3e_22_199e7",
+        "span.-b.-ubpt",
+        "span.prc.-fs24",
+        "[data-price]",
         "[data-final-price]",
-        
-        # Meta tags as last resort
+        "[data-price-amount]",
         "meta[property='og:price:amount']",
-        "meta[name='product:price:amount']",
         "meta[itemprop='price']",
+        "meta[name='product:price:amount']",
     ]
-    
+
     found_prices = []
-    
-    for selector in konga_selectors:
+    tried = set()
+
+    def try_parse(txt: str, source: str):
+        if not txt:
+            return None
+        p = _parse_price_string(txt)
+        _log_extraction_attempt(source, txt, p)
+        return p
+
+    # 1) Try direct selectors first
+    LOG.info("Phase 1: Trying direct CSS selectors (%d selectors)...", len(konga_selectors))
+    for sel in konga_selectors:
         try:
-            elements = soup.select(selector)
+            elements = soup.select(sel)
+            _log_selector_attempt(sel, len(elements), 
+                                elements[0].get_text(strip=True)[:50] if elements else "")
             
-            if not elements:
-                continue
-            
+            if elements:
+                tried.add(sel)
+                
             for el in elements:
-                # CRITICAL: Exclude rating/review/suggestion sections
-                parent = el.parent
-                if parent:
-                    parent_classes = ' '.join(parent.get('class', [])).lower()
-                else:
-                    parent_classes = ""
-                
-                # Check all ancestors for exclusion keywords
-                ancestor_classes = ""
-                ancestors = el.find_parents()
-                for a in ancestors[:5]:  # Check only first 5 ancestors for performance
-                    ancestor_classes += ' ' + ' '.join(a.get('class', [])).lower()
-                
-                full_class_check = parent_classes + ' ' + ancestor_classes
-                
-                exclusion_keywords = [
-                    'rating', 'stars', 'review', 'reviews', 'review-count', 'rating-count',
-                    'suggestion', 'recommendation', 'you-might-like', 'related-products',
-                    'product-suggestions', 'similar-products', 'carousel', 'slider',
-                    'sidebar', 'footer', 'breadcrumb', 'share', 'compare'
-                ]
-                
-                if any(x in full_class_check for x in exclusion_keywords):
-                    LOG.debug("Konga: Excluded selector %s (in %s)", selector, full_class_check[:50])
-                    continue
-                
-                # Get price value
+                text = ""
                 if el.name == "meta":
-                    price_val = el.get("content", "").strip()
+                    text = el.get("content", "") or ""
+                    LOG.debug("      Meta tag [property=%s]: content='%s'", 
+                             el.get('property', 'N/A'), text[:50])
                 else:
-                    price_val = el.get_text(" ", strip=True)
+                    text = el.get_text(" ", strip=True) or el.get("data-price") or el.get("data-final-price") or ""
+                    LOG.debug("      Element text: '%s' | data-price=%s | data-final-price=%s",
+                             text[:50], 
+                             el.get('data-price', 'N/A'),
+                             el.get('data-final-price', 'N/A'))
                 
-                if not price_val:
+                if not text:
                     continue
                 
-                # Parse price
-                p = _parse_price_string(price_val)
+                p = try_parse(text, f"selector:{sel}")
                 if p and 5000 <= p < 100_000_000:
-                    found_prices.append(p)
-                    LOG.debug("Konga: Found price ₦%.0f via selector %s", p, selector)
-        
+                    LOG.info("✓ SUCCESS: Found price ₦%.0f via selector '%s'", p, sel)
+                    return p
         except Exception as e:
-            LOG.debug("Konga selector %s exception: %s", selector, e)
+            LOG.error("Error with selector '%s': %s", sel, str(e)[:200])
             continue
     
-    # If found via direct selectors, return the most reliable one
-    if found_prices:
-        # Return the first valid price (highest confidence)
-        return found_prices[0]
+    LOG.warning("Phase 1 complete: No price found via direct selectors (tried %d selectors)", len(tried))
+
+    # 2) Attribute search anywhere in DOM
+    LOG.info("Phase 2: Searching for price attributes in DOM...")
+    price_attrs = ("data-price", "data-final-price", "data-price-amount", "data-selling-price")
+    for attr in price_attrs:
+        try:
+            elements = soup.find_all(attrs={attr: True})
+            LOG.debug("  Attribute [%s]: found %d elements", attr, len(elements))
+            
+            for idx, el in enumerate(elements[:5]):  # Log first 5
+                val = el.get(attr)
+                LOG.debug("    [%d] %s='%s'", idx, attr, val[:50] if val else 'N/A')
+            
+            for el in elements:
+                val = el.get(attr)
+                if not val:
+                    continue
+                p = try_parse(val, f"attr:{attr}")
+                if p and 5000 <= p < 100_000_000:
+                    LOG.info("✓ SUCCESS: Found price ₦%.0f via attribute '%s'", p, attr)
+                    return p
+        except Exception as e:
+            LOG.error("Error searching attribute '%s': %s", attr, str(e)[:200])
     
-    # Fallback: DOM gathering with Konga-specific exclusion
-    LOG.debug("Konga: No direct selector match, falling back to DOM gathering")
-    candidates = _gather_price_candidates_from_dom(soup, domain_hint="konga")
+    LOG.warning("Phase 2 complete: No price found via attribute search")
+
+    # 3) Search scripts for common JSON payloads
+    LOG.info("Phase 3: Searching script tags for price data...")
+    scripts = soup.find_all("script")
+    LOG.debug("Found %d script tags", len(scripts))
     
-    valid_candidates = []
-    for p in candidates:
-        # Filter for realistic product prices only
-        if 5000 <= p <= 10_000_000:
-            # Exclude rating scores (1.0-5.0 stars) and review counts
-            if not (1.0 <= p <= 5.0 or (p < 1000 and p.is_integer())):
-                valid_candidates.append(p)
+    script_text_acc = ""
+    for idx, s in enumerate(scripts):
+        try:
+            if s.string:
+                script_text_acc += s.string + "\n"
+        except Exception:
+            continue
     
-    if valid_candidates:
-        # Current price is typically the highest displayed valid price
-        result = max(valid_candidates)
-        LOG.debug("Konga fallback: Using DOM candidate ₦%.0f", result)
-        return result
+    LOG.debug("Total script text length: %d chars", len(script_text_acc))
+
+    json_tokens = []
+    # try multiple regexes to extract JSON-like objects containing price info
+    regex_patterns = [
+        r'("sellingPrice"\s*:\s*[0-9]{3,})', 
+        r'("price"\s*:\s*["\']?[0-9,\.kK]+["\']?)', 
+        r'("finalPrice"\s*:\s*[0-9]{3,})'
+    ]
     
-    LOG.debug("Konga: No valid price found after all extraction methods")
+    for regex in regex_patterns:
+        matches = list(re.finditer(regex, script_text_acc, flags=re.IGNORECASE))
+        LOG.debug("  Regex '%s': %d matches", regex[:40], len(matches))
+        for m in matches[:3]:  # Log first 3
+            LOG.debug("    Match: %s", m.group(0)[:60])
+            json_tokens.append(m.group(0))
+
+    # Also try to find JS object blocks
+    LOG.debug("  Looking for __INITIAL_STATE__ or similar...")
+    match_block = re.search(r'(window\.__INITIAL_STATE__\s*=\s*({.*?})\s*;)', script_text_acc, flags=re.S)
+    if match_block:
+        LOG.debug("  Found __INITIAL_STATE__ block (%d chars)", len(match_block.group(2)))
+        block = match_block.group(2)
+        try:
+            jsobj = json.loads(block)
+            # look for typical keys
+            for key in ('sellingPrice', 'price', 'finalPrice', 'amount'):
+                def _deep_search(o, path=""):
+                    if isinstance(o, dict):
+                        for k, v in o.items():
+                            current_path = f"{path}.{k}" if path else k
+                            if k and k.lower() == key.lower() and isinstance(v, (int, float, str)):
+                                json_tokens.append(f'"{key}":{v}')
+                                LOG.debug("    Found in JSON at %s: %s=%s", current_path, key, str(v)[:30])
+                            elif isinstance(v, (dict, list)):
+                                _deep_search(v, current_path)
+                    elif isinstance(o, list):
+                        for i, item in enumerate(o):
+                            _deep_search(item, f"{path}[{i}]")
+                _deep_search(jsobj)
+        except Exception as e:
+            LOG.debug("  Failed to parse __INITIAL_STATE__ as JSON: %s", str(e)[:100])
+
+    # Parse tokens found in scripts
+    LOG.info("Phase 3b: Parsing %d JSON tokens found in scripts...", len(json_tokens))
+    for tok in json_tokens:
+        # extract number
+        m = re.search(r'([0-9]{3,}[0-9,\.]*)', tok)
+        if m:
+            text = m.group(1)
+            p = try_parse(text, "script_token")
+            if p and 5000 <= p < 100_000_000:
+                LOG.info("✓ SUCCESS: Found price ₦%.0f in script token", p)
+                return p
+    
+    LOG.warning("Phase 3 complete: No price found in scripts")
+
+    # 4) visible-text heuristic (page_text passed in)
+    LOG.info("Phase 4: Searching visible text and Playwright markers...")
+    try:
+        if page_text:
+            # Check price marker inserted by Playwright price_js
+            LOG.debug("  Checking for __PLAYWRIGHT_PRICE_JS__ marker...")
+            m = re.search(r'__PLAYWRIGHT_PRICE_JS__\:([0-9,\.kK]+)', page_text)
+            if m:
+                candidate = m.group(1)
+                LOG.debug("  Found marker with value: %s", candidate)
+                p = try_parse(candidate, "playwright_marker")
+                if p and 5000 <= p < 100_000_000:
+                    LOG.info("✓ SUCCESS: Found price ₦%.0f via Playwright marker", p)
+                    return p
+            else:
+                LOG.debug("  No Playwright marker found")
+
+            # generic currency search (₦ / NGN / N)
+            LOG.debug("  Searching for currency patterns (₦, NGN, N)...")
+            visible_matches = re.findall(r'(?:₦|NGN|N)\s*[:\-]?\s*([0-9][0-9,\.]*\s*[kK]?)', page_text, flags=re.I)
+            LOG.debug("  Found %d currency matches in visible text", len(visible_matches))
+            
+            for idx, raw in enumerate(visible_matches[:5]):
+                raw_clean = raw.replace(" ", "")
+                LOG.debug("    [%d] Raw match: '%s' -> cleaned: '%s'", idx, raw, raw_clean)
+                p = try_parse(raw_clean, "visible_text_regex")
+                if p and 5000 <= p < 100_000_000:
+                    LOG.info("✓ SUCCESS: Found price ₦%.0f via visible text regex", p)
+                    return p
+    except Exception as e:
+        LOG.error("Error in visible text scanning: %s", str(e)[:200])
+    
+    LOG.warning("Phase 4 complete: No price found in visible text")
+
+    # 5) DOM candidate gathering fallback (reuse existing collector)
+    LOG.info("Phase 5: Fallback - gathering all numeric candidates from DOM...")
+    try:
+        candidates = _gather_price_candidates_from_dom(soup, domain_hint="konga")
+        LOG.debug("  Found %d numeric candidates", len(candidates))
+        if candidates:
+            # Log top candidates
+            sorted_candidates = sorted(candidates, reverse=True)[:5]
+            LOG.debug("  Top 5 candidates: %s", [f"₦{c:,.0f}" for c in sorted_candidates])
+            
+            # Use heuristics: choose the most realistic (max)
+            cand = max(candidates)
+            if 5000 <= cand <= 10_000_000:
+                LOG.info("✓ SUCCESS: Fallback DOM candidate -> ₦%.0f", cand)
+                return cand
+            else:
+                LOG.warning("  Best candidate ₦%.0f outside realistic range (5k-10M)", cand)
+    except Exception as e:
+        LOG.error("Error in fallback candidate gathering: %s", str(e)[:200])
+
+    LOG.error("✗ FAILED: No valid price found after exhaustive search. Tried selectors: %s", list(tried)[:10])
     return None
 
 def extract_prices_from_visible_text(
@@ -972,82 +1365,156 @@ def extract_prices_from_visible_text(
     Handles ₦ / NGN / N prefixes, commas, decimals, and k/K suffix.
     Uses heuristics to decide which is current vs previous.
     """
+    LOG.info("Starting visible-text price extraction...")
+    LOG.debug("Parameters: min=₦%.0f, max=₦%.0f, currencies=%s", min_price, max_price, currency_prefixes)
+    
     if not page_text or not isinstance(page_text, str):
+        LOG.warning("Invalid input: page_text is %s", "None" if page_text is None else f"type {type(page_text)}")
         return None, None
 
     # collapse whitespace
     txt = re.sub(r"\s+", " ", page_text)
+    LOG.debug("Text preprocessed: %d chars -> %d chars (whitespace collapsed)", len(page_text), len(txt))
+    
+    # Show sample of text being searched
+    sample = txt[:200].replace('\n', ' ')
+    LOG.debug("Text sample being searched: '%s...'", sample)
 
     # capture patterns like "₦ 12,000", "NGN12k", "N 12.5k"
-    # We capture the numeric part (may include trailing k)
     pattern = rf"(?i)(?:{currency_prefixes})\s*[:\-]?\s*([0-9][0-9,\.]*\s*[kK]?|\d+(?:\.\d+)?\s*[kK])"
+    LOG.debug("Regex pattern: %s", pattern)
+    
     raw_matches = re.findall(pattern, txt)
+    LOG.info("Phase 1: Pattern matching found %d raw matches", len(raw_matches))
+    
+    # Log each raw match found
+    for idx, match in enumerate(raw_matches[:10]):  # Log first 10
+        LOG.debug("  Raw match [%d]: '%s'", idx, match)
+    if len(raw_matches) > 10:
+        LOG.debug("  ... and %d more matches", len(raw_matches) - 10)
 
     def normalize_num(s: str) -> Optional[float]:
         if not s:
+            LOG.debug("    Normalization skipped: empty string")
             return None
+        original = s
         s = s.strip().replace(" ", "")
         mul = 1.0
         if s[-1] in ("k", "K"):
             mul = 1_000.0
             s = s[:-1]
-        s = s.replace(",", "")
+            LOG.debug("    '%s' -> detected 'k' suffix, multiplier=1000", original)
+        s_clean = s.replace(",", "")
         try:
-            val = float(s) * mul
+            val = float(s_clean) * mul
+            LOG.debug("    '%s' -> cleaned='%s' -> parsed=%.0f", original, s_clean, val)
             return val
-        except Exception:
+        except Exception as e:
+            LOG.debug("    '%s' -> FAILED to parse: %s", original, str(e))
             return None
 
     candidates: List[float] = []
-    for raw in raw_matches:
+    LOG.info("Phase 2: Normalizing %d raw matches...", len(raw_matches))
+    
+    for idx, raw in enumerate(raw_matches):
+        LOG.debug("  Processing match [%d]: '%s'", idx, raw)
         val = normalize_num(raw)
         if val is None:
+            LOG.debug("    [✗ REJECTED] Normalization failed for '%s'", raw)
             continue
+        
         # enforce sane bounds
-        if val < min_price or val > max_price:
+        if val < min_price:
+            LOG.debug("    [✗ FILTERED] ₦%.0f below minimum (₦%.0f)", val, min_price)
             continue
+        if val > max_price:
+            LOG.debug("    [✗ FILTERED] ₦%.0f above maximum (₦%.0f)", val, max_price)
+            continue
+        
+        LOG.debug("    [✓ ACCEPTED] ₦%.0f within bounds [%.0f - %.0f]", val, min_price, max_price)
         candidates.append(val)
 
+    LOG.info("Phase 2 complete: %d candidates passed normalization and bounds", len(candidates))
+    LOG.debug("Accepted candidates: %s", [f"₦{c:,.0f}" for c in candidates])
+
     # deduplicate while preserving order
+    LOG.info("Phase 3: Deduplicating candidates...")
     seen = set()
     valid_prices = []
+    duplicates_found = 0
+    
     for p in candidates:
-        if p not in seen:
+        if p in seen:
+            duplicates_found += 1
+            LOG.debug("  [DEDUP] Removing duplicate: ₦%.0f", p)
+        else:
             seen.add(p)
             valid_prices.append(p)
+            LOG.debug("  [KEEP] ₦%.0f", p)
+    
+    LOG.info("Phase 3 complete: %d unique prices (removed %d duplicates)", len(valid_prices), duplicates_found)
+    LOG.debug("Unique prices in order: %s", [f"₦{p:,.0f}" for p in valid_prices])
 
     if not valid_prices:
-        LOG.debug("No valid visible prices extracted from visible-text")
+        LOG.warning("No valid visible prices found after filtering")
         return None, None
 
     first = valid_prices[0]
     second = valid_prices[1] if len(valid_prices) > 1 else None
+    
+    LOG.info("Phase 4: Applying heuristics to determine current vs previous...")
+    LOG.debug("Primary candidate: ₦%.0f", first)
+    LOG.debug("Secondary candidate: %s", f"₦{second:.0f}" if second else "None")
 
     # Heuristics:
     # - If first > second by a meaningful margin -> previous = first, current = second
     # - If nearly identical -> single price
     # - Else prefer lower as current if substantially lower (>=5%)
     if second is None:
-        return first, None
-
-    if first > second and (first - second) > 500:
-        current, previous = second, first
+        current, previous = first, None
+        LOG.info("  [SINGLE PRICE] Only one price found: ₦%.0f", current)
     else:
-        # nearly equal -> treat as single
-        if abs(first - second) <= max(1.0, 0.01 * first):
-            current, previous = first, None
+        # Calculate differences for logging
+        diff = abs(first - second)
+        pct_diff = (diff / max(first, second)) * 100 if max(first, second) > 0 else 0
+        LOG.debug("  Price comparison: ₦%.0f vs ₦%.0f (diff=₦%.0f, %.1f%%)", first, second, diff, pct_diff)
+        
+        if first > second and (first - second) > 500:
+            current, previous = second, first
+            LOG.info("  [STRIKETHROUGH DETECTED] First > Second by >₦500 -> Current=₦%.0f, Previous=₦%.0f", 
+                    current, previous)
         else:
-            if second < first and (first - second) / first >= 0.05:
-                current, previous = second, first
+            # nearly equal -> treat as single
+            if abs(first - second) <= max(1.0, 0.01 * first):
+                current, previous = first, None
+                LOG.info("  [NEARLY EQUAL] Difference < 1%% -> Single price: ₦%.0f", current)
             else:
-                current, previous = first, second
+                if second < first and (first - second) / first >= 0.05:
+                    current, previous = second, first
+                    LOG.info("  [DISCOUNT DETECTED] Second is 5%%+ lower -> Current=₦%.0f, Previous=₦%.0f", 
+                            current, previous)
+                else:
+                    current, previous = first, second
+                    LOG.info("  [DEFAULT ORDER] First treated as current -> Current=₦%.0f, Previous=₦%.0f", 
+                            current, previous)
 
     LOG.info(
-        "Visible-text extractor → current: ₦%.0f | previous: %s",
-        current,
-        f"₦{previous:.0f}" if previous is not None else "None"
+        "Visible-text extraction RESULT → Current: %s | Previous: %s",
+        f"₦{current:,.0f}" if current else "None",
+        f"₦{previous:,.0f}" if previous else "None"
     )
+    
+    # Debug summary of decision path
+    LOG.debug("Extraction summary:")
+    LOG.debug("  - Raw matches found: %d", len(raw_matches))
+    LOG.debug("  - After normalization/bounds: %d", len(candidates))
+    LOG.debug("  - Unique prices: %d", len(valid_prices))
+    LOG.debug("  - Final decision: current=%s, previous=%s", 
+             f"₦{current:.0f}" if current else "None",
+             f"₦{previous:.0f}" if previous else "None")
+    
     return current, previous
+
 # ═══════════════════════════════════════════════════════════════════════════
 # E-COMMERCE SCRAPERS (ENHANCED FOR KONGA WITH BETTER SELECTORS)
 # ═══════════════════════════════════════════════════════════════════════════
