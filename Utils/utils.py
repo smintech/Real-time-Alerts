@@ -181,9 +181,9 @@ async def fetch_with_playwright_aggressive(url: str, retries: int = 3) -> str:
                     window.chrome = { runtime: {} };
                     Object.defineProperty(navigator, 'permissions', {get: () => ({ query: () => Promise.resolve({state: 'granted'}) })});
                 """)
-                
-                await page.goto(url, wait_until='networkidle', timeout=90000)
-                
+
+                await page.goto(url, wait_until='domcontentloaded', timeout=90000)
+                 await page.wait_for_load_state("networkidle", timeout=90000)
                 await page.wait_for_timeout(random.randint(3000, 7000))
                 
                 # Full scroll to trigger lazy-loaded prices
@@ -201,7 +201,7 @@ async def fetch_with_playwright_aggressive(url: str, retries: int = 3) -> str:
                 
                 html = await page.content()
                 
-                if len(html) > 5000 and 'cloudflare' not in html.lower() and 'just a moment' not in html.lower():
+                if len(html) > 8000 and 'cloudflare' not in html.lower() and 'just a moment' not in html.lower():
                     LOG.debug("Playwright succeeded for %s", url)
                     return html
         except Exception as e:
@@ -706,6 +706,59 @@ def _extract_konga_current_price(soup: BeautifulSoup, page_text: str) -> Optiona
     
     LOG.debug("Konga: No valid price found after all 2026 filters")
     return None
+
+def extract_prices_from_visible_text(
+    page_text: str,
+    currency_prefixes: str = r"₦|N|NGN",
+    min_price: float = 10000,
+    max_price: float = 20000000
+) -> Tuple[Optional[float], Optional[float]]:
+    """
+    Pure visible-text fallback:
+    - Scans the flat rendered page text in document order
+    - Finds prices starting with ₦/N/NGN followed by numbers
+    - First valid price → current
+    - If second price exists and is lower → second = current, first = previous (common discount pattern)
+    - Otherwise second = previous if different
+    """
+    pattern = rf"({currency_prefixes})\s*([\d,]+(?:\.\d+)?)"
+    matches = list(re.finditer(pattern, page_text, re.IGNORECASE))
+
+    valid_prices = []
+    for m in matches:
+        num_part = m.group(2).replace(",", "").strip()
+        try:
+            value = float(num_part)
+            if min_price <= value <= max_price:
+                valid_prices.append(value)
+        except ValueError:
+            continue
+
+    if not valid_prices:
+        LOG.debug("No valid prices found in rendered page text")
+        return None, None
+
+    first = valid_prices[0]
+    second = valid_prices[1] if len(valid_prices) >= 2 else None
+
+    if second is None:
+        return first, None
+
+    # Common case: old price appears first (higher), then discounted price
+    if first > second and (first - second) > 500:  # meaningful discount
+        current = second
+        previous = first
+    else:
+        current = first
+        previous = second if abs(second - first) > 500 else None  # avoid same price twice
+
+    LOG.info(
+        "Visible-text fallback → current: ₦%.0f | previous: %s",
+        current,
+        f"₦{previous:.0f}" if previous is not None else "None"
+    )
+
+    return current, previous
 # ═══════════════════════════════════════════════════════════════════════════
 # E-COMMERCE SCRAPERS (ENHANCED FOR KONGA WITH BETTER SELECTORS)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -926,7 +979,27 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
                     product["current_price"] = p
             except Exception as e:
                 LOG.debug("Konga price extractor exception: %s", e)
-                        
+        
+        if "konga" in domain and product["current_price"] is None:
+            try:
+                if len(page_text) > 1500:  # minimal sanity check
+                    curr, prev = extract_prices_from_visible_text(page_text)
+                    if curr is not None:
+                        product["current_price"] = curr
+                        # Only set previous if it makes sense (higher than current)
+                        if prev is not None and prev > curr:
+                            product["previous_price"] = prev
+                        LOG.info(
+                            "Konga visible-text fallback → current ₦%.0f (prev %s)",
+                            curr,
+                            f"₦{prev:.0f}" if prev else "None"
+                        )
+                    else:
+                        LOG.debug("Visible-text fallback found no valid prices on Konga")
+                else:
+                    LOG.warning("Page text too short for Konga fallback (%d chars)", len(page_text))
+            except Exception as ex:
+                LOG.exception("Konga visible-text fallback error: %s", ex)
         
         if product["current_price"] is None:
             page_text = soup.get_text(" ", strip=True)
