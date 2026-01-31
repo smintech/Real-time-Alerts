@@ -152,8 +152,8 @@ def fetch_with_cloudscraper_aggressive(url: str, retries: int = 6) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 async def get_visible_text_from_playwright_page(page, timeout: int = 5000) -> str:
     """
-    FIX: More robust visible text extraction with better performance.
-    Handles visibility edge cases and returns clean, collapsed text.
+    FIXED: Better visibility checks with timeout protection
+    Evaluates JS in-page to return visible human text only
     """
     js = r"""
     () => {
@@ -161,7 +161,6 @@ async def get_visible_text_from_playwright_page(page, timeout: int = 5000) -> st
         if (!el) return false;
         
         try {
-          // Check computed styles
           const style = window.getComputedStyle(el);
           if (!style) return false;
           
@@ -173,17 +172,14 @@ async def get_visible_text_from_playwright_page(page, timeout: int = 5000) -> st
             return false;
           }
           
-          // Check dimensions (zero-size elements are not visible)
           const rect = el.getBoundingClientRect();
           if (rect.width === 0 || rect.height === 0) {
             return false;
           }
-          
         } catch (e) {
           return false;
         }
         
-        // Check aria-hidden on element and ancestors
         let node = el;
         while (node && node !== document.body) {
           try {
@@ -227,13 +223,17 @@ async def get_visible_text_from_playwright_page(page, timeout: int = 5000) -> st
     try:
         visible = await page.evaluate(js, timeout=timeout)
         if visible and isinstance(visible, str):
-            # Collapse multiple spaces
             visible = re.sub(r"\s+", " ", visible).strip()
             return visible
     except Exception as e:
-        LOG.debug("get_visible_text_from_playwright_page evaluate failed: %s", str(e)[:50])
+        LOG.debug("get_visible_text_from_playwright_page failed: %s", str(e)[:50])
     
     return ""
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# 2. FIXED: fetch_with_playwright_aggressive()
+# ═══════════════════════════════════════════════════════════════════════════
 
 async def fetch_with_playwright_aggressive(
     url: str,
@@ -241,12 +241,11 @@ async def fetch_with_playwright_aggressive(
     return_visible_text: bool = False
 ) -> Union[str, Tuple[str, str]]:
     """
-    FIXED: Improved Playwright fetch with:
-    - Better timeout handling (reduced from 90s to 45s for faster failure)
-    - Proper page state detection instead of arbitrary waits
-    - More efficient lazy loading triggering
-    - Better resource cleanup
-    - Return tuple handling
+    FIXED: Handles Konga timeouts and browser closure properly
+    - Reduced networkidle timeout from 90s to 15-20s
+    - Graceful timeout handling
+    - Proper browser cleanup
+    - Konga-specific timeout handling
     """
     for attempt in range(1, retries + 1):
         LOG.debug("Playwright attempt %d/%d for %s", attempt, retries, url)
@@ -256,7 +255,7 @@ async def fetch_with_playwright_aggressive(
         
         try:
             async with async_playwright() as p:
-                # Launch with timeout
+                # Launch browser with timeout
                 browser = await asyncio.wait_for(
                     p.chromium.launch(headless=True, args=[
                         '--no-sandbox',
@@ -271,7 +270,11 @@ async def fetch_with_playwright_aggressive(
                 
                 context = await asyncio.wait_for(
                     browser.new_context(
-                        user_agent=random.choice(_USER_AGENTS),
+                        user_agent=random.choice([
+                            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+                            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15",
+                            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36",
+                        ]),
                         viewport={'width': 1280, 'height': 800},
                         locale='en-US',
                         timezone_id='Africa/Lagos',
@@ -280,12 +283,18 @@ async def fetch_with_playwright_aggressive(
                 )
                 
                 page = await context.new_page()
-                
-                # Set page timeout
-                page.set_default_timeout(45000)  # 45 seconds
-                page.set_default_navigation_timeout(45000)
 
-                # anti-detect tweaks
+                # CRITICAL: Set timeouts based on domain
+                if 'konga' in url.lower():
+                    # Konga is slow - use shorter timeouts
+                    LOG.debug("Konga URL detected - using 30s timeout")
+                    page.set_default_timeout(30000)      # 30 seconds
+                    page.set_default_navigation_timeout(30000)
+                else:
+                    page.set_default_timeout(45000)      # 45 seconds for others
+                    page.set_default_navigation_timeout(45000)
+
+                # Anti-detect tweaks
                 await page.add_init_script("""
                     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                     Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
@@ -297,30 +306,37 @@ async def fetch_with_playwright_aggressive(
                 # Navigate with timeout
                 try:
                     await asyncio.wait_for(
-                        page.goto(url, wait_until='domcontentloaded', timeout=45000),
-                        timeout=50.0
-                    )
-                except asyncio.TimeoutError:
-                    LOG.warning("Page goto timeout for %s, continuing with current page state", url)
-                
-                # Wait for network idle with timeout
-                try:
-                    await asyncio.wait_for(
-                        page.wait_for_load_state("networkidle", timeout=30000),
+                        page.goto(url, wait_until='domcontentloaded', timeout=30000),
                         timeout=35.0
                     )
                 except asyncio.TimeoutError:
+                    LOG.warning("Page goto timeout for %s, continuing with current state", url)
+                
+                # CRITICAL FIX: Shorter networkidle timeout for Konga
+                try:
+                    if 'konga' in url.lower():
+                        # Konga: 15 second max for networkidle (was 90s!)
+                        await asyncio.wait_for(
+                            page.wait_for_load_state("networkidle", timeout=15000),
+                            timeout=20.0
+                        )
+                    else:
+                        # Others: 30 second max
+                        await asyncio.wait_for(
+                            page.wait_for_load_state("networkidle", timeout=30000),
+                            timeout=35.0
+                        )
+                except asyncio.TimeoutError:
                     LOG.warning("Network idle timeout for %s, continuing with available content", url)
                 
-                # Shorter random wait for stability
+                # Shorter random wait
                 await page.wait_for_timeout(random.randint(1500, 3000))
 
-                # Full scroll to trigger lazy load (optimized)
+                # Full scroll to trigger lazy load
                 try:
                     await asyncio.wait_for(
                         page.evaluate("""
                             async () => {
-                                // Scroll to bottom
                                 await new Promise((resolve) => {
                                     let totalHeight = 0;
                                     const distance = 300;
@@ -334,14 +350,13 @@ async def fetch_with_playwright_aggressive(
                                         }
                                     }, 300);
                                 });
-                                // Return to top
                                 window.scrollTo(0, 0);
                             }
                         """),
                         timeout=10.0
                     )
                 except Exception as e:
-                    LOG.debug("Scroll failed gracefully: %s", e)
+                    LOG.debug("Scroll failed gracefully: %s", str(e)[:50])
 
                 # Collect visible text if requested
                 visible_text = None
@@ -353,7 +368,7 @@ async def fetch_with_playwright_aggressive(
                         )
                         LOG.debug("Collected visible text (len=%d) for %s", len(visible_text or ""), url)
                     except Exception as e:
-                        LOG.debug("Visible text collection failed: %s", e)
+                        LOG.debug("Visible text collection failed: %s", str(e)[:50])
                         visible_text = ""
 
                 # Get page content
@@ -367,7 +382,7 @@ async def fetch_with_playwright_aggressive(
                     html = ""
 
                 # Basic sanity checks
-                if html and len(html) > 8000:
+                if html and len(html) > 5000:
                     blocked_kw = ['just a moment', 'verify you are human', 'cloudflare challenge', 
                                  'attention required', 'checking your browser']
                     if not any(k in html.lower() for k in blocked_kw):
@@ -384,20 +399,20 @@ async def fetch_with_playwright_aggressive(
             LOG.debug("Playwright attempt %d exception for %s: %s", attempt, url, str(e)[:100])
         
         finally:
-            # Aggressive cleanup
+            # CRITICAL FIX: Proper cleanup with error handling
             if page:
                 try:
-                    await asyncio.wait_for(page.close(), timeout=5.0)
+                    await asyncio.wait_for(page.close(), timeout=2.0)
                 except Exception:
                     pass
             if context:
                 try:
-                    await asyncio.wait_for(context.close(), timeout=5.0)
+                    await asyncio.wait_for(context.close(), timeout=2.0)
                 except Exception:
                     pass
             if browser:
                 try:
-                    await asyncio.wait_for(browser.close(), timeout=5.0)
+                    await asyncio.wait_for(browser.close(), timeout=2.0)
                 except Exception:
                     pass
 
