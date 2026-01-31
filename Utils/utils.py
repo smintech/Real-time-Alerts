@@ -70,7 +70,7 @@ if not _SCRAPER_PROXIES:
 # ═══════════════════════════════════════════════════════════════════════════
 
 COMMON_NEWS_PATHS = [
-    "/news", "/news.aspx", "/news-events", "/news-and-events",
+    "/news", "/news-events", "/news-and-events",
     "/News", "/bulletin", "/bulletins", "/Bulletin", "/news-events/",
     "/category/news", "/category/news/", "/category/press-release",
     "/topics/education/", "/category/education/", "/tags/education/",
