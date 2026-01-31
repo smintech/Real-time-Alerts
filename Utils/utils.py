@@ -444,23 +444,44 @@ def split_concatenated_price(text: str, min_price: float = 50000) -> Tuple[Optio
 
 def _gather_price_candidates_from_dom(soup: BeautifulSoup, domain_hint: str = "") -> List[float]:
     """
-    Enhanced DOM price gathering with Konga-specific concatenation handling.
+    Enhanced DOM price gathering with pre-cleaning and post-filtering.
     """
+    
+    # PRE-EXTRACTION: Remove noise elements
+    exclusion_selectors = [
+        'script', 'style', 'nav', 'header', 'footer',  'aside', 'iframe', 'noscript',
+        '.rating', '.stars', '.review', '.reviews', '.review-count', '.rating-count',
+        '.suggested-products', '.recommendations', '.you-might-like', 
+        '.related-products', '.product-suggestions', '.similar-products',
+        '[class*="rating"]', '[class*="review"]', '[class*="suggestion"]', 
+        '[class*="recommendation"]', '[class*="related"]', '[class*="similar"]',
+        '[data-testid*="rating"]', '[data-testid*="review"]', '[data-testid*="suggestion"]'
+    ]
+    
+    for selector in exclusion_selectors:
+        for elem in soup.select(selector):
+            try:
+                elem.decompose()
+            except Exception:
+                pass
+
     domain = domain_hint or ""
     if not domain:
         domain_meta = soup.find("meta", property="og:site_name") or soup.find("meta", attrs={"name": "application-name"})
         domain = domain_meta["content"].lower() if domain_meta and domain_meta.get("content") else ""
-    
+
+    # Price selectors (updated for 2026)
     selectors = [
         "span.prc", "span.price", "div.price", "div.prc", ".product-price",
         ".price", ".prc", "span[class*='price']", "div[class*='price']",
         "span[class*='prc']", "span[class*='old-price']", ".price-was",
-        "[data-testid*='price']", "._3e_22_199e7", "._44738_3988u"  # Konga classes
+        "[data-testid*='price']", "._3e_22_199e7", "._44738_3988u",
+        "[data-price]", "[data-price-amount]"
     ]
     
     found: List[float] = []
     seen_texts = set()
-    
+
     # Phase 1: Direct selectors
     for sel in selectors:
         for el in soup.select(sel):
@@ -469,23 +490,21 @@ def _gather_price_candidates_from_dom(soup: BeautifulSoup, domain_hint: str = ""
                 continue
             seen_texts.add(txt)
             
-            # Try parsing
             p = _parse_price_string(txt)
             if p and 1000 <= p < 100_000_000:
                 found.append(p)
             elif p and p >= 100_000_000:
-                # Try splitting concatenated
                 split = _split_concatenated_numeric_token(str(int(p)))
                 if split:
                     found.extend([sp for sp in split if sp >= 1000])
             
-            # Also check for concatenated tokens in text
+            # Check for concatenated tokens
             for token in re.findall(r"[\d.,]{6,}", txt):
                 split = _split_concatenated_numeric_token(token.replace(',', ''))
                 if split:
                     found.extend([sp for sp in split if sp >= 1000])
-    
-    # Phase 2: Container-based search (for prices in same container)
+
+    # Phase 2: Container-based search
     for container in soup.select("div, section, li"):
         price_children = []
         for child in container.find_all(True, recursive=False):
@@ -503,14 +522,36 @@ def _gather_price_candidates_from_dom(soup: BeautifulSoup, domain_hint: str = ""
         
         if len(price_children) >= 1:
             found.extend(price_children)
-    
-    # Remove duplicates and sort
+
+    # Remove duplicates
     unique_found = []
     seen_vals = set()
     for p in found:
         if p not in seen_vals:
             seen_vals.add(p)
             unique_found.append(p)
+
+    # POST-EXTRACTION FILTERING
+    def is_valid_price(p: float) -> bool:
+        # Exclude ratings (1.0-5.0 in 0.5 increments)
+        if 1.0 <= p <= 5.0 and p % 0.5 == 0:
+            return False
+        # Exclude review counts, quantities, shipping costs
+        if p < 1000:
+            return False
+        # Exclude extreme outliers
+        if p > 100_000_000:
+            return False
+        return True
+    
+    unique_found = [p for p in unique_found if is_valid_price(p)]
+    
+    # Konga-specific logic: return only the highest (current) price
+    if domain_hint == "konga" and len(unique_found) >= 2:
+        unique_found.sort(reverse=True)
+        # If prices are close (within 15%), it's likely current vs old price
+        if abs(unique_found[0] - unique_found[1]) / unique_found[0] < 0.15:
+            return [unique_found[0]]
     
     return unique_found
 
@@ -646,71 +687,62 @@ def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain
 
 def _extract_konga_current_price(soup: BeautifulSoup, page_text: str) -> Optional[float]:
     """
-    FIXED Konga price extraction with concatenation handling.
+    Konga-specific extraction for 2026 with aggressive anti-rating/review logic.
     """
-    # 1) Meta/JSON-LD first (unaffected by concatenation)
-    for meta_prop in ("og:price:amount", "product:price:amount", "price:amount"):
-        m = soup.find("meta", property=meta_prop) or soup.find("meta", attrs={"name": meta_prop})
-        if m and m.get("content"):
-            p = _parse_price_string(m["content"])
-            if p and 10000 <= p < 100_000_000:
-                return p
     
-    # 2) Itemprop
-    ip = soup.find(attrs={"itemprop": "price"})
-    if ip:
-        if ip.get("content"):
-            p = _parse_price_string(ip.get("content"))
-            if p and 10000 <= p < 100_000_000:
-                return p
-        text = ip.get_text(" ", strip=True)
-        p = _parse_price_string(text)
-        if p and 10000 <= p < 100_000_000:
-            return p
+    # Primary selectors based on Konga's 2026 HTML structure
+    konga_selectors = [
+        "span[data-testid='current-price']", 
+        "div[data-testid='price-current']",
+        "span[data-testid='product-price']",
+        "div._3e_22_199e7",  # Main price container
+        "span.-b.-ubpt",     # Bold price element
+        "span.prc.-fs24",    # Large price display
+        "[data-price-type='final']",
+        "meta[property='og:price:amount']",
+        "meta[name='product:price:amount']"
+    ]
     
-    # 3) Data attributes
-    attr_names = ["data-price", "data-offer-price", "data-offerprice", "data-amount"]
-    for a in attr_names:
-        el = soup.find(attrs={a: True})
-        if el:
-            val = el.get(a) or el.get("content")
-            p = _parse_price_string(str(val))
-            if p and 10000 <= p < 100_000_000:
-                return p
-    
-    # 4) DOM gathering with domain hint
-    candidates = _gather_price_candidates_from_dom(soup, domain_hint="konga")
-    
-    if not candidates:
-        return None
-    
-    # Filter to realistic Konga product range (phones typically 100k-2M)
-    valid_candidates = [p for p in candidates if 10000 <= p <= 10_000_000]
-    
-    if not valid_candidates:
-        # If all candidates are huge, try splitting them all
-        all_split = []
-        for p in candidates:
-            if p >= 10_000_000:
-                split = _split_concatenated_numeric_token(str(int(p)))
-                if split:
-                    all_split.extend([sp for sp in split if 10000 <= sp <= 10_000_000])
-        valid_candidates = all_split
-    
-    if not valid_candidates:
-        LOG.debug("Konga: No valid price candidates found")
-        return None
-    
-    # Konga current price is usually the HIGHER one (previous price is struck through/smaller)
-    # But if we have 2 candidates close to each other, take the max as current
-    if len(valid_candidates) >= 2:
-        valid_candidates.sort(reverse=True)
-        # If top two are very close (within 10%), likely current vs old
-        if abs(valid_candidates[0] - valid_candidates[1]) / valid_candidates[0] < 0.1:
-            return valid_candidates[0]
-    
-    return max(valid_candidates) if valid_candidates else None
+    for selector in konga_selectors:
+        el = soup.select_one(selector)
+        if not el:
+            continue
+            
+        # CRITICAL: Exclude rating/review/suggestion sections
+        parent_classes = ' '.join(el.parent.get('class', [])).lower() if el.parent else ""
+        ancestors = el.find_parents()
+        ancestor_classes = ' '.join([' '.join(a.get('class', [])) for a in ancestors]).lower()
+        
+        if any(x in parent_classes + ' ' + ancestor_classes for x in [
+            'rating', 'stars', 'review', 'reviews', 'suggestion', 'recommendation', 
+            'you-might-like', 'related-products', 'product-suggestions', 'similar-products'
+        ]):
+            continue
 
+        # Get price value
+        price_val = el.get("content") if el.name == "meta" else el.get_text(" ", strip=True)
+        p = _parse_price_string(price_val)
+        if p and 10000 <= p < 100_000_000:
+            LOG.debug("Konga price found via %s: ₦%.0f", selector, p)
+            return p
+
+    # Fallback DOM gathering with Konga-specific exclusion
+    candidates = _gather_price_candidates_from_dom(soup, domain_hint="konga")
+    valid_candidates = []
+    
+    for p in candidates:
+        # Filter for realistic product prices only
+        if 10000 <= p <= 10_000_000:
+            # Exclude rating scores (1.0-5.0) and review counts
+            if not (1.0 <= p <= 5.0 or (p < 1000 and p.is_integer())):
+                valid_candidates.append(p)
+    
+    if valid_candidates:
+        # Current price is typically the highest displayed
+        return max(valid_candidates)
+    
+    LOG.debug("Konga: No valid price found after all 2026 filters")
+    return None
 # ═══════════════════════════════════════════════════════════════════════════
 # E-COMMERCE SCRAPERS (ENHANCED FOR KONGA WITH BETTER SELECTORS)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1660,46 +1692,55 @@ def extract_punch_items(html: str, base_url: str) -> List[Dict[str, Any]]:
     return items
 
 def extract_myschool_items(html: str, base_url: str) -> List[Dict[str, Any]]:
-    """MySchool.ng-specific extraction with broader fallbacks."""
+    """MySchool.ng-specific extraction with 2026-proof selectors and robust fallback."""
     soup = BeautifulSoup(html, "lxml")
     items = []
     seen = set()
 
-    # Broadened container selectors (added more from generic for resilience)
+    # 2026-optimized container selectors with data attributes and broader patterns
     containers = soup.select(
         ".news-item, .post, .article, .news, .news-list, .news-listing, li.news, div[class*='news'], "
-        "article, .post, .entry, li, .content-item, .story, .td_module_wrap, div[class*='post'], div[class*='item']"
+        "article, .post, .entry, li, .content-item, .story, .td_module_wrap, div[class*='post'], "
+        "div[class*='item'] , .news-card, .article-card, .post-item, "
+        "div[data-testid*='news'], a[data-testid*='news-link'], div[data-testid*='article'], "
+        ".post-content, .article-content, div[data-testid*='content-card'], .content-card, .news-block"
     )
 
     for c in containers:
         try:
-            # Title element candidates (expanded for more matches)
+            # Multi-level title/link extraction
             title_elem = c.select_one("h2 a, h3 a, .title a, a.title, a, h2, h3, .news-title a")
             if not title_elem:
                 continue
+                
             title = title_elem.get_text(" ", strip=True)
-            link = title_elem.get("href") or title_elem.get("data-href") or None
-            if not title or not link:
+            link = title_elem.get("href") or title_elem.get("data-href")
+            
+            if not title or len(title) < 10 or not link:
                 continue
+                
             link = urljoin(base_url, link)
 
+            # Date extraction from multiple possible locations
             date = None
-            date_elem = c.select_one(".date, .post-date, time, span.date, .news-date")
+            date_elem = c.select_one(".date, .post-date, time, span.date, .news-date, [data-testid*='date']")
             if date_elem:
                 date = date_elem.get_text(" ", strip=True)
 
+            # Snippet extraction with fallback chain
             snippet = None
-            for sel in (".excerpt, .summary, .post-excerpt, .news-snippet, p, div.description"):
+            for sel in (".excerpt, .summary, .post-excerpt, .news-snippet, p, div.description, [data-testid*='excerpt']"):
                 s = c.select_one(sel)
                 if s:
                     snippet = s.get_text(" ", strip=True)
                     if len(snippet) >= 40:
                         break
-
+            
             if not snippet:
                 snippet = "Click to read full update..."
 
-            key = f"{title[:50]}|{link}"
+            # Deduplication
+            key = f"{title[:60]}|{link}"
             if key in seen:
                 continue
             seen.add(key)
@@ -1715,36 +1756,43 @@ def extract_myschool_items(html: str, base_url: str) -> List[Dict[str, Any]]:
         except Exception:
             continue
 
-    # New: Fallback to generic a-tag scan if few items found (mimics Colab's working approach)
-    if len(items) < 3:  # Threshold to trigger fallback if specific selectors miss
-        LOG.debug("MySchool fallback: Using generic a-tag extraction due to low yield (%d items)", len(items))
+    # Enhanced fallback for MySchool's dynamic rendering
+    if len(items) < 3:
+        LOG.debug("MySchool fallback: Using generic a-tag scan due to low yield (%d items)", len(items))
         for a in soup.find_all("a", href=True):
             title = a.get_text(" ", strip=True)
             href = a.get("href", "").strip()
+            
             if not title or len(title) < 10:
                 continue
             if _SCHOOL_KEYWORDS_RE and not _SCHOOL_KEYWORDS_RE.search(title):
                 continue
+                
             full_link = urljoin(base_url, href)
-            key = f"{title[:50]}|{full_link}"
+            key = f"{title[:60]}|{full_link}"
             if key in seen:
                 continue
             seen.add(key)
+                
+            # Extract context from parent container
+            container = a.find_parent(["li", "div", "article", "p", "td"])
             snippet = "Click link for details."
             date_str = None
-            container = a.find_parent(["li", "div", "article", "p", "td"])
+            
             if container:
                 container_text = container.get_text(" ", strip=True)
                 if _DATE_RE:
                     date_match = _DATE_RE.search(container_text)
                     if date_match:
                         date_str = date_match.group(0)
-                siblings = a.find_next_siblings(["p", "div", "span"])
-                for sib in siblings[:3]:
+                        
+                # Get sibling text for snippet
+                for sib in a.find_next_siblings(["p", "div", "span"])[:2]:
                     sib_text = sib.get_text(" ", strip=True)
                     if len(sib_text) > 30:
                         snippet = sib_text[:300]
                         break
+
             items.append({
                 "title": title,
                 "snippet": snippet,
