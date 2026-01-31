@@ -1685,6 +1685,70 @@ async def fetch_article_details(article_url: str) -> Optional[Dict[str, Any]]:
         LOG.error(f"✗ Failed to fetch article: {str(e)[:50]}")
         return None
 
+def extract_myschool_news_from_visible(soup: BeautifulSoup, max_items: int = 10) -> List[Dict[str, Any]]:
+    """
+    myschool.ng optimized visible-text extraction: handles link-heavy pages.
+    - Scans likely containers or all <a> tags with title-like text
+    - Recovers href directly from <a> for reliable links
+    - Sets placeholder snippet ("Read more...") — details fetched later
+    """
+    items = []
+    seen_titles = set()
+
+    # Step 1: Get full visible text for fallback filtering
+    page_text = soup.get_text(separator="\n", strip=True)
+
+    # Step 2: Find potential title links (hybrid: use <a> for links, text for filtering)
+    a_tags = soup.find_all('a', href=True)
+    for a in a_tags:
+        title = a.get_text(" ", strip=True)
+        if not title or len(title) < 25 or len(title) > 140:
+            continue
+        if any(n in title.lower() for n in ['read more', 'see more', 'comments', 'share', 'like', 'views', 'advertisement', 'sponsored']):
+            continue
+        if title in seen_titles:
+            continue
+
+        # Keyword filter (required for relevance)
+        if not any(kw.lower() in title.lower() for kw in ['jamb', 'waec', 'neco', 'utme', 'admission', 'post-utme', 'cut off', 'result', 'school fees', 'registration', '2026']):
+            continue
+
+        # Guess if it's a news link (myschool structure: /news/slug)
+        href = a['href']
+        if '/news/' not in href.lower() and '/blog/' not in href.lower():
+            continue  # skip non-news links
+
+        link = urljoin("https://myschool.ng", href)
+
+        # Look for date in visible text near title (search in page_text around title position)
+        date = None
+        if _DATE_RE:
+            # Find approximate position in full text
+            pos = page_text.lower().find(title.lower())
+            if pos != -1:
+                nearby_text = page_text[max(0, pos-200):pos+len(title)+200]
+                m = _DATE_RE.search(nearby_text)
+                if m:
+                    date = m.group(0)
+
+        items.append({
+            "title": title,
+            "date": date,
+            "snippet": "Read more for full update...",  # placeholder — fetch details later
+            "link": link,
+            "source": "myschool.ng"
+        })
+        seen_titles.add(title)
+
+        if len(items) >= max_items:
+            break
+
+    # Sort: prefer items with dates, then title alpha
+    items.sort(key=lambda x: (x['date'] is None, x['title']))
+
+    LOG.info("myschool visible-text extraction → %d items with placeholder snippets", len(items))
+    return items[:max_items]
+
 # ═══════════════════════════════════════════════════════════════════════════
 # SITE-SPECIFIC EXTRACTORS (UPDATED FOR ALL SOURCES)
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2217,15 +2281,18 @@ def extract_school_news_listings(html: str, base_url: str) -> List[Dict[str, Any
     return items[:15]
 
 async def scrape_school_news(
-    urls: List[str], 
-    fetch_full_content: bool = False, 
-    max_articles: int = 10
+    urls: List[str],
+    fetch_full_content: bool = False,
+    max_articles: int = 5
 ) -> List[Dict[str, Any]]:
     """
-    Scrape school news with parallel fetching for speed.
+    Scrape school news from given URLs.
+    Primary: generic extract_school_news_listings
+    Fallback: visible-text strategy for myschool.ng if primary yields <2 items.
+    Fetches article details/snippets for top items.
     """
     all_news = []
-    
+
     for base_url in urls:
         LOG.info(f"\n{'='*70}")
         LOG.info(f"📰 Scraping: {base_url}")
@@ -2264,38 +2331,48 @@ async def scrape_school_news(
             LOG.warning(f"  ✗ All candidate URLs failed for {base_url}")
             continue
         
-        items = extract_school_news_listings(html, successful_url)
-        LOG.info(f"  ✓ Found {len(items)} articles from {successful_url}")
+        soup = BeautifulSoup(html, "lxml")
         
-        if not items:
+        # Primary extraction: your generic method
+        listing_items = extract_school_news_listings(html, successful_url)
+        
+        # Fallback for myschool.ng: if primary yields <2 items, switch to visible-text
+        if "myschool.ng" in successful_url.lower() and len(listing_items) < 2:
+            LOG.warning("Primary extraction yielded only %d items for myschool.ng — falling back to visible-text strategy", len(listing_items))
+            listing_items = extract_myschool_news_from_visible(soup, max_items=15)
+        
+        LOG.info(f"  ✓ Found {len(listing_items)} articles from {successful_url}")
+        
+        if not listing_items:
             continue
         
-        if fetch_full_content and max_articles > 0:
+        all_news.extend(listing_items)
+        
+        # Fetch full content/details for top articles, using snippets from articles
+        if fetch_full_content:
             LOG.info(f"\n  📄 Fetching full content for top {max_articles} articles in parallel...")
             
-            # Parallel fetch
-            tasks = [fetch_article_details(item['link']) for item in items[:max_articles] if item['link']]
+            tasks = [fetch_article_details(item['link']) for item in listing_items[:max_articles] if item['link']]
             details_list = await asyncio.gather(*tasks, return_exceptions=True)
             
-            for item, details in zip(items[:max_articles], details_list):
+            for item, details in zip(listing_items[:max_articles], details_list):
                 if not isinstance(details, Exception) and details:
-                    item['snippet'] = details['content']
+                    item['snippet'] = details['content']  # Use fetched summary as snippet
                     item['full_content'] = details['full_content']
-                    item['word_count'] = details['word_count']
                     item['key_info'] = details['key_info']
+                    item['word_count'] = details['word_count']
                     if details['date'] and not item['date']:
                         item['date'] = details['date']
                 else:
-                    LOG.warning(f"Failed parallel fetch for {item['title'][:30]}")
+                    LOG.warning("Failed to fetch details for %s", item['title'][:30])
         
-        all_news.extend(items)
-        LOG.info(f"\n  ✓ Processed {len(items)} articles from {successful_url}")
+        LOG.info("\n  ✓ Processed {len(listing_items)} articles from {successful_url}")
         
         LOG.info("-" * 70)
-        await asyncio.sleep(random.uniform(3, 6))  # Reduced
-    
+        await asyncio.sleep(random.uniform(3, 6))
+
     LOG.info(f"\n{'='*70}")
     LOG.info(f"📊 TOTAL: {len(all_news)} articles from {len(urls)} sources")
     LOG.info(f"{'='*70}\n")
-    
+
     return all_news
