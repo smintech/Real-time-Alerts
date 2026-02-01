@@ -221,235 +221,83 @@ def _log_extraction_attempt(source: str, raw_value: str, parsed_value: Optional[
 # -------------------------------------------------------------------
 async def get_visible_text_from_playwright_page(page, timeout: int = 10000) -> str:
     """
-    Robust visible text extraction:
-      1. Primary: page.inner_text("body") — fastest, most reliable, never fails on normal pages
-      2. Fallback: Enhanced JS with price element detection (only if primary returns short text)
-    Always appends __PRICE_ELEMENTS__ section when price elements are found.
-    Guarantees meaningful visible text output.
+    ROBUST VISIBLE TEXT EXTRACTION (Integrated Fix)
+    - Removes suggestion/related/accessory areas before extraction
+    - Targets main product content only
     """
     LOG.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    LOG.info("🔍 STARTING VISIBLE TEXT EXTRACTION (ROBUST MODE)")
+    LOG.info("🔍 VISIBLE TEXT EXTRACTION (Product Area Only)")
     LOG.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
 
-    # PRIMARY METHOD: page.inner_text("body") — simple, reliable, captures all visible text including prices with ₦
-    try:
-        LOG.debug("  → Primary method: page.inner_text('body')...")
-        start = time.time()
-        text = await asyncio.wait_for(page.inner_text("body"), timeout=timeout / 1000.0)
-        cleaned = re.sub(r"\s+", " ", text).strip()
-        duration = time.time() - start
-        
-        LOG.info("  ✅ PRIMARY METHOD SUCCESS")
-        LOG.info("     • Characters extracted: %d", len(cleaned))
-        LOG.info("     • Time taken: %.2fs", duration)
-        
-        # If primary gives sufficient text, return it immediately (most common case)
-        if len(cleaned) >= 1000:
-            LOG.info("  Primary text sufficient — skipping JS fallback")
-            LOG.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            return cleaned
-        
-        LOG.warning("  Primary text short (%d chars) — falling back to enhanced JS", len(cleaned))
-    
-    except Exception as e:
-        LOG.error("  ❌ Primary method failed: %s", str(e)[:200])
-        LOG.warning("  Proceeding to enhanced JS fallback")
-        cleaned = ""
-
-    # FALLBACK: Enhanced JavaScript extraction with price element tracking
-    LOG.debug("  → Executing enhanced JavaScript fallback...")
-    
-    js = r"""
-    () => {
-      const startTime = performance.now();
-      
-      function isElementVisible(el) {
-        if (!el) return false;
-        try {
-          const style = window.getComputedStyle(el);
-          if (!style) return false;
-          if (style.visibility === 'hidden' || style.display === 'none' || parseFloat(style.opacity) === 0) return false;
-          const rect = el.getBoundingClientRect();
-          if (rect.width === 0 || rect.height === 0) return false;
-        } catch (e) { return false; }
-        
-        let node = el;
-        while (node && node !== document.body) {
-          try {
-            if (node.hasAttribute && node.hasAttribute('aria-hidden') && node.getAttribute('aria-hidden') === 'true') {
-              return false;
-            }
-          } catch (e) {}
-          node = node.parentElement;
-        }
-        return true;
-      }
-
-      function cleanText(text) {
-        return text.replace(/\s+/g, ' ').trim();
-      }
-
-      function looksLikePrice(text) {
-        return /₦|NGN|N\s*\d{3,}|\d{6,}/.test(text);
-      }
-
-      // Collect visible text nodes
-      const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
-      const visibleTextParts = [];
-      let node;
-      while ((node = walker.nextNode())) {
-        const text = node.textContent || '';
-        const trimmed = cleanText(text);
-        if (!trimmed) continue;
-        const parent = node.parentElement;
-        if (!parent) continue;
-        if (isElementVisible(parent)) visibleTextParts.push(trimmed);
-      }
-
-      // Collect attribute tokens
-      const attrTokens = [];
-      const priceAttrs = ['data-price', 'data-final-price', 'data-price-amount', 'data-amount', 
-                          'data-selling-price', 'data-offer-price', 'content'];
-      
-      document.querySelectorAll('[data-price], [data-final-price], [data-price-amount], [data-selling-price], [data-offer-price]').forEach(el => {
-        try {
-          if (!isElementVisible(el)) return;
-          priceAttrs.forEach(attr => {
-            const val = el.getAttribute(attr);
-            if (val && val.trim()) attrTokens.push(val.trim());
-          });
-          if (el.title) attrTokens.push(el.title);
-          if (el.alt) attrTokens.push(el.alt);
-          const ariaLabel = el.getAttribute('aria-label');
-          if (ariaLabel) attrTokens.push(ariaLabel);
-        } catch(e){}
-      });
-
-      // Collect pseudo-element content
-      const pseudoTokens = [];
-      try {
-        const candidates = Array.from(document.querySelectorAll('span, div, p')).slice(0, 50);
-        candidates.forEach(el => {
-          try {
-            if (!isElementVisible(el)) return;
-            const before = window.getComputedStyle(el, '::before').getPropertyValue('content');
-            const after = window.getComputedStyle(el, '::after').getPropertyValue('content');
-            if (before && before !== 'none' && before !== 'normal') {
-              const cleaned = before.replace(/^["']|["']$/g, '');
-              if (cleaned) pseudoTokens.push(cleaned);
-            }
-            if (after && after !== 'none' && after !== 'normal') {
-              const cleaned = after.replace(/^["']|["']$/g, '');
-              if (cleaned) pseudoTokens.push(cleaned);
-            }
-          } catch(e){}
-        });
-      } catch(e){}
-
-      // Extract price elements with position tracking
-      const priceElements = [];
-      const priceSelectors = ['[class*="price"]', '[class*="Price"]', '[class*="amount"]', '[id*="price"]', 'span', 'div', 'p'];
-      const seenPriceTexts = new Set();
-      
-      priceSelectors.forEach(sel => {
-        try {
-          document.querySelectorAll(sel).forEach(el => {
-            if (!isElementVisible(el)) return;
-            const text = cleanText(el.innerText || el.textContent || '');
-            if (text.length > 0 && text.length < 200 && looksLikePrice(text)) {
-              const key = text.substring(0, 50);
-              if (!seenPriceTexts.has(key)) {
-                seenPriceTexts.add(key);
-                const rect = el.getBoundingClientRect();
-                priceElements.push({
-                  tag: el.tagName,
-                  class: el.className || 'none',
-                  id: el.id || 'none',
-                  text: text,
-                  top: Math.round(rect.top),
-                  left: Math.round(rect.left)
-                });
-              }
-            }
-          });
-        } catch(e) {}
-      });
-      
-      // Sort price elements top-to-bottom, left-to-right
-      priceElements.sort((a, b) => {
-        if (Math.abs(a.top - b.top) > 50) return a.top - b.top;
-        return a.left - b.left;
-      });
-
-      // Combine and deduplicate
-      const combined = [];
-      const seen = new Set();
-      [...visibleTextParts, ...attrTokens, ...pseudoTokens].forEach(t => {
-        if (!t) return;
-        const normal = cleanText(t);
-        if (!normal || normal.length < 1) return;
-        if (!seen.has(normal)) {
-          seen.add(normal);
-          combined.push(normal);
-        }
-      });
-
-      const endTime = performance.now();
-      
-      return {
-        text: combined.join(' '),
-        priceElements: priceElements,
-        stats: {
-          visibleNodes: visibleTextParts.length,
-          attrTokens: attrTokens.length,
-          pseudoTokens: pseudoTokens.length,
-          priceElements: priceElements.length,
-          totalUnique: combined.length,
-          executionTimeMs: Math.round(endTime - startTime)
-        }
-      };
-    }
-    """
-    
     try:
         start = time.time()
-        ret = await page.evaluate(js, timeout=timeout)
-        duration = time.time() - start
         
-        if isinstance(ret, dict):
-            base_text = ret.get('text', '')
-            price_elements = ret.get('priceElements', [])
-            stats = ret.get('stats', {})
+        js_code = """
+        () => {
+            // CRITICAL: Remove suggestion/related areas before extraction
+            document.querySelectorAll(
+                '[class*="suggestion"], [class*="related"], [class*="similar"], ' +
+                '[class*="also-like"], [class*="recommended"], [class*="carousel"], ' +
+                '[class*="slick"], [id*="suggestion"], [id*="related"], ' +
+                '[class*="bundle"], [class*="accessory"], [class*="compare"], ' +
+                'script, style, nav, footer, header, iframe, noscript, ' +
+                '[class*="ad"], [id*="ad"], [class*="cookie"], [class*="popup"]'
+            ).forEach(el => el.remove());
+
+            // Find main product area (prefer one with price)
+            let root = document.body;
+            const mainCandidates = Array.from(document.querySelectorAll(
+                '[class*="product-main"], [class*="product-detail"], ' +
+                '[class*="product-info"], [class*="productview"], ' +
+                'main, [role="main"]'
+            ));
             
-            combined = re.sub(r"\s+", " ", base_text).strip()
-            
-            LOG.info("  ✅ FALLBACK JS SUCCESS")
-            LOG.info("     • Stats: nodes=%d | attrs=%d | pseudo=%d | prices=%d | unique=%d",
-                     stats.get('visibleNodes',0), stats.get('attrTokens',0),
-                     stats.get('pseudoTokens',0), stats.get('priceElements',0),
-                     stats.get('totalUnique',0))
-            LOG.info("     • JS execution: %dms | Python time: %.2fs", 
-                     stats.get('executionTimeMs',0), duration)
-            LOG.info("     • Base text length: %d chars", len(combined))
-            
-            if price_elements:
-                LOG.info("     • Price elements found: %d → appending structured section", len(price_elements))
-                price_section = "\n__PRICE_ELEMENTS__\n"
-                for elem in price_elements:
-                    price_section += f"{elem.get('text','').strip()}\n"
-                combined += price_section
-            
-            LOG.info("  Final visible text length: %d characters", len(combined))
-            LOG.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            return combined
+            if (mainCandidates.length > 0) {
+                root = mainCandidates.find(el => 
+                    el.textContent.includes('₦') && el.textContent.length > 500
+                ) || mainCandidates[0];
+            }
+
+            const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {
+                acceptNode: node => {
+                    const el = node.parentElement;
+                    if (!el) return NodeFilter.FILTER_REJECT;
+                    const style = getComputedStyle(el);
+                    if (style.display === 'none' || style.visibility === 'hidden') {
+                        return NodeFilter.FILTER_REJECT;
+                    }
+                    return NodeFilter.FILTER_ACCEPT;
+                }
+            });
+
+            const texts = [];
+            while (walker.nextNode()) {
+                texts.push(walker.currentNode.nodeValue.trim());
+            }
+
+            return {
+                text: texts.join(' ').replace(/\\s+/g, ' ').trim(),
+                container: root.tagName,
+                count: texts.length
+            };
+        }
+        """
+        
+        result = await page.evaluate(js_code)
+        
+        if isinstance(result, dict):
+            text = result.get('text', '')
+            LOG.info(f"  ✅ SUCCESS: {len(text)} chars extracted from main area")
+            return text
+        return str(result) if result else ""
             
     except Exception as e:
-        LOG.error("  ❌ Fallback JS failed: %s", str(e)[:200])
-    
-    # Ultimate fallback: return whatever primary gave (even if short)
-    LOG.warning("  Both methods failed or gave short text — returning primary result")
-    LOG.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    return cleaned or ""
+        LOG.error(f"  Robust extraction failed: {e}")
+        try:
+            return await page.evaluate("() => document.body.innerText")
+        except:
+            return ""
+
 
 # -------------------------------------------------------------------
 # 2) Fully improved fetch_with_playwright_aggressive (with XHR capture + price_js)
@@ -769,7 +617,7 @@ async def fetch_with_playwright_aggressive(
                 # Extract visible text if requested (BEFORE cleanup!)
                 if return_visible_text:
                     try:
-                        visible_text = await page.evaluate("() => Array.from(document.querySelectorAll('body *')).map(el => el.innerText).join('\\n').trim()")
+                        visible_text = await get_visible_text_from_playwright_page(page) if return_visible_text else ""
                         LOG.info("  ✅ Visible text extracted: %d characters", len(visible_text or ""))
                     except Exception as e:
                         LOG.error("  ❌ Visible text extraction failed: %s", str(e)[:200])
