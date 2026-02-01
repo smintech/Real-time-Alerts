@@ -219,15 +219,45 @@ def _log_extraction_attempt(source: str, raw_value: str, parsed_value: Optional[
 # -------------------------------------------------------------------
 # 1) Enhanced visible-text + attribute + pseudo-content extractor
 # -------------------------------------------------------------------
-async def get_visible_text_from_playwright_page(page, timeout: int = 5000) -> str:
+async def get_visible_text_from_playwright_page(page, timeout: int = 10000) -> str:
     """
-    Extract visible text + attributes + pseudo-content with human-like fallback.
-    NOW INCLUDES: position-aware extraction and price element tracking.
+    Robust visible text extraction:
+      1. Primary: page.inner_text("body") — fastest, most reliable, never fails on normal pages
+      2. Fallback: Enhanced JS with price element detection (only if primary returns short text)
+    Always appends __PRICE_ELEMENTS__ section when price elements are found.
+    Guarantees meaningful visible text output.
     """
     LOG.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    LOG.info("🔍 STARTING VISIBLE TEXT EXTRACTION")
+    LOG.info("🔍 STARTING VISIBLE TEXT EXTRACTION (ROBUST MODE)")
     LOG.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    LOG.debug("Parameters: timeout=%dms", timeout)
+
+    # PRIMARY METHOD: page.inner_text("body") — simple, reliable, captures all visible text including prices with ₦
+    try:
+        LOG.debug("  → Primary method: page.inner_text('body')...")
+        start = time.time()
+        text = await asyncio.wait_for(page.inner_text("body"), timeout=timeout / 1000.0)
+        cleaned = re.sub(r"\s+", " ", text).strip()
+        duration = time.time() - start
+        
+        LOG.info("  ✅ PRIMARY METHOD SUCCESS")
+        LOG.info("     • Characters extracted: %d", len(cleaned))
+        LOG.info("     • Time taken: %.2fs", duration)
+        
+        # If primary gives sufficient text, return it immediately (most common case)
+        if len(cleaned) >= 1000:
+            LOG.info("  Primary text sufficient — skipping JS fallback")
+            LOG.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+            return cleaned
+        
+        LOG.warning("  Primary text short (%d chars) — falling back to enhanced JS", len(cleaned))
+    
+    except Exception as e:
+        LOG.error("  ❌ Primary method failed: %s", str(e)[:200])
+        LOG.warning("  Proceeding to enhanced JS fallback")
+        cleaned = ""
+
+    # FALLBACK: Enhanced JavaScript extraction with price element tracking
+    LOG.debug("  → Executing enhanced JavaScript fallback...")
     
     js = r"""
     () => {
@@ -263,7 +293,7 @@ async def get_visible_text_from_playwright_page(page, timeout: int = 5000) -> st
         return /₦|NGN|N\s*\d{3,}|\d{6,}/.test(text);
       }
 
-      // Step 1: Collect visible text nodes (original method)
+      // Collect visible text nodes
       const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
       const visibleTextParts = [];
       let node;
@@ -276,7 +306,7 @@ async def get_visible_text_from_playwright_page(page, timeout: int = 5000) -> st
         if (isElementVisible(parent)) visibleTextParts.push(trimmed);
       }
 
-      // Step 2: Collect attribute-based tokens (original method)
+      // Collect attribute tokens
       const attrTokens = [];
       const priceAttrs = ['data-price', 'data-final-price', 'data-price-amount', 'data-amount', 
                           'data-selling-price', 'data-offer-price', 'content'];
@@ -284,12 +314,10 @@ async def get_visible_text_from_playwright_page(page, timeout: int = 5000) -> st
       document.querySelectorAll('[data-price], [data-final-price], [data-price-amount], [data-selling-price], [data-offer-price]').forEach(el => {
         try {
           if (!isElementVisible(el)) return;
-          
           priceAttrs.forEach(attr => {
             const val = el.getAttribute(attr);
             if (val && val.trim()) attrTokens.push(val.trim());
           });
-          
           if (el.title) attrTokens.push(el.title);
           if (el.alt) attrTokens.push(el.alt);
           const ariaLabel = el.getAttribute('aria-label');
@@ -297,17 +325,15 @@ async def get_visible_text_from_playwright_page(page, timeout: int = 5000) -> st
         } catch(e){}
       });
 
-      // Step 3: Capture pseudo-element content (original method)
+      // Collect pseudo-element content
       const pseudoTokens = [];
       try {
         const candidates = Array.from(document.querySelectorAll('span, div, p')).slice(0, 50);
         candidates.forEach(el => {
           try {
             if (!isElementVisible(el)) return;
-            
             const before = window.getComputedStyle(el, '::before').getPropertyValue('content');
             const after = window.getComputedStyle(el, '::after').getPropertyValue('content');
-            
             if (before && before !== 'none' && before !== 'normal') {
               const cleaned = before.replace(/^["']|["']$/g, '');
               if (cleaned) pseudoTokens.push(cleaned);
@@ -320,28 +346,20 @@ async def get_visible_text_from_playwright_page(page, timeout: int = 5000) -> st
         });
       } catch(e){}
 
-      // NEW STEP 4: Extract price elements with position tracking
+      // Extract price elements with position tracking
       const priceElements = [];
-      const priceSelectors = [
-        '[class*="price"]',
-        '[class*="Price"]',
-        '[class*="amount"]',
-        '[id*="price"]',
-        'span', 'div', 'p'
-      ];
-      
+      const priceSelectors = ['[class*="price"]', '[class*="Price"]', '[class*="amount"]', '[id*="price"]', 'span', 'div', 'p'];
       const seenPriceTexts = new Set();
+      
       priceSelectors.forEach(sel => {
         try {
           document.querySelectorAll(sel).forEach(el => {
             if (!isElementVisible(el)) return;
-            
             const text = cleanText(el.innerText || el.textContent || '');
             if (text.length > 0 && text.length < 200 && looksLikePrice(text)) {
               const key = text.substring(0, 50);
               if (!seenPriceTexts.has(key)) {
                 seenPriceTexts.add(key);
-                
                 const rect = el.getBoundingClientRect();
                 priceElements.push({
                   tag: el.tagName,
@@ -357,16 +375,15 @@ async def get_visible_text_from_playwright_page(page, timeout: int = 5000) -> st
         } catch(e) {}
       });
       
-      // Sort price elements by position (top to bottom, left to right)
+      // Sort price elements top-to-bottom, left-to-right
       priceElements.sort((a, b) => {
         if (Math.abs(a.top - b.top) > 50) return a.top - b.top;
         return a.left - b.left;
       });
 
-      // Step 5: Combine and deduplicate
+      // Combine and deduplicate
       const combined = [];
       const seen = new Set();
-      
       [...visibleTextParts, ...attrTokens, ...pseudoTokens].forEach(t => {
         if (!t) return;
         const normal = cleanText(t);
@@ -396,71 +413,43 @@ async def get_visible_text_from_playwright_page(page, timeout: int = 5000) -> st
     
     try:
         start = time.time()
-        LOG.debug("  ⏳ Executing JavaScript extraction...")
-        
         ret = await page.evaluate(js, timeout=timeout)
         duration = time.time() - start
         
-        if ret and isinstance(ret, dict):
-            text = ret.get('text', '')
-            stats = ret.get('stats', {})
+        if isinstance(ret, dict):
+            base_text = ret.get('text', '')
             price_elements = ret.get('priceElements', [])
-            cleaned = re.sub(r"\s+", " ", text).strip()
+            stats = ret.get('stats', {})
             
-            LOG.info("  ✅ TEXT EXTRACTION SUCCESSFUL")
-            LOG.info("  📊 Statistics:")
-            LOG.info("     • Visible text nodes: %d", stats.get('visibleNodes', 0))
-            LOG.info("     • Attribute tokens: %d", stats.get('attrTokens', 0))
-            LOG.info("     • Pseudo-element tokens: %d", stats.get('pseudoTokens', 0))
-            LOG.info("     • Price elements found: %d", stats.get('priceElements', 0))
-            LOG.info("     • Total unique tokens: %d", stats.get('totalUnique', 0))
-            LOG.info("     • JavaScript execution: %dms", stats.get('executionTimeMs', 0))
-            LOG.info("     • Python processing: %.2fs", duration)
-            LOG.info("     • Final text length: %d characters", len(cleaned))
+            combined = re.sub(r"\s+", " ", base_text).strip()
             
-            # NEW: Log price elements with structure
+            LOG.info("  ✅ FALLBACK JS SUCCESS")
+            LOG.info("     • Stats: nodes=%d | attrs=%d | pseudo=%d | prices=%d | unique=%d",
+                     stats.get('visibleNodes',0), stats.get('attrTokens',0),
+                     stats.get('pseudoTokens',0), stats.get('priceElements',0),
+                     stats.get('totalUnique',0))
+            LOG.info("     • JS execution: %dms | Python time: %.2fs", 
+                     stats.get('executionTimeMs',0), duration)
+            LOG.info("     • Base text length: %d chars", len(combined))
+            
             if price_elements:
-                LOG.info("")
-                LOG.info("  💰 PRICE ELEMENTS DETECTED (in reading order):")
-                LOG.info("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-                
-                for idx, elem in enumerate(price_elements[:10], 1):
-                    LOG.info("  [%d] <%s class='%s' id='%s'>", 
-                            idx, elem.get('tag', '?'), 
-                            elem.get('class', 'none')[:50],
-                            elem.get('id', 'none')[:30])
-                    LOG.info("      Text: %s", elem.get('text', '')[:70])
-                    LOG.info("      Position: top=%dpx, left=%dpx", 
-                            elem.get('top', 0), elem.get('left', 0))
-                
-                LOG.info("  ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-                
-                # Append price elements as structured data
-                price_section = '\n__PRICE_ELEMENTS__\n'
+                LOG.info("     • Price elements found: %d → appending structured section", len(price_elements))
+                price_section = "\n__PRICE_ELEMENTS__\n"
                 for elem in price_elements:
-                    price_section += f"{elem.get('text', '')}\n"
-                cleaned += price_section
+                    price_section += f"{elem.get('text','').strip()}\n"
+                combined += price_section
             
-            # Show sample of extracted text
-            if cleaned:
-                sample = cleaned.split('__PRICE_ELEMENTS__')[0][:300].replace('\n', ' ')
-                LOG.debug("  📝 Text sample (first 300 chars):")
-                LOG.debug("     %s...", sample)
-            
+            LOG.info("  Final visible text length: %d characters", len(combined))
             LOG.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            return cleaned
-            
-        elif isinstance(ret, str):
-            cleaned = re.sub(r"\s+", " ", ret).strip()
-            LOG.info("  ✅ TEXT EXTRACTION (legacy format): %d characters in %.2fs", len(cleaned), duration)
-            return cleaned
+            return combined
             
     except Exception as e:
-        LOG.error("  ❌ VISIBLE TEXT EXTRACTION FAILED")
-        LOG.error("     Error: %s", str(e)[:200])
-        LOG.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        LOG.error("  ❌ Fallback JS failed: %s", str(e)[:200])
     
-    return ""
+    # Ultimate fallback: return whatever primary gave (even if short)
+    LOG.warning("  Both methods failed or gave short text — returning primary result")
+    LOG.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+    return cleaned or ""
 
 # -------------------------------------------------------------------
 # 2) Fully improved fetch_with_playwright_aggressive (with XHR capture + price_js)
@@ -1285,307 +1274,103 @@ def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain
     return best_guess
 
 def _extract_konga_current_price(soup: BeautifulSoup, page_text: str) -> Optional[float]:
-    """
-    Enhanced Konga extraction: working selectors FIRST, then fallbacks.
-    Logs HTML structure to help identify new selectors.
-    """
     LOG.info("")
     LOG.info("┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓")
-    LOG.info("┃ KONGA PRICE EXTRACTION                                         ┃")
+    LOG.info("┃ KONGA PRICE EXTRACTION (FINAL VERSION)                         ┃")
     LOG.info("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
-    LOG.debug("Page text available: %d characters", len(page_text or ""))
+    LOG.debug("Input: HTML parsed, visible text %d chars", len(page_text or ""))
+
+    # PHASE 1: __NEXT_DATA__ (Konga = Next.js → this is gold)
+    LOG.info("📋 Phase 1: __NEXT_DATA__ parsing")
+    next_script = soup.find("script", {"id": "__NEXT_DATA__"})
+    if next_script and next_script.string:
+        try:
+            data = json.loads(next_script.string)
+            def find_price(obj):
+                if isinstance(obj, dict):
+                    for k, v in obj.items():
+                        key = str(k).lower()
+                        if key in ["price", "sellingprice", "finalprice", "currentprice", "amount", "offerprice"]:
+                            try:
+                                p = float(str(v).replace(",", ""))
+                                if 5000 <= p <= 100_000_000:
+                                    return p
+                            except:
+                                pass
+                        if isinstance(v, (dict, list)):
+                            result = find_price(v)
+                            if result: return result
+                elif isinstance(obj, list):
+                    for item in obj:
+                        result = find_price(item)
+                        if result: return result
+                return None
+            
+            price = find_price(data)
+            if price:
+                LOG.info("  ✅ SUCCESS PHASE 1: __NEXT_DATA__ → ₦%.0f", price)
+                return price
+        except Exception as e:
+            LOG.debug("  __NEXT_DATA__ parse error: %s", str(e)[:100])
     
-    # WORKING SELECTORS (from your logs) - PRIORITY #1
+    LOG.warning("  Phase 1 failed")
+
+    # PHASE 2: Known working selectors (from your actual logs)
+    LOG.info("📋 Phase 2: Known working selectors")
     working_selectors = [
-        "div.priceBox_priceBoxPrice__i7paS",  # ✅ Found 2 elements in your log
+        "div.priceBox_priceBoxPrice__i7paS",
         "span.shared_price__gnso_",
-        "span.shared_initialPrice__cTRSe",
+        "span.shared_initialPrice__cTRSe", "span.-b.-ubpt", "span.prc", "span.price", "span.Price"
     ]
     
-    # Standard selectors - PRIORITY #2
-    standard_selectors = [
-        "span[data-testid='current-price']",
-        "div[data-testid='price-current']",
-        "span[data-testid='product-price']",
-        "div[data-testid='selling-price']",
-        "span._3e_22_199e7",
-        "span.-b.-ubpt",
-        "span.prc",
-        "span.price",
-        "span.Price",
-        "[data-price-amount]",
-        "meta[property='og:price:amount']",
-        "meta[itemprop='price']",
-    ]
-    
-    all_selectors = working_selectors + standard_selectors
-    
-    LOG.info("📋 Phase 1: Direct CSS Selectors (%d total, %d working)", 
-             len(all_selectors), len(working_selectors))
-    LOG.info("─" * 70)
-    
-    for idx, sel in enumerate(all_selectors, 1):
-        try:
-            elements = soup.select(sel)
-            is_working = sel in working_selectors
-            status_icon = "🎯" if is_working else "📌"
-            
-            if elements:
-                LOG.info("  [%d/%d] %s ✅ %s → %d elements", 
-                        idx, len(all_selectors), status_icon, sel, len(elements))
-                
-                for elem_idx, el in enumerate(elements[:3], 1):
-                    text = ""
-                    if el.name == "meta":
-                        text = el.get("content", "") or ""
-                        LOG.debug("        [%d] Meta content: '%s'", elem_idx, text[:60])
-                    else:
-                        text = el.get_text(" ", strip=True) or el.get("data-price") or el.get("data-final-price") or ""
-                        # NEW: Log element structure
-                        elem_class = ' '.join(el.get('class', []))
-                        LOG.debug("        [%d] <%s class='%s'>", elem_idx, el.name, elem_class[:40])
-                        LOG.debug("            Text: '%s'", text[:60])
-                    
-                    if not text:
-                        continue
-                    
-                    p = _parse_price_string(text)
-                    if p and 5000 <= p < 100_000_000:
-                        LOG.info("")
-                        LOG.info("  ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓")
-                        LOG.info("  ┃ ✅ SUCCESS - PHASE 1 (SELECTOR MATCH)                ┃")
-                        LOG.info("  ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫")
-                        LOG.info("  ┃ Selector: %-44s ┃", sel[:44])
-                        LOG.info("  ┃ Raw text: %-44s ┃", text[:44])
-                        LOG.info("  ┃ Parsed:   ₦%-42.0f ┃", p)
-                        LOG.info("  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
-                        return p
-            else:
-                LOG.debug("  [%d/%d] %s ❌ %s → not found", 
-                         idx, len(all_selectors), status_icon, sel)
-                
-        except Exception as e:
-            LOG.debug("  [%d/%d] ⚠️  %s → error: %s", 
-                     idx, len(all_selectors), sel, str(e)[:50])
-
-    LOG.warning("⚠️  Phase 1 failed: No price via direct selectors")
-
-    # Phase 2: Check __PRICE_ELEMENTS__ section (from enhanced visible text)
-    LOG.info("")
-    LOG.info("📋 Phase 2: Price Elements Section (from JS extraction)")
-    LOG.info("─" * 70)
-    
-    if '__PRICE_ELEMENTS__' in page_text:
-        price_section = page_text.split('__PRICE_ELEMENTS__')[1]
-        lines = [l.strip() for l in price_section.split('\n') if l.strip()]
-        
-        LOG.debug("  Found %d price element lines", len(lines))
-        
-        prices_found = []
-        for idx, line in enumerate(lines[:10], 1):
-            LOG.debug("  [%d] Raw: %s", idx, line[:60])
-            
-            matches = re.findall(r'₦?\s*([0-9,]+\.?\d*)', line)
-            for match in matches:
-                try:
-                    cleaned = match.replace(',', '').strip()
-                    if cleaned:
-                        price = float(cleaned)
-                        if 5000 <= price <= 100_000_000:
-                            prices_found.append(price)
-                            LOG.info("      ✅ Extracted: ₦%s → %.0f", match, price)
-                except:
-                    pass
-        
-        if prices_found:
-            unique_prices = list(dict.fromkeys(prices_found))
-            LOG.info("")
-            LOG.info("  📊 Unique prices: %s", [f"₦{p:,.0f}" for p in unique_prices[:5]])
-            
-            if len(unique_prices) >= 1:
-                # Use first price (they're in reading order from top of page)
-                result = unique_prices[0]
-                LOG.info("")
-                LOG.info("  ┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓")
-                LOG.info("  ┃ ✅ SUCCESS - PHASE 2 (PRICE ELEMENTS)                ┃")
-                LOG.info("  ┣━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┫")
-                LOG.info("  ┃ Price:    ₦%-44.0f ┃", result)
-                LOG.info("  ┃ Source:   %-44s ┃", "Position-aware extraction")
-                LOG.info("  ┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
-                return result
-
-    LOG.warning("⚠️  Phase 2 failed: No price in structured elements")
-
-    # Phase 3: Attribute search
-    LOG.info("")
-    LOG.info("📋 Phase 3: Attribute Search")
-    LOG.info("─" * 70)
-    
-    price_attrs = ("data-price", "data-final-price", "data-price-amount", "data-selling-price")
-    for attr in price_attrs:
-        try:
-            elements = soup.find_all(attrs={attr: True})
-            LOG.debug("  %s: %d elements", attr, len(elements))
-            
-            for el in elements[:5]:
-                val = el.get(attr)
-                if not val:
-                    continue
-                    
-                p = _parse_price_string(val)
-                if p and 5000 <= p < 100_000_000:
-                    LOG.info("  ✅ SUCCESS - PHASE 3: %s='%s' → ₦%.0f", attr, val[:30], p)
+    for sel in working_selectors:
+        elements = soup.select(sel)
+        if elements:
+            LOG.info("  🎯 Found %d elements with selector: %s", len(elements), sel)
+            for el in elements:
+                text = el.get_text(" ", strip=True)
+                p = _parse_price_string(text)
+                if p and 5000 <= p <= 100_000_000:
+                    LOG.info("  ✅ SUCCESS PHASE 2: %s → ₦%.0f", sel, p)
                     return p
-                    
-        except Exception as e:
-            LOG.debug("  ⚠️  %s search error: %s", attr, str(e)[:50])
-
-    LOG.warning("⚠️  Phase 3 failed: No price via attributes")
-
-    # Phase 4: Script/JSON search
-    LOG.info("")
-    LOG.info("📋 Phase 4: Script/JSON Search")
-    LOG.info("─" * 70)
     
-    scripts = soup.find_all("script")
-    LOG.debug("  Found %d script tags", len(scripts))
-    
-    script_text = "\n".join([s.string or "" for s in scripts if s.string])
-    
-    patterns = [
-        (r'"price"\s*[:=]\s*(\d{6,})', "price"),
-        (r'"sellingPrice"\s*[:=]\s*(\d{6,})', "sellingPrice"),
-        (r'"finalPrice"\s*[:=]\s*(\d{6,})', "finalPrice"),
-    ]
-    
-    for pattern, name in patterns:
-        matches = re.finditer(pattern, script_text, re.IGNORECASE)
-        for match in matches:
-            val = match.group(1)
-            p = _parse_price_string(val)
-            if p and 5000 <= p < 100_000_000:
-                LOG.info("  ✅ SUCCESS - PHASE 4: script.%s → ₦%.0f", name, p)
-                return p
+    LOG.warning("  Phase 2 failed")
 
-    LOG.warning("⚠️  Phase 4 failed: No price in scripts")
-
-    # Phase 5: Check for Playwright price marker
-    LOG.info("")
-    LOG.info("📋 Phase 5: Playwright Price Marker")
-    LOG.info("─" * 70)
+    # PHASE 3: Structured price elements from visible text
+    LOG.info("📋 Phase 3: __PRICE_ELEMENTS__ section")
+    if '__PRICE_ELEMENTS__' in page_text:
+        section = page_text.split('__PRICE_ELEMENTS__')[1]
+        lines = [l.strip() for l in section.split('\n') if l.strip()]
+        prices = []
+        for line in lines:
+            p = _parse_price_string(line)
+            if p and 5000 <= p <= 100_000_000:
+                prices.append(p)
+        if prices:
+            price = max(prices)  # or prices[0] if you prefer first/top one
+            LOG.info("  ✅ SUCCESS PHASE 3: Structured elements → ₦%.0f", price)
+            return price
     
-    marker_match = re.search(r'__PLAYWRIGHT_PRICE_JS__\:([0-9,\.kK]+)', page_text)
-    if marker_match:
-        candidate = marker_match.group(1)
-        LOG.debug("  Found marker: %s", candidate)
-        p = _parse_price_string(candidate)
-        if p and 5000 <= p < 100_000_000:
-            LOG.info("  ✅ SUCCESS - PHASE 5: Playwright marker → ₦%.0f", p)
-            return p
+    LOG.warning("  Phase 3 failed")
 
-    LOG.warning("⚠️  Phase 5 failed: No Playwright marker")
+    # PHASE 4: Visible text regex (guaranteed to have text now)
+    LOG.info("📋 Phase 4: Visible text regex")
+    matches = re.findall(r'(?:₦|NGN|N)[\s]*[:\-]?\s*([0-9][0-9,\.]*\s*[kK]?)', page_text, re.I)
+    prices = []
+    for m in matches:
+        p = _parse_price_string(m.replace(" ", ""))
+        if p and 5000 <= p <= 100_000_000:
+            prices.append(p)
+    if prices:
+        price = max(prices)
+        LOG.info("  ✅ SUCCESS PHASE 4: Visible text → ₦%.0f", price)
+        return price
 
-    # Phase 6: DOM structure analysis (NEW - helps find new selectors)
-    LOG.info("")
-    LOG.info("📋 Phase 6: DOM Structure Analysis (for debugging)")
-    LOG.info("─" * 70)
-    
-    # Find elements containing price-like patterns and log their structure
-    price_containers = []
-    for element in soup.find_all(['div', 'span', 'p']):
-        text = element.get_text(strip=True)
-        
-        if not re.search(r'₦|NGN|\d{6,}', text):
-            continue
-        
-        if len(text) > 300:  # Skip very long texts
-            continue
-        
-        price = _parse_price_string(text)
-        if price and 5000 <= price <= 100_000_000:
-            classes = element.get('class', [])
-            class_str = ' '.join(classes) if classes else 'NO_CLASS'
-            elem_id = element.get('id', 'NO_ID')
-            
-            price_containers.append({
-                'tag': element.name,
-                'class': class_str,
-                'id': elem_id,
-                'text': text[:80],
-                'price': price,
-                'html': str(element)[:200]
-            })
-    
-    if price_containers:
-        LOG.info("  📦 Found %d price-containing elements:", len(price_containers))
-        LOG.info("")
-        
-        # Deduplicate by class
-        seen_classes = set()
-        unique_containers = []
-        for container in price_containers:
-            if container['class'] not in seen_classes:
-                seen_classes.add(container['class'])
-                unique_containers.append(container)
-        
-        # Show top 5 unique structures
-        for idx, container in enumerate(unique_containers[:5], 1):
-            LOG.info("  [%d] <%s class='%s' id='%s'>", 
-                    idx, container['tag'], container['class'][:50], container['id'][:20])
-            LOG.info("      Price: ₦%.0f", container['price'])
-            LOG.info("      Text: %s", container['text'])
-            LOG.info("      HTML: %s...", container['html'])
-            LOG.info("")
-        
-        LOG.info("  💡 NEW SELECTOR SUGGESTIONS:")
-        for idx, container in enumerate(unique_containers[:3], 1):
-            if container['class'] != 'NO_CLASS':
-                selector = f"{container['tag']}.{container['class'].split()[0]}"
-                LOG.info("      [%d] %s", idx, selector)
-        LOG.info("")
-        
-        # Use most common price as fallback
-        from collections import Counter
-        price_counts = Counter([c['price'] for c in price_containers])
-        most_common = price_counts.most_common(1)
-        
-        if most_common:
-            result = most_common[0][0]
-            LOG.info("  ✅ FALLBACK: Most common price → ₦%.0f (appears %d times)", 
-                    result, most_common[0][1])
-            return result
-
-    LOG.warning("⚠️  Phase 6 failed: No valid price containers")
-
-    # Phase 7: Simple visible text regex (last resort)
-    LOG.info("")
-    LOG.info("📋 Phase 7: Visible Text Regex (last resort)")
-    LOG.info("─" * 70)
-    
-    visible_matches = re.findall(r'(?:₦|NGN|N)\s*[:\-]?\s*([0-9][0-9,\.]*\s*[kK]?)', page_text, re.I)
-    LOG.debug("  Found %d currency matches", len(visible_matches))
-    
-    for idx, raw in enumerate(visible_matches[:10], 1):
-        raw_clean = raw.replace(" ", "")
-        p = _parse_price_string(raw_clean)
-        if p and 5000 <= p < 100_000_000:
-            LOG.info("  [%d] ₦%s → %.0f", idx, raw[:20], p)
-            LOG.info("  ✅ SUCCESS - PHASE 7: Regex match → ₦%.0f", p)
-            return p
-
-    # FINAL FAILURE
-    LOG.error("")
     LOG.error("┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓")
-    LOG.error("┃ ❌ ALL 7 PHASES FAILED - NO PRICE FOUND                        ┃")
+    LOG.error("┃ ❌ ALL PHASES FAILED — NO PRICE EXTRACTED                       ┃")
     LOG.error("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
-    LOG.error("")
-    LOG.error("💡 DEBUGGING TIPS:")
-    LOG.error("   1. Check the DOM Structure Analysis (Phase 6) output above")
-    LOG.error("   2. Look for NEW SELECTOR SUGGESTIONS")
-    LOG.error("   3. Add successful selectors to 'working_selectors' list")
-    LOG.error("   4. Check if page is blocked (Cloudflare, etc)")
-    
     return None
+
 
 def extract_prices_from_visible_text(
     page_text: str,
