@@ -1012,24 +1012,24 @@ def normalize_product_key(scrape_result: Dict[str, Any]) -> str:
 def _parse_price_string(s: str) -> Optional[float]:
     if not s or not isinstance(s, str):
         return None
-    s = s.replace('\xa0', ' ').strip()
-    m = re.findall(r"[\d.,]+", s)
-    if not m:
-        return None
-    num = max(m, key=len)
+    s = s.replace('\xa0', ' ').replace('NGN', '').replace('N', '').strip()
+    # Remove currency and commas
+    cleaned = re.sub(r'[₦,]', '', s)
+    # Handle k/m abbreviations (rare on Konga but possible)
+    mul = 1
+    if cleaned.lower().endswith('k'):
+        mul = 1000
+        cleaned = cleaned[:-1]
+    elif cleaned.lower().endswith('m'):
+        mul = 1_000_000
+        cleaned = cleaned[:-1]
     try:
-        if ',' in num and '.' in num and num.rfind('.') > num.rfind(','):
-            clean = num.replace(',', '')
-        elif num.count(',') > 0 and num.count('.') == 0:
-            clean = num.replace(',', '')
-        else:
-            clean = num
-        clean = re.sub(r"[^\d.]", "", clean)
-        if clean == "":
-            return None
-        v = float(clean)
-        return v
-    except Exception:
+        val = float(cleaned) * mul
+        # Konga realistic range (most products 10k–4.5M)
+        if 5_000 <= val <= 5_000_000:
+            return val
+        return None
+    except:
         return None
 
 def split_concatenated_price(text: str, min_price: float = 50000) -> Tuple[Optional[float], Optional[float]]:
@@ -1273,37 +1273,128 @@ def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain
 
     return best_guess
 
-def _extract_konga_current_price(soup: BeautifulSoup, page_text: str) -> Optional[float]:
+def _extract_product_id_from_url(url: str) -> Optional[int]:
+    """Extract trailing product ID from Konga/Jumia style URLs to prevent ID-as-price bug."""
+    if not url:
+        return None
+    # Match trailing digits after hyphen or slash (e.g., -6834464 or /6834464/)
+    id_match = re.search(r'(?:[-/])(\d{5,})(?:[/?#]|$)', url)
+    if id_match:
+        val = int(id_match.group(1))
+        # Product IDs are typically 5-7 digits; ensure it's in range that could be confused with price
+        if 10000 <= val <= 9999999:
+            return val
+    return None
+
+def _parse_price_safe(text: str, exclude_id: Optional[int] = None) -> Optional[float]:
+    """
+    Parse price with strict validation to prevent product ID masquerading as price.
+    Returns None if value matches exclude_id or falls outside ₦1,000–₦5,000,000 range.
+    """
+    if not text:
+        return None
+    
+    # Handle m/M (million) and k/K (thousand) suffixes
+    text_clean = str(text).lower().replace('m', '000000').replace('k', '000')
+    
+    # Remove currency symbols and whitespace
+    cleaned = re.sub(r'[₦ngn,\s]', '', text_clean)
+    
+    # Find all numeric matches
+    matches = re.findall(r'\d+(?:\.\d{2})?', cleaned)
+    
+    for match in matches:
+        try:
+            val = float(match)
+            # STRICT VALIDATION:
+            # - Min: ₦1,000 (below this is likely not a price)
+            # - Max: ₦5,000,000 (above this is likely a product ID or error)
+            if not (1000 <= val <= 5_000_000):
+                continue
+            
+            # CRITICAL: Exclude if matches product ID (e.g., 6834464)
+            if exclude_id and abs(val - exclude_id) < 1:
+                continue
+                
+            return val
+        except ValueError:
+            continue
+    return None
+
+def _extract_konga_current_price(soup: BeautifulSoup, page_text: str, url: str = "") -> Optional[float]:
+    """
+    FIXED: Konga price extraction with product ID filtering.
+    Prevents picking product IDs (e.g., 6834464) as prices (₦6,834,464).
+    """
     LOG.info("")
     LOG.info("┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓")
-    LOG.info("┃ KONGA PRICE EXTRACTION (FINAL VERSION)                         ┃")
+    LOG.info("┃ KONGA PRICE EXTRACTION (FIXED - PRODUCT ID FILTER)             ┃")
     LOG.info("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
-    LOG.debug("Input: HTML parsed, visible text %d chars", len(page_text or ""))
+    
+    # Extract product ID to exclude from price candidates
+    product_id = _extract_product_id_from_url(url)
+    if product_id:
+        LOG.info("📌 Excluding product ID from prices: %d", product_id)
+    
+    # Helper that respects product ID exclusion
+    def safe_parse(text):
+        return _parse_price_safe(text, exclude_id=product_id)
+    
+    # Helper to check if text contains the raw product ID (avoid parsing 6834464 as 6,834,464)
+    def contains_product_id(text):
+        if not product_id or not text:
+            return False
+        return str(product_id) in text.replace(',', '').replace('₦', '').replace('N', '')
 
-    # PHASE 1: __NEXT_DATA__ (Konga = Next.js → this is gold)
+    # PHASE 1: __NEXT_DATA__ (Konga = Next.js) with ID field exclusion
     LOG.info("📋 Phase 1: __NEXT_DATA__ parsing")
     next_script = soup.find("script", {"id": "__NEXT_DATA__"})
     if next_script and next_script.string:
         try:
             data = json.loads(next_script.string)
-            def find_price(obj):
+            
+            def find_price(obj, depth=0):
+                if depth > 15:
+                    return None
                 if isinstance(obj, dict):
                     for k, v in obj.items():
-                        key = str(k).lower()
-                        if key in ["price", "sellingprice", "finalprice", "currentprice", "amount", "offerprice"]:
-                            try:
-                                p = float(str(v).replace(",", ""))
-                                if 5000 <= p <= 100_000_000:
-                                    return p
-                            except:
-                                pass
+                        k_lower = str(k).lower()
+                        
+                        # SKIP any field containing "id" (price_id, product_id, etc.) to avoid ID-as-price
+                        if 'id' in k_lower:
+                            continue
+                            
+                        is_price_key = any(x in k_lower for x in ['price', 'selling', 'final', 'amount', 'offerprice'])
+                        if not is_price_key:
+                            continue
+                        
+                        p = None
+                        if isinstance(v, (int, float)):
+                            if 1000 <= v <= 5_000_000:
+                                if product_id and v == product_id:
+                                    continue
+                                p = float(v)
+                        elif isinstance(v, str):
+                            # Skip if raw string equals/exactly contains product ID
+                            if product_id and str(product_id) in v.replace(',', '').replace('₦', ''):
+                                continue
+                            p = safe_parse(v)
+                        
+                        if p:
+                            return p
+                    
+                    # Recurse if not found at this level
+                    for v in obj.values():
                         if isinstance(v, (dict, list)):
-                            result = find_price(v)
-                            if result: return result
-                elif isinstance(obj, list):
+                            result = find_price(v, depth + 1)
+                            if result:
+                                return result
+                                
+                elif isinstance(obj, list) and depth < 10:
                     for item in obj:
-                        result = find_price(item)
-                        if result: return result
+                        result = find_price(item, depth + 1)
+                        if result:
+                            return result
                 return None
             
             price = find_price(data)
@@ -1312,28 +1403,36 @@ def _extract_konga_current_price(soup: BeautifulSoup, page_text: str) -> Optiona
                 return price
         except Exception as e:
             LOG.debug("  __NEXT_DATA__ parse error: %s", str(e)[:100])
-    
+
     LOG.warning("  Phase 1 failed")
 
-    # PHASE 2: Known working selectors (from your actual logs)
+    # PHASE 2: Known working selectors with ID contamination check
     LOG.info("📋 Phase 2: Known working selectors")
     working_selectors = [
         "div.priceBox_priceBoxPrice__i7paS",
         "span.shared_price__gnso_",
-        "span.shared_initialPrice__cTRSe", "span.-b.-ubpt", "span.prc", "span.price", "span.Price"
+        "span.shared_initialPrice__cTRSe", 
+        "span.-b.-ubpt", 
+        "span.prc", 
+        "span.price", 
+        "span.Price"
     ]
-    
+
     for sel in working_selectors:
         elements = soup.select(sel)
         if elements:
             LOG.info("  🎯 Found %d elements with selector: %s", len(elements), sel)
             for el in elements:
                 text = el.get_text(" ", strip=True)
-                p = _parse_price_string(text)
-                if p and 5000 <= p <= 100_000_000:
+                # Skip if this text contains the raw product ID (e.g., "6834464" in "Product ID: 6834464")
+                if contains_product_id(text):
+                    LOG.debug("  ⚠️ Skipping potential ID match in text: %s", text[:50])
+                    continue
+                p = safe_parse(text)
+                if p:
                     LOG.info("  ✅ SUCCESS PHASE 2: %s → ₦%.0f", sel, p)
                     return p
-    
+
     LOG.warning("  Phase 2 failed")
 
     # PHASE 3: Structured price elements from visible text
@@ -1343,23 +1442,28 @@ def _extract_konga_current_price(soup: BeautifulSoup, page_text: str) -> Optiona
         lines = [l.strip() for l in section.split('\n') if l.strip()]
         prices = []
         for line in lines:
-            p = _parse_price_string(line)
-            if p and 5000 <= p <= 100_000_000:
+            if contains_product_id(line):
+                continue
+            p = safe_parse(line)
+            if p:
                 prices.append(p)
         if prices:
             price = max(prices)  # or prices[0] if you prefer first/top one
             LOG.info("  ✅ SUCCESS PHASE 3: Structured elements → ₦%.0f", price)
             return price
-    
+
     LOG.warning("  Phase 3 failed")
 
-    # PHASE 4: Visible text regex (guaranteed to have text now)
+    # PHASE 4: Visible text regex with ID filtering
     LOG.info("📋 Phase 4: Visible text regex")
+    # Look for currency patterns but exclude lines containing the product ID
     matches = re.findall(r'(?:₦|NGN|N)[\s]*[:\-]?\s*([0-9][0-9,\.]*\s*[kK]?)', page_text, re.I)
     prices = []
     for m in matches:
-        p = _parse_price_string(m.replace(" ", ""))
-        if p and 5000 <= p <= 100_000_000:
+        if product_id and str(product_id) in m.replace(',', ''):
+            continue
+        p = safe_parse(m.replace(" ", ""))
+        if p:
             prices.append(p)
     if prices:
         price = max(prices)
@@ -1370,7 +1474,6 @@ def _extract_konga_current_price(soup: BeautifulSoup, page_text: str) -> Optiona
     LOG.error("┃ ❌ ALL PHASES FAILED — NO PRICE EXTRACTED                       ┃")
     LOG.error("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
     return None
-
 
 def extract_prices_from_visible_text(
     page_text: str,
@@ -1704,7 +1807,7 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
         if "konga" in domain:
             page_text = visible_text or soup.get_text(" ", strip=True)
             try:
-                p = _extract_konga_current_price(soup, page_text)
+                p = _extract_konga_current_price(soup, page_text, url)
                 if p:
                     product["current_price"] = p
                     LOG.info("Konga: Found price ₦%.0f", p)
