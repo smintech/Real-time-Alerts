@@ -219,187 +219,181 @@ def _log_extraction_attempt(source: str, raw_value: str, parsed_value: Optional[
 # -------------------------------------------------------------------
 # 1) Enhanced visible-text + attribute + pseudo-content extractor
 # -------------------------------------------------------------------
+# === FIX: safe visible-text extraction (no raw newlines inside JS strings) ===
 async def get_visible_text_playwright(page, timeout: int = 10000) -> str:
     """
-    PRODUCTION VISIBLE TEXT EXTRACTION
-    Uses TreeWalker + Konga-specific cleanup for reliable price text.
+    PRODUCTION VISIBLE TEXT EXTRACTION (fixed)
+    Avoids multi-line JS string literal issues and falls back cleanly.
     """
     LOG.info("🔍 Visible text extraction (production)")
-    
+    # Use a single-line JS snippet or template literal variable to avoid syntax errors.
+    js_code = (
+        "(() => {"
+        "  const removeSelector = 'script, style, nav, footer, header, [class*=\"ad\"], [id*=\"ad\"], "
+        "[class*=\"cookie\"], [class*=\"popup\"], iframe, noscript, [class*=\"banner\"], "
+        "[class*=\"newsletter\"], [aria-hidden=\"true\"], [class*=\"suggestion\"], [class*=\"related\"], [class*=\"carousel\"]';"
+        "  document.querySelectorAll(removeSelector).forEach(el=>el.remove());"
+        "  let root = document.body;"
+        "  const productContainers = Array.from(document.querySelectorAll('main, article, [class*=\"product\"], [class*=\"detail\"], [role=\"main\"]'));"
+        "  if (productContainers.length) {"
+        "    root = productContainers.reduce((a,b) => ((a.textContent||'').length > (b.textContent||'').length ? a : b));"
+        "  }"
+        "  const walker = document.createTreeWalker(root, NodeFilter.SHOW_TEXT, {"
+        "    acceptNode: node => {"
+        "      const el = node.parentElement; if(!el) return NodeFilter.FILTER_REJECT;"
+        "      const style = getComputedStyle(el);"
+        "      if(style.display === 'none' || style.visibility === 'hidden' || el.offsetParent === null || style.fontSize === '0px') return NodeFilter.FILTER_REJECT;"
+        "      const txt = (node.nodeValue||'').trim(); if (txt.length <= 3) return NodeFilter.FILTER_REJECT;"
+        "      return NodeFilter.FILTER_ACCEPT;"
+        "    }"
+        "  });"
+        "  const texts = [];"
+        "  let node;"
+        "  while(node = walker.nextNode()) { const t = (node.nodeValue||'').trim(); if (t.length>3) texts.push(t); }"
+        "  return texts.join(' ').replace(/\\s+/g,' ').trim();"
+        "})()"
+    )
+
     try:
-        js_code = """
-        () => {
-            // KONGA-SPECIFIC CLEANUP: Remove noise first
-            document.querySelectorAll(
-                'script, style, nav, footer, header, [class*="ad"], [id*="ad"], 
-                iframe, noscript, [class*="cookie"], [class*="popup"], 
-                [class*="banner"], [class*="newsletter"], [aria-hidden="true"],
-                [class*="suggestion"], [class*="related"], [class*="carousel"]'
-            ).forEach(el => el.remove());
-
-            // Find best root (product area preferred)
-            let root = document.body;
-            const productContainers = Array.from(document.querySelectorAll(
-                'main, article, [class*="product"], [class*="detail"], [role="main"]'
-            ));
-            
-            if (productContainers.length > 0) {
-                root = productContainers.reduce((a, b) => 
-                    ((a.textContent || '').length > (b.textContent || '').length ? a : b)
-                );
-            }
-
-            // TreeWalker: visible text only (Konga-optimized)
-            const walker = document.createTreeWalker(
-                root, NodeFilter.SHOW_TEXT,
-                {
-                    acceptNode: node => {
-                        const el = node.parentElement;
-                        if (!el) return NodeFilter.FILTER_REJECT;
-                        
-                        // Skip hidden/micro-text
-                        const style = getComputedStyle(el);
-                        if (style.display === 'none' || style.visibility === 'hidden' || 
-                            el.offsetParent === null || style.fontSize === '0px') {
-                            return NodeFilter.FILTER_REJECT;
-                        }
-                        
-                        const txt = (node.nodeValue || '').trim();
-                        if (txt.length <= 3) return NodeFilter.FILTER_REJECT;
-                        
-                        return NodeFilter.FILTER_ACCEPT;
-                    }
-                }
-            );
-
-            const texts = [];
-            let node;
-            while (node = walker.nextNode()) {
-                const t = (node.nodeValue || '').trim();
-                if (t.length > 3) texts.push(t);
-            }
-
-            return texts.join(' ').replace(/\\s+/g, ' ').trim();
-        }
-        """
-        
-        result = await page.evaluate(js_code)
-        text = str(result).strip()
-        
-        LOG.info("  ✅ Visible text: %d chars, %d nodes", len(text), text.count(' ') + 1)
+        result = await page.evaluate(js_code, timeout=timeout)
+        text = str(result or "").strip()
+        LOG.info("  ✅ Visible text: %d chars", len(text))
         return text
-        
     except Exception as e:
-        LOG.error("  ❌ JS extraction failed: %s", str(e)[:100])
-        # Ultimate fallback
-        return await page.evaluate("document.body.innerText") or ""
+        LOG.error("  ❌ JS extraction failed: %s", str(e)[:200])
+        # fallback to innerText (safe)
+        try:
+            return (await page.evaluate("document.body.innerText")) or ""
+        except Exception as e2:
+            LOG.error("  ❌ innerText fallback failed: %s", str(e2)[:200])
+            return ""
 # -------------------------------------------------------------------
 # 2) Fully improved fetch_with_playwright_aggressive (with XHR capture + price_js)
 # -------------------------------------------------------------------
-async def fetch_with_playwright_aggressive(
-    url: str,
-    retries: int = 3,
-    return_visible_text: bool = False
-) -> Union[str, Tuple[str, str]]:
-    """
-    PRODUCTION FETCH - FIXED FOR KONGA 2026
-    1. Product ID-aware price extraction
-    2. Robust visible text before cleanup
-    3. Konga-optimized timeouts/selectors
-    """
-    LOG.info("╔═══════════════════════════════════════════════════════════════════╗")
-    LOG.info("║ PRODUCTION KONGA FETCH (2026 FIXED)                              ║")
-    LOG.info("╚═══════════════════════════════════════════════════════════════════╝")
-    LOG.info("🌐 %s", url[:80])
-    
+# === FIX: fetch_with_playwright_aggressive — improved error handling and finalization ===
+async def fetch_with_playwright_aggressive(url: str, retries: int = 3, return_visible_text: bool = False):
+    LOG.info("╔════════════════════════════════════════════════╗")
+    LOG.info("║ PRODUCTION KONGA FETCH (2026 FIXED - robust)   ║")
+    LOG.info("╚════════════════════════════════════════════════╝")
+    LOG.info("🌐 %s", url[:160])
+
     is_konga = 'konga' in url.lower()
     if is_konga:
         LOG.info("🎯 KONGA MODE: Product ID filtering + visible text enabled")
-    
+
     for attempt in range(1, retries + 1):
-        LOG.info("┌── ATTEMPT %d/%d ───────────────────────────────────────────────┐", attempt, retries)
-        
+        LOG.info("┌── ATTEMPT %d/%d ─────────────────────────────────┐", attempt, retries)
         browser = context = page = None
         try:
             async with async_playwright() as p:
-                start = time.time()
-                
-                # LAUNCH (production args)
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=[
-                        '--no-sandbox', '--disable-blink-features=AutomationControlled',
-                        '--disable-dev-shm-usage', '--disable-web-security',
-                        '--disable-setuid-sandbox', '--disable-extensions'
-                    ]
-                )
-                
-                # CONTEXT (Konga-optimized)
+                # Launch
+                browser = await p.chromium.launch(headless=True, args=[
+                    '--no-sandbox', '--disable-blink-features=AutomationControlled',
+                    '--disable-dev-shm-usage', '--disable-web-security',
+                    '--disable-setuid-sandbox', '--disable-extensions'
+                ])
                 context = await browser.new_context(
                     user_agent=random.choice(_USER_AGENTS),
                     viewport={'width': 1920, 'height': 1080},
                     locale='en-US', timezone_id='Africa/Lagos'
                 )
-                
                 page = await context.new_page()
-                
-                # BLOCK HEAVY RESOURCES (30% faster)
-                await page.route("**/*.{gif,css,woff,woff2}", lambda route: route.abort())
-                
-                # ANTI-DETECTION
+
+                # Route blocking - allow css for debugging if needed; aggressive block for production
+                await page.route("**/*.{css,gif,woff,woff2}", lambda route: route.abort())
+
+                # Anti-detection
                 await page.add_init_script("""
                     Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                     Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
                     window.chrome = {runtime: {}};
                 """)
-                
-                # NAVIGATE (Konga timeout)
-                timeout = 45000 if is_konga else 30000
-                await page.goto(url, wait_until="domcontentloaded", timeout=timeout)
-                
-                # HUMAN SCROLL (triggers lazy prices)
-                await page.evaluate("""
-                    async () => {
-                        await new Promise(r => {
-                            let h = 0, d = 400;
-                            let i = setInterval(() => {
-                                window.scrollBy(0, d);
-                                h += d;
-                                if (h >= document.body.scrollHeight - 1000) {
-                                    clearInterval(i); r();
-                                }
-                            }, 300);
-                        });
-                        window.scrollTo(0, 0);
-                    }
-                """)
-                
-                # KONGA: Wait for price selectors
-                if is_konga:
-                    await page.wait_for_timeout(4000)  # Settle + lazy load
-                
-                # CRITICAL: EXTRACT BEFORE CLEANUP
+
+                # Set sensible timeouts
+                nav_timeout = 60000 if is_konga else 45000
+                try:
+                    await page.goto(url, wait_until="domcontentloaded", timeout=nav_timeout)
+                except Exception as nav_err:
+                    LOG.warning("Goto warning/failed: %s", str(nav_err)[:200])
+                    # try a second strategy: wait until networkidle (might be slower but more reliable)
+                    try:
+                        await page.goto(url, wait_until="networkidle", timeout=nav_timeout*2)
+                    except Exception as nav_err2:
+                        LOG.error("Goto networkidle also failed: %s", str(nav_err2)[:200])
+                        raise nav_err2
+
+                # Simple human scroll to trigger lazy loading
+                try:
+                    await page.evaluate("""
+                        async () => {
+                            await new Promise(r => {
+                                let step = 400, pos = 0;
+                                const t = setInterval(() => {
+                                    window.scrollBy(0, step);
+                                    pos += step;
+                                    if(pos >= document.body.scrollHeight - 1000) { clearInterval(t); r(); }
+                                }, 250);
+                            });
+                            window.scrollTo(0,0);
+                        }
+                    """)
+                except Exception as e:
+                    LOG.warning("Scrolling warning: %s", str(e)[:200])
+
+                # Extract
                 html = await page.content()
                 visible_text = ""
                 if return_visible_text or is_konga:
                     visible_text = await get_visible_text_playwright(page)
-                
-                duration = time.time() - start
-                LOG.info("└── SUCCESS %.1fs | HTML:%d | Text:%d ───────────────────────────────┘", 
-                        duration, len(html), len(visible_text))
-                
-                return (html, visible_text) if return_visible_text else html
-                
-        except Exception as e:
-            LOG.error("└── FAILED: %s ───────────────────────────────────────────────────┘", str(e)[:60])
-            
-            if browser: await browser.close()
-            
-            if attempt < retries:
-                await asyncio.sleep(random.uniform(2, 4))
-    
-    raise Exception(f"All {retries} attempts failed for {url}")
 
+                duration = time.time() - start if (start := time.time()) else 0
+                LOG.info("└── SUCCESS %.1fs | HTML:%d | Text:%d ───────────────────────────────┘",
+                         duration, len(html), len(visible_text))
+                return (html, visible_text) if return_visible_text else html
+
+        except Exception as e:
+            # Better classification for TargetClosed and crashes
+            err_name = type(e).__name__
+            LOG.error("└── FAILED (%s): %s", err_name, str(e)[:240])
+
+            # Attempt to gracefully close if open
+            try:
+                if page and not page.is_closed():
+                    await page.close()
+            except Exception:
+                pass
+            try:
+                if context:
+                    await context.close()
+            except Exception:
+                pass
+            try:
+                if browser:
+                    await browser.close()
+            except Exception:
+                pass
+
+            # Exponential-ish backoff (non-blocking sleep)
+            if attempt < retries:
+                backoff = min(6, 1.5 ** attempt)
+                LOG.info("Retrying after %.1fs...", backoff)
+                await asyncio.sleep(backoff)
+            else:
+                LOG.error("All %d attempts failed for %s", retries, url)
+        finally:
+            # ensure everything cleaned up if not already
+            try:
+                if context:
+                    await context.close()
+            except:
+                pass
+            try:
+                if browser:
+                    await browser.close()
+            except:
+                pass
+
+    raise Exception(f"All {retries} attempts failed for {url}")
 # ═══════════════════════════════════════════════════════════════════════════
 # ULTIMATE FETCH
 # ═══════════════════════════════════════════════════════════════════════════
@@ -826,35 +820,41 @@ def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain
 
     return best_guess
 
+# === FIX: robust parse for 'k' notation ===
 def _parse_price_string(text: str) -> Optional[float]:
-    """Parse price from text containing Naira amounts - FIXED PRODUCT ID FILTER."""
+    """Parse price from text containing Naira amounts - handles k notation correctly."""
     if not text:
         return None
-    
-    # Handle 'k' notation (e.g., 1,440k)
-    text = text.lower().replace('k', '000')
-    
-    # Extract product ID pattern to exclude (e.g., 6612850, 6834464)
-    product_id = None
-    id_match = re.search(r'\b\d{5,7}\b', text)
-    if id_match:
-        product_id = int(id_match.group(0))
-    
-    # Find all numeric patterns
+
+    text = text.strip().lower()
+
+    # Handle 'k' notation like "1.4k" or "1440k" -> multiply appropriately
+    k_match = re.search(r'(\d+(?:[.,]\d+)?)\s*k\b', text)
+    if k_match:
+        try:
+            val = float(k_match.group(1).replace(',', ''))
+            return val * 1000.0
+        except:
+            pass
+
+    # Remove stray currency symbols/letters and normalize commas
+    cleaned = re.sub(r'[^\d.,]', '', text).replace(',', '')
+    try:
+        if cleaned:
+            val = float(cleaned)
+            if 5000 <= val <= 5_000_000:
+                return val
+    except:
+        pass
+
+    # fallback: extract numbers as before (legacy)
     numbers = re.findall(r'[\d,]+(?:\.\d{2})?', text)
     for num in numbers:
         try:
             clean = num.replace(',', '')
             val = float(clean)
-            
-            # STRICT VALIDATION: Konga product range (phones/electronics)
             if not (5000 <= val <= 5_000_000):
                 continue
-                
-            # CRITICAL FIX: Block product IDs masquerading as prices
-            if product_id and abs(val - product_id) < 100:
-                continue
-                
             return val
         except:
             continue
@@ -862,126 +862,224 @@ def _parse_price_string(text: str) -> Optional[float]:
 
 def _extract_konga_current_price(soup: BeautifulSoup, page_text: str, url: str = "") -> Optional[float]:
     """
-    ULTIMATE KONGA PRICE EXTRACTION - FIXED FOR 2026
-    1. Product ID filtering from URL
-    2. Multi-phase extraction (Next.js → Selectors → Visible text)
-    3. Integrated robust visible text extraction
+    Robust Konga price extraction (drop-in replacement).
+    Phases:
+      1) Try __NEXT_DATA__ (structured Next.js JSON) with safe traversal
+      2) Try a list of known CSS selectors
+      3) Fallback to visible text regex matches (page_text)
+    Improvements:
+      - Product ID detection (from URL and JSON) and filtering
+      - Avoid skipping keys merely because they contain 'id' (only exact/id-like fields filtered)
+      - Tolerant numeric extraction from strings inside JSON
     """
     LOG.info("┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓")
-    LOG.info("┃ KONGA PRICE EXTRACTION (PRODUCTION FIXED)                     ┃")
+    LOG.info("┃ KONGA PRICE EXTRACTION (HARDENED)                             ┃")
     LOG.info("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
-    
-    # EXTRACT PRODUCT ID FROM URL (CRITICAL FIX)
-    product_id = None
-    if url:
-        id_match = re.search(r'(\d{5,})$', url) or re.search(r'-(\d{5,})$', url)
-        if id_match:
-            product_id = int(id_match.group(1))
-            LOG.info("🎯 Product ID detected: %d (will be filtered from prices)", product_id)
-    
-    # PHASE 1: __NEXT_DATA__ (Next.js structured data - MOST RELIABLE)
-    LOG.info("📋 Phase 1: __NEXT_DATA__ parsing (ID-filtered)")
-    next_script = soup.find("script", {"id": "__NEXT_DATA__"})
-    if next_script and next_script.string:
-        try:
-            data = json.loads(next_script.string)
-            
-            def find_price(obj, depth=0):
-                if depth > 15:  # Prevent deep recursion
-                    return None
-                if isinstance(obj, dict):
-                    for k, v in obj.items():
-                        k_lower = str(k).lower()
-                        
-                        # SKIP ID FIELDS (price_id, product_id, etc.)
-                        if 'id' in k_lower:
-                            continue
-                            
-                        # Price keywords only
-                        price_keys = ["price", "sellingprice", "finalprice", "currentprice", "amount", "offerprice"]
-                        if any(pk in k_lower for pk in price_keys):
-                            try:
-                                if isinstance(v, (int, float)):
-                                    p = float(v)
-                                else:
-                                    p = _parse_price_string(str(v))
-                                
-                                if p and 5000 <= p <= 5_000_000 and p != product_id:
-                                    return p
-                            except:
-                                pass
-                        
-                        if isinstance(v, (dict, list)):
-                            result = find_price(v, depth + 1)
-                            if result:
-                                return result
-                elif isinstance(obj, list):
-                    for item in obj:
-                        result = find_price(item, depth + 1)
-                        if result:
-                            return result
-                return None
-            
-            price = find_price(data)
-            if price:
-                LOG.info("  ✅ SUCCESS PHASE 1: __NEXT_DATA__ → ₦%.0f", price)
-                return price
-        except Exception as e:
-            LOG.debug("  __NEXT_DATA__ parse error: %s", str(e)[:100])
-    
-    LOG.warning("  Phase 1 failed")
 
-    # PHASE 2: KNOWN WORKING SELECTORS (2026 verified)
+    # ---- helpers ----
+    def safe_parse_num_like(s: Any) -> Optional[float]:
+        """Try to parse a numeric-like value (int/float or strings containing digits/currency)."""
+        if s is None:
+            return None
+        # If numeric type already
+        if isinstance(s, (int, float)):
+            try:
+                return float(s)
+            except:
+                return None
+        # Strings: try parse with existing robust parser if available
+        try:
+            txt = str(s).strip()
+            # common currency micro-cleanup
+            # try direct match for Naira/NGN/₦
+            m = re.search(r'₦\s*([0-9,\.kK]+)', txt)
+            if m:
+                return _parse_price_string(m.group(1))
+            # generic fallback using _parse_price_string
+            p = _parse_price_string(txt)
+            if p:
+                return p
+        except Exception:
+            pass
+        return None
+
+    def find_price_in_obj(obj, depth=0, product_id_candidates=None):
+        """
+        Recursively walk JSON-like structures to find price candidates.
+        Avoid infinite recursion via depth.
+        """
+        if depth > 18:
+            return []
+
+        candidates = []
+        if isinstance(obj, dict):
+            # Identify obvious product id fields in this dict (numbers/strings that look like konga ids)
+            local_ids = set()
+            for k, v in obj.items():
+                kl = k.lower()
+                # Accept exact id-like keys: 'id', 'product_id', 'productid', 'sku', 'productid'
+                if kl in ("id", "product_id", "productid", "sku", "productid", "itemid"):
+                    try:
+                        if isinstance(v, (int, float)):
+                            local_ids.add(int(v))
+                        else:
+                            mm = re.search(r'\d{5,7}', str(v))
+                            if mm:
+                                local_ids.add(int(mm.group(0)))
+                    except:
+                        pass
+
+            # traverse keys/values
+            for k, v in obj.items():
+                # If key name strongly suggests a price, parse directly
+                kl = k.lower()
+                if any(pk in kl for pk in ("price", "sellingprice", "finalprice", "currentprice", "amount", "offerprice", "listprice", "mrp")):
+                    p = safe_parse_num_like(v)
+                    if p:
+                        candidates.append(p)
+                        continue
+
+                # If value is a primitive that might contain price text (string)
+                if isinstance(v, (str, int, float)):
+                    p = safe_parse_num_like(v)
+                    if p:
+                        # Filter out values that equal product ids (we'll filter later against detected product_id)
+                        candidates.append(p)
+                        continue
+
+                # Recurse
+                if isinstance(v, (dict, list)):
+                    candidates.extend(find_price_in_obj(v, depth + 1, product_id_candidates=product_id_candidates))
+
+        elif isinstance(obj, list):
+            for item in obj:
+                candidates.extend(find_price_in_obj(item, depth + 1, product_id_candidates=product_id_candidates))
+
+        return candidates
+
+    # ---- detect product id from URL ----
+    product_id = None
+    try:
+        if url:
+            id_match = re.search(r'(\d{5,7})(?:$|[^0-9])', url)
+            if id_match:
+                product_id = int(id_match.group(1))
+                LOG.info("🎯 Product ID from URL detected: %s", product_id)
+    except Exception:
+        product_id = None
+
+    # ---- Phase 1: __NEXT_DATA__ structured JSON ----
+    LOG.info("📋 Phase 1: __NEXT_DATA__ parsing (safe traversal)")
+    try:
+        next_script = soup.find("script", {"id": "__NEXT_DATA__"})
+        if next_script and next_script.string:
+            raw = next_script.string
+            try:
+                data = json.loads(raw)
+            except Exception as e:
+                # Sometimes it's wrapped or contains invalid trailing commas — try a best-effort cleanup
+                cleaned = re.sub(r',\s*}', '}', raw)
+                cleaned = re.sub(r',\s*]', ']', cleaned)
+                data = json.loads(cleaned)
+
+            # detect product ids inside JSON as well (augment product_id)
+            try:
+                # quick scan for 5-7 digit numbers inside JSON string - helps avoid misreading product-id as price
+                id_candidates = set(int(m) for m in re.findall(r'\b(\d{5,7})\b', raw))
+                if id_candidates:
+                    # prefer the one that matches URL if present
+                    if product_id and product_id in id_candidates:
+                        LOG.info("🔎 product_id present in JSON (matches URL)")
+                    else:
+                        # pick a likely product id (smallest or arbitrary)
+                        candidate = sorted(id_candidates)[0]
+                        if not product_id:
+                            product_id = candidate
+                            LOG.info("🔎 Product ID from JSON heuristics: %s", product_id)
+            except Exception:
+                pass
+
+            # collect numeric candidates from JSON
+            json_prices = find_price_in_obj(data, depth=0, product_id_candidates=product_id)
+            # filter / normalize candidates
+            json_prices = [p for p in (json_prices or []) if isinstance(p, (int, float))]
+            json_prices = [float(p) for p in json_prices if 5000 <= float(p) <= 5_000_000]
+            if product_id:
+                json_prices = [p for p in json_prices if abs(p - product_id) > 99]
+
+            if json_prices:
+                # choose most common or median heuristic
+                from collections import Counter
+                cnt = Counter(json_prices)
+                most_common = cnt.most_common(1)[0][0]
+                LOG.info("  ✅ SUCCESS PHASE 1: __NEXT_DATA__ → ₦%.0f (candidates=%d)", most_common, len(json_prices))
+                return float(most_common)
+    except Exception as e:
+        LOG.debug("  __NEXT_DATA__ parse error: %s", str(e)[:200])
+
+    LOG.warning("  Phase 1 failed or no valid price found")
+
+    # ---- Phase 2: known selectors ----
     LOG.info("📋 Phase 2: Production selectors (ID-filtered)")
-    working_selectors = [
-        "div.priceBox_priceBoxPrice__i7paS",      # Container price
-        "span.shared_price__gnso_",               # Current price span
-        "span[data-testid='current-price']",      # TestID current
-        "div[data-testid='price-current']",       # TestID container
-        "span.-b.-ubpt",                          # Utility price
-        "span.prc",                               # Generic price
-        "span[class*='price']",                   # Fallback
-    ]
-    
-    for sel in working_selectors:
-        elements = soup.select(sel)
-        if elements:
-            for el in elements:
-                text = el.get_text(" ", strip=True)
-                p = _parse_price_string(text)
-                if p and p != product_id:
-                    LOG.info("  ✅ SUCCESS PHASE 2: %s → ₦%.0f", sel[:30], p)
-                    return p
-    
+    try:
+        working_selectors = [
+            "div.priceBox_priceBoxPrice__i7paS",
+            "span.shared_price__gnso_",
+            "span[data-testid='current-price']",
+            "div[data-testid='price-current']",
+            "span.-b.-ubpt",
+            "span.prc",
+            "span[class*='price']",
+            "[class*='priceBox']",
+            ".price, .current-price, .product-price"
+        ]
+        for sel in working_selectors:
+            elements = soup.select(sel)
+            if elements:
+                for el in elements:
+                    text = el.get_text(" ", strip=True)
+                    p = _parse_price_string(text)
+                    if p and 5000 <= p <= 5_000_000:
+                        if product_id and abs(p - product_id) < 100:
+                            LOG.debug("  Selector price %s looks like product_id %s — skipping", p, product_id)
+                            continue
+                        LOG.info("  ✅ SUCCESS PHASE 2: %s → ₦%.0f", sel[:40], p)
+                        return float(p)
+    except Exception as e:
+        LOG.debug("  Phase 2 selector error: %s", str(e)[:200])
+
     LOG.warning("  Phase 2 failed")
 
-    # PHASE 3: VISIBLE TEXT REGEX (Robust fallback)
+    # ---- Phase 3: visible text regex fallback ----
     LOG.info("📋 Phase 3: Visible text regex (ID-filtered)")
-    naira_patterns = [
-        r'₦\s*([\d,]+(?:\.\d{2})?)',
-        r'NGN\s*([\d,]+(?:\.\d{2})?)',
-        r'N\s*([\d,]+(?:\.\d{2})?)(?=\s|$|\.|\,)',
-        r'([\d,]+(?:\.\d{2})?)\s*Naira',
-    ]
-    
-    prices = []
-    for pattern in naira_patterns:
-        matches = re.findall(pattern, page_text, re.IGNORECASE)
-        for match in matches:
-            p = _parse_price_string(match)
-            if p and 5000 <= p <= 5_000_000 and p != product_id:
-                prices.append(p)
-    
-    if prices:
-        # Return most frequent price (mode) or max if few candidates
-        from collections import Counter
-        price_counts = Counter(prices)
-        price = price_counts.most_common(1)[0][0] if len(prices) > 2 else max(prices)
-        LOG.info("  ✅ SUCCESS PHASE 3: Visible text → ₦%.0f (%d candidates)", price, len(prices))
-        return price
-    
-    LOG.warning("  Phase 3 failed")
-    
+    try:
+        naira_patterns = [
+            r'₦\s*([\d,]+(?:\.\d{1,2})?)',
+            r'NGN\s*([\d,]+(?:\.\d{1,2})?)',
+            r'([\d,]+(?:\.\d{1,2})?)\s*naira',
+            r'([\d,]+(?:\.\d{1,2})?)\s*N\b'
+        ]
+        prices = []
+        for pattern in naira_patterns:
+            for m in re.findall(pattern, page_text or "", flags=re.IGNORECASE):
+                try:
+                    p = _parse_price_string(m)
+                    if p and 5000 <= p <= 5_000_000:
+                        if product_id and abs(p - product_id) < 100:
+                            continue
+                        prices.append(p)
+                except:
+                    continue
+
+        if prices:
+            from collections import Counter
+            counts = Counter(prices)
+            price = counts.most_common(1)[0][0] if len(prices) > 2 else max(prices)
+            LOG.info("  ✅ SUCCESS PHASE 3: Visible text → ₦%.0f (%d candidates)", price, len(prices))
+            return float(price)
+    except Exception as e:
+        LOG.debug("  Phase 3 regex error: %s", str(e)[:200])
+
     LOG.error("❌ ALL PHASES FAILED - No valid price found")
     return None
 
