@@ -769,7 +769,7 @@ async def fetch_with_playwright_aggressive(
                 # Extract visible text if requested (BEFORE cleanup!)
                 if return_visible_text:
                     try:
-                        visible_text = await get_visible_text_from_playwright_page(page, timeout=5000)
+                        visible_text = await page.evaluate("() => Array.from(document.querySelectorAll('body *')).map(el => el.innerText).join('\\n').trim()")
                         LOG.info("  ✅ Visible text extracted: %d characters", len(visible_text or ""))
                     except Exception as e:
                         LOG.error("  ❌ Visible text extraction failed: %s", str(e)[:200])
