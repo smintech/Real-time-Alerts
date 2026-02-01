@@ -814,21 +814,24 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════════════════
 # SCHOOL UPDATES POSTING
 # ═══════════════════════════════════════════════════════════════════════════
-
-# bot/scheduler.py - FIXES FOR FORCE MODE & JAMB SCRAPING
-
 async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     """
     Job: Scrapes school sources, extracts updates per source,
     and posts separate messages for sources with new/changed content.
     Uses dual-layer persistence with deduplication.
-    
-    FIXED: Force mode now properly bypasses recency checks
     """
-    LOG.info("--- SCHOOL UPDATES JOB STARTED ---")
-
+    LOG.info("=" * 70)
+    LOG.info("🏫 SCHOOL UPDATES JOB STARTED")
+    LOG.info("=" * 70)
+    
+    # Debug configuration state
+    force_mode = TEST_MODE or SCHOOL_FORCE_POST
+    LOG.info(f"Configuration: TEST_MODE={TEST_MODE}, SCHOOL_FORCE_POST={SCHOOL_FORCE_POST}")
+    LOG.info(f"Force Mode: {'🔴 ENABLED (bypassing checks)' if force_mode else '⚪ DISABLED'}")
+    LOG.info(f"AUTO_POST_TO_CHANNEL={AUTO_POST_TO_CHANNEL}, CHANNEL_DEAL_CHAT_ID={CHANNEL_DEAL_CHAT_ID}")
+    
     if not AUTO_POST_TO_CHANNEL or not CHANNEL_DEAL_CHAT_ID:
-        LOG.info("Channel posting disabled — skipping school updates")
+        LOG.error("❌ Channel posting disabled or CHANNEL_DEAL_CHAT_ID missing — aborting")
         return
 
     max_posts = MAX_CHANNEL_POSTS_PER_RUN or 5
@@ -836,33 +839,55 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     eligible_candidates = []
     now = datetime.now(TIMEZONE)
     
-    # Check if force mode is enabled
-    force_mode = TEST_MODE or SCHOOL_FORCE_POST
-    if force_mode:
-        LOG.warning("🔴 FORCE MODE ENABLED - Bypassing recency and duplicate checks")
+    # Verify sources configuration
+    LOG.info(f"📋 DEFAULT_SCHOOL_SOURCES loaded: {len(DEFAULT_SCHOOL_SOURCES)} source(s)")
+    if not DEFAULT_SCHOOL_SOURCES:
+        LOG.error("❌ DEFAULT_SCHOOL_SOURCES is empty! Check your configuration.")
+        return
+        
+    for src_name, urls in DEFAULT_SCHOOL_SOURCES.items():
+        url_count = len(urls) if urls else 0
+        LOG.info(f"  📌 {src_name}: {url_count} URL(s) {urls if urls else '[EMPTY]'}")
 
+    processed_count = 0
+    error_count = 0
+    skipped_count = 0
+    
     # Scrape all sources
     for source_name, urls in DEFAULT_SCHOOL_SOURCES.items():
+        processed_count += 1
+        LOG.info(f"\n{'─' * 70}")
+        LOG.info(f"🔍 [{processed_count}/{len(DEFAULT_SCHOOL_SOURCES)}] Processing: {source_name}")
+        LOG.info(f"{'─' * 70}")
+        
         if not urls:
+            LOG.warning(f"⚠️  Skipping {source_name}: No URLs configured")
+            skipped_count += 1
             continue
 
         try:
-            LOG.info(f"\n{'='*70}")
-            LOG.info(f"Processing: {source_name}")
-            LOG.info(f"{'='*70}")
+            LOG.info(f"🌐 Scraping {len(urls)} URL(s) for {source_name}...")
+            LOG.debug(f"URLs: {urls}")
             
             # Use the improved scrape_school_news function
             items = await scrape_school_news(
                 urls,
-                fetch_full_content=False,  # Just get listings with improved snippets
+                fetch_full_content=False,
                 max_articles=10
             )
             
+            LOG.info(f"📊 Scraped {len(items) if items else 0} items from {source_name}")
+            
             if not items:
-                LOG.info("No items for %s", source_name)
+                LOG.info(f"⏭️  No items returned for {source_name} — skipping")
+                skipped_count += 1
                 continue
             
-            LOG.info(f"Found {len(items)} items for {source_name}")
+            # Log first few items for debugging
+            for idx, item in enumerate(items[:3], 1):
+                title = item.get('title', 'N/A')[:50]
+                link = item.get('link', 'N/A')[:60]
+                LOG.debug(f"  Item {idx}: {title}... | {link}...")
 
             # Generate report
             report_lines = [
@@ -880,7 +905,6 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
 
                 snippet = item.get("snippet", "").strip()
                 if snippet and len(snippet) > 30:
-                    # Clean up snippet
                     snippet = snippet.replace("Read More", "").replace("Click to read", "").strip()
                     report_lines.append(f"  └─ {snippet[:200]}... <a href=\"{item['link']}\">Read more</a>")
                 else:
@@ -899,13 +923,16 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             content_hash = compute_content_hash({
                 "title": source_name,
                 "item_count": len(items),
-                "raw": {"items": items[:5]}  # Use first 5 for hash
+                "raw": {"items": items[:5]}
             })
+            LOG.debug(f"📝 Content hash for {source_name}: {content_hash[:16]}...")
 
             # Check if duplicate (SKIP IF FORCE MODE)
             snapshot_key = f"school_{_slugify(source_name)}"
+            LOG.info(f"🔑 Snapshot key: {snapshot_key}")
             
             if not force_mode:
+                LOG.info(f"🔍 Checking for duplicates (lookback: 24h)...")
                 is_duplicate = await check_duplicate_post(
                     ref=snapshot_key,
                     content_hash=content_hash,
@@ -913,22 +940,37 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 )
 
                 if is_duplicate:
-                    LOG.info("Skipping duplicate school update for %s", source_name)
+                    LOG.info(f"⏭️  DUPLICATE DETECTED for {source_name} — skipping")
+                    skipped_count += 1
                     continue
+                else:
+                    LOG.info(f"✅ Not a duplicate")
+            else:
+                LOG.info(f"🚫 Skipping duplicate check (force mode)")
 
             # Check recency (SKIP IF FORCE MODE)
             if not force_mode:
+                LOG.info(f"⏰ Checking recency (min 12h)...")
                 snapshot = await load_channel_snapshot(snapshot_key)
                 if snapshot and snapshot.get("last_posted_at"):
                     try:
                         last_dt = datetime.fromisoformat(snapshot["last_posted_at"])
                         hours_since = (now - last_dt).total_seconds() / 3600
-                        if hours_since < 12:  # Minimum 12 hours between posts
-                            LOG.info("Skipping %s — posted %.1f hours ago", source_name, hours_since)
+                        LOG.info(f"🕐 Last posted: {hours_since:.1f} hours ago")
+                        if hours_since < 12:
+                            LOG.info(f"⏭️  TOO RECENT for {source_name} — skipping (needs 12h)")
+                            skipped_count += 1
                             continue
-                    except Exception:
-                        pass
+                        else:
+                            LOG.info(f"✅ Recency check passed ({hours_since:.1f}h > 12h)")
+                    except Exception as e:
+                        LOG.warning(f"⚠️  Error parsing last_posted_at: {e}")
+                else:
+                    LOG.info(f"✅ No previous snapshot found (new source)")
+            else:
+                LOG.info(f"🚫 Skipping recency check (force mode)")
 
+            LOG.info(f"✅ {source_name} ELIGIBLE for posting ({len(items)} items)")
             eligible_candidates.append({
                 "source_name": source_name,
                 "report_text": report_text,
@@ -937,27 +979,58 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 "item_count": len(items),
             })
 
-        except Exception:
-            LOG.exception("Failed to process %s", source_name)
+        except Exception as e:
+            error_count += 1
+            LOG.error(f"❌ EXCEPTION processing {source_name}: {str(e)}")
+            LOG.exception(f"Full traceback for {source_name}:")
+            continue
+
+    # Summary before posting
+    LOG.info(f"\n{'=' * 70}")
+    LOG.info(f"📊 PROCESSING SUMMARY")
+    LOG.info(f"{'=' * 70}")
+    LOG.info(f"Sources processed: {processed_count}")
+    LOG.info(f"Sources skipped:   {skipped_count}")
+    LOG.info(f"Errors:            {error_count}")
+    LOG.info(f"Eligible to post:  {len(eligible_candidates)}")
 
     if not eligible_candidates:
-        LOG.info("No eligible school sources to post")
+        LOG.error("❌ NO ELIGIBLE CANDIDATES — Nothing to post!")
+        LOG.info("Possible reasons:")
+        LOG.info("  • All sources returned empty items")
+        LOG.info("  • All sources failed with exceptions")
+        LOG.info("  • All sources marked as duplicates (if not in force mode)")
+        LOG.info("  • All sources too recent (if not in force mode)")
         return
 
     # Sort by most items
     eligible_candidates.sort(key=lambda x: -x["item_count"])
     to_post = eligible_candidates[:max_posts]
+    
+    LOG.info(f"📤 Will post {len(to_post)} source(s) (max allowed: {max_posts})")
 
     posted_count = 0
     targets = CHANNEL_DEAL_CHAT_ID if isinstance(CHANNEL_DEAL_CHAT_ID, list) else [CHANNEL_DEAL_CHAT_ID]
+    LOG.info(f"📡 Target channel(s): {targets}")
 
-    for item in to_post:
+    for idx, item in enumerate(to_post, 1):
+        source_name = item['source_name']
+        LOG.info(f"\n{'─' * 70}")
+        LOG.info(f"📨 [{idx}/{len(to_post)}] Posting: {source_name}")
+        LOG.info(f"{'─' * 70}")
+        
         emoji = "🔴" if force_mode else ("🆕" if item.get("is_new") else "🔄")
         message = f"{emoji} <b>School Updates — {item['source_name']}</b>\n━━━━━━━━━━━━━━━━━━\n\n{item['report_text']}"
-
+        
+        message_length = len(message)
+        LOG.info(f"📝 Message length: {message_length} chars")
+        if message_length > 4000:
+            LOG.warning(f"⚠️  Message exceeds 4096 limit! Actual: {message_length}")
+        
         sent_successfully = False
         for chat_id in targets:
             try:
+                LOG.info(f"📤 Sending to chat_id: {chat_id}...")
                 await context.bot.send_message(
                     chat_id=chat_id,
                     text=message,
@@ -965,11 +1038,15 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                     disable_web_page_preview=True,
                 )
                 sent_successfully = True
-                LOG.info("Posted school update: %s", item['source_name'])
+                LOG.info(f"✅ SUCCESSFULLY posted to {chat_id}")
             except Exception as e:
-                LOG.error("Failed posting school update: %s", e)
+                LOG.error(f"❌ FAILED to post to {chat_id}: {str(e)}")
+                LOG.exception(f"Full error for chat_id {chat_id}:")
 
         if sent_successfully:
+            posted_count += 1
+            LOG.info(f"💾 Post successful for {source_name}")
+            
             # Don't save snapshot in force mode (to allow re-posting)
             if not force_mode:
                 snapshot_data = {
@@ -978,15 +1055,23 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                     "site": item["source_name"],
                     "title": f"School Updates - {item['source_name']}",
                 }
-                await mark_as_posted(item["snapshot_key"], snapshot_data)
+                try:
+                    await mark_as_posted(item["snapshot_key"], snapshot_data)
+                    LOG.info(f"💾 Snapshot saved for {source_name}")
+                except Exception as e:
+                    LOG.error(f"❌ Failed to save snapshot: {e}")
             else:
-                LOG.info("Force mode: Skipping snapshot save for re-posting capability")
+                LOG.info(f"🚫 Force mode: Skipping snapshot save")
             
-            posted_count += 1
             if posted_count < len(to_post):
+                LOG.info(f"⏳ Waiting {send_delay}s before next post...")
                 await asyncio.sleep(send_delay)
+        else:
+            LOG.error(f"❌ Failed to post {source_name} to any target")
 
-    LOG.info("--- SCHOOL JOB FINISHED: %d sources posted ---", posted_count)
+    LOG.info(f"\n{'=' * 70}")
+    LOG.info(f"🏁 JOB COMPLETE: {posted_count}/{len(to_post)} source(s) posted")
+    LOG.info(f"{'=' * 70}\n")
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TRIAL MANAGEMENT
