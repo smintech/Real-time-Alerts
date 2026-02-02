@@ -37,29 +37,29 @@ CHANNEL_DEAL_CHAT_ID = [int(x.strip()) for x in os.getenv("CHANNEL", "").split("
 CHANNEL_MONITORED_URLS = {
     # Phones
     "iphone-15-pro-max-256": [
-        #"https://www.jumia.com.ng/apple-iphone-15-pro-max-6.7-256gb-nano-sim-esim-5g-natural-381382767.html",
+        "https://www.jumia.com.ng/apple-iphone-15-pro-max-6.7-256gb-nano-sim-esim-5g-natural-381382767.html",
         "https://www.konga.com/product/apple-iphone-15-pro-max-6-7-256gb-rom-8gb-ram-1-sim-esim-5g-4441mah-blue-6612850"
     ],
     "iphone-15-pro-128": [
-        #"https://www.jumia.com.ng/apple-iphone-15-pro-6.1-128gb-rom-8gb-ram-nano-sim-white-389800758.html",
+        "https://www.jumia.com.ng/apple-iphone-15-pro-6.1-128gb-rom-8gb-ram-nano-sim-white-389800758.html",
         "https://www.konga.com/product/apple-iphone-15-pro-6-1-128gb-rom-8gb-ram-nano-sim-5g-6826852"
     ],
 
     # Gaming
     "ps5-slim-1tb": [
-        #"https://www.jumia.com.ng/sony-playstation-5-slim-ps5-slim-console-1tb-410637026.html",
+        "https://www.jumia.com.ng/sony-playstation-5-slim-ps5-slim-console-1tb-410637026.html",
         "https://www.konga.com/product/sony-playstation-5-slim-ps5-slim-console-1tb-6834464"
     ],
 
     # Laptops
     "macbook-air-m3-256": [
-        #"https://www.jumia.com.ng/apple-macbook-air-13-m3-chip-8gb-256gb-space-gray-389242856.html",
+        "https://www.jumia.com.ng/apple-macbook-air-13-m3-chip-8gb-256gb-space-gray-389242856.html",
         "https://www.konga.com/product/apple-macbook-air-m3-chip-with-8-core-cpu-and-8-core-gpu-256gb-ssd-silver-13-inch-6656405"
     ],
 
     # Earbuds
     "freepods-4": [
-        #"https://www.jumia.com.ng/oraimo-freepods-4-anc-wireless-stereo-earbuds-413570378.html",
+        "https://www.jumia.com.ng/oraimo-freepods-4-anc-wireless-stereo-earbuds-413570378.html",
         "https://www.konga.com/product/oraimo-freepods-4-anc-true-wireless-stereo-earbuds-6624829"
     ],
 
