@@ -847,17 +847,18 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
         
     for src_name, urls in DEFAULT_SCHOOL_SOURCES.items():
         url_count = len(urls) if urls else 0
-        LOG.info(f"  📌 {src_name}: {url_count} URL(s) {urls if urls else '[EMPTY]'}")
+        LOG.info(f"  📌 {src_name}: {url_count} URL(s)")
 
     processed_count = 0
     error_count = 0
     skipped_count = 0
     
-    # Scrape all sources
-    for source_name, urls in DEFAULT_SCHOOL_SOURCES.items():
+    # Scrape all sources with individual exception isolation
+    source_list = list(DEFAULT_SCHOOL_SOURCES.items())
+    for idx, (source_name, urls) in enumerate(source_list, 1):
         processed_count += 1
         LOG.info(f"\n{'─' * 70}")
-        LOG.info(f"🔍 [{processed_count}/{len(DEFAULT_SCHOOL_SOURCES)}] Processing: {source_name}")
+        LOG.info(f"🔍 [{idx}/{len(source_list)}] Processing: {source_name}")
         LOG.info(f"{'─' * 70}")
         
         if not urls:
@@ -865,30 +866,24 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             skipped_count += 1
             continue
 
+        source_success = False
         try:
-            LOG.info(f"🌐 Scraping {len(urls)} URL(s) for {source_name}...")
-            LOG.debug(f"URLs: {urls}")
+            LOG.info(f"🌐 Scraping {len(urls)} URL(s)...")
             
-            # Use the improved scrape_school_news function
             items = await scrape_school_news(
                 urls,
                 fetch_full_content=False,
                 max_articles=10
             )
             
-            LOG.info(f"📊 Scraped {len(items) if items else 0} items from {source_name}")
+            item_count = len(items) if items else 0
+            LOG.info(f"📊 Found {item_count} items")
             
             if not items:
-                LOG.info(f"⏭️  No items returned for {source_name} — skipping")
+                LOG.info(f"⏭️  No items returned — skipping")
                 skipped_count += 1
                 continue
             
-            # Log first few items for debugging
-            for idx, item in enumerate(items[:3], 1):
-                title = item.get('title', 'N/A')[:50]
-                link = item.get('link', 'N/A')[:60]
-                LOG.debug(f"  Item {idx}: {title}... | {link}...")
-
             # Generate report
             report_lines = [
                 f"<b>{source_name}</b>",
@@ -897,7 +892,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 "",
             ]
 
-            for item in items[:10]:  # Limit to 10 per source
+            for item in items[:10]:
                 title_line = f"• <b>{item['title']}</b>"
                 if item.get("date"):
                     title_line += f" — <i>{item['date']}</i>"
@@ -919,54 +914,50 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
 
             report_text = "\n".join(report_lines)
             
-            # Compute hash for dedup
+            # Check message length (Telegram limit: 4096)
+            if len(report_text) > 4000:
+                LOG.warning(f"⚠️  Message too long ({len(report_text)} chars), truncating...")
+                report_text = report_text[:4000] + "...\n\n<i>Message truncated</i>"
+
+            # Compute hash
             content_hash = compute_content_hash({
                 "title": source_name,
                 "item_count": len(items),
                 "raw": {"items": items[:5]}
             })
-            LOG.debug(f"📝 Content hash for {source_name}: {content_hash[:16]}...")
 
-            # Check if duplicate (SKIP IF FORCE MODE)
             snapshot_key = f"school_{_slugify(source_name)}"
             LOG.info(f"🔑 Snapshot key: {snapshot_key}")
             
+            # Duplicate check
             if not force_mode:
-                LOG.info(f"🔍 Checking for duplicates (lookback: 24h)...")
+                LOG.info(f"🔍 Checking for duplicates...")
                 is_duplicate = await check_duplicate_post(
                     ref=snapshot_key,
                     content_hash=content_hash,
                     lookback_hours=24
                 )
-
                 if is_duplicate:
-                    LOG.info(f"⏭️  DUPLICATE DETECTED for {source_name} — skipping")
+                    LOG.info(f"⏭️  Duplicate detected — skipping")
                     skipped_count += 1
                     continue
-                else:
-                    LOG.info(f"✅ Not a duplicate")
             else:
                 LOG.info(f"🚫 Skipping duplicate check (force mode)")
 
-            # Check recency (SKIP IF FORCE MODE)
+            # Recency check
             if not force_mode:
-                LOG.info(f"⏰ Checking recency (min 12h)...")
+                LOG.info(f"⏰ Checking recency...")
                 snapshot = await load_channel_snapshot(snapshot_key)
                 if snapshot and snapshot.get("last_posted_at"):
                     try:
                         last_dt = datetime.fromisoformat(snapshot["last_posted_at"])
                         hours_since = (now - last_dt).total_seconds() / 3600
-                        LOG.info(f"🕐 Last posted: {hours_since:.1f} hours ago")
                         if hours_since < 12:
-                            LOG.info(f"⏭️  TOO RECENT for {source_name} — skipping (needs 12h)")
+                            LOG.info(f"⏭️  Too recent ({hours_since:.1f}h < 12h) — skipping")
                             skipped_count += 1
                             continue
-                        else:
-                            LOG.info(f"✅ Recency check passed ({hours_since:.1f}h > 12h)")
                     except Exception as e:
-                        LOG.warning(f"⚠️  Error parsing last_posted_at: {e}")
-                else:
-                    LOG.info(f"✅ No previous snapshot found (new source)")
+                        LOG.warning(f"⚠️  Error parsing timestamp: {e}")
             else:
                 LOG.info(f"🚫 Skipping recency check (force mode)")
 
@@ -978,12 +969,15 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 "snapshot_key": snapshot_key,
                 "item_count": len(items),
             })
+            source_success = True
 
         except Exception as e:
             error_count += 1
-            LOG.error(f"❌ EXCEPTION processing {source_name}: {str(e)}")
-            LOG.exception(f"Full traceback for {source_name}:")
+            LOG.error(f"❌ EXCEPTION in {source_name}: {str(e)}")
+            LOG.exception(f"Full traceback:")
             continue
+        
+        LOG.info(f"🏁 Completed {source_name}: {'✅ SUCCESS' if source_success else '❌ FAILED/SKIPPED'}")
 
     # Summary before posting
     LOG.info(f"\n{'=' * 70}")
@@ -993,85 +987,106 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     LOG.info(f"Sources skipped:   {skipped_count}")
     LOG.info(f"Errors:            {error_count}")
     LOG.info(f"Eligible to post:  {len(eligible_candidates)}")
+    LOG.info(f"Eligible list:     {[e['source_name'] for e in eligible_candidates]}")
 
     if not eligible_candidates:
         LOG.error("❌ NO ELIGIBLE CANDIDATES — Nothing to post!")
-        LOG.info("Possible reasons:")
-        LOG.info("  • All sources returned empty items")
-        LOG.info("  • All sources failed with exceptions")
-        LOG.info("  • All sources marked as duplicates (if not in force mode)")
-        LOG.info("  • All sources too recent (if not in force mode)")
         return
 
-    # Sort by most items
-    eligible_candidates.sort(key=lambda x: -x["item_count"])
-    to_post = eligible_candidates[:max_posts]
+    # POSTING PHASE
+    LOG.info(f"\n{'=' * 70}")
+    LOG.info(f"📤 ENTERING POSTING PHASE")
+    LOG.info(f"{'=' * 70}")
     
-    LOG.info(f"📤 Will post {len(to_post)} source(s) (max allowed: {max_posts})")
-
-    posted_count = 0
-    targets = CHANNEL_DEAL_CHAT_ID if isinstance(CHANNEL_DEAL_CHAT_ID, list) else [CHANNEL_DEAL_CHAT_ID]
-    LOG.info(f"📡 Target channel(s): {targets}")
-
-    for idx, item in enumerate(to_post, 1):
-        source_name = item['source_name']
-        LOG.info(f"\n{'─' * 70}")
-        LOG.info(f"📨 [{idx}/{len(to_post)}] Posting: {source_name}")
-        LOG.info(f"{'─' * 70}")
+    try:
+        # Sort by most items
+        eligible_candidates.sort(key=lambda x: -x["item_count"])
+        to_post = eligible_candidates[:max_posts]
         
-        emoji = "🔴" if force_mode else ("🆕" if item.get("is_new") else "🔄")
-        message = f"{emoji} <b>School Updates — {item['source_name']}</b>\n━━━━━━━━━━━━━━━━━━\n\n{item['report_text']}"
-        
-        message_length = len(message)
-        LOG.info(f"📝 Message length: {message_length} chars")
-        if message_length > 4000:
-            LOG.warning(f"⚠️  Message exceeds 4096 limit! Actual: {message_length}")
-        
-        sent_successfully = False
-        for chat_id in targets:
-            try:
-                LOG.info(f"📤 Sending to chat_id: {chat_id}...")
-                await context.bot.send_message(
-                    chat_id=chat_id,
-                    text=message,
-                    parse_mode="HTML",
-                    disable_web_page_preview=True,
-                )
-                sent_successfully = True
-                LOG.info(f"✅ SUCCESSFULLY posted to {chat_id}")
-            except Exception as e:
-                LOG.error(f"❌ FAILED to post to {chat_id}: {str(e)}")
-                LOG.exception(f"Full error for chat_id {chat_id}:")
+        LOG.info(f"Will attempt to post {len(to_post)} source(s) (max allowed: {max_posts})")
 
-        if sent_successfully:
-            posted_count += 1
-            LOG.info(f"💾 Post successful for {source_name}")
+        posted_count = 0
+        targets = CHANNEL_DEAL_CHAT_ID if isinstance(CHANNEL_DEAL_CHAT_ID, list) else [CHANNEL_DEAL_CHAT_ID]
+        
+        if not targets:
+            LOG.error("❌ No target channels configured!")
+            return
             
-            # Don't save snapshot in force mode (to allow re-posting)
-            if not force_mode:
-                snapshot_data = {
-                    "content_hash": item["content_hash"],
-                    "item_count": item["item_count"],
-                    "site": item["source_name"],
-                    "title": f"School Updates - {item['source_name']}",
-                }
+        LOG.info(f"📡 Target channel(s): {targets}")
+        LOG.info(f"🤖 Bot instance: {context.bot}")
+
+        for idx, item in enumerate(to_post, 1):
+            source_name = item['source_name']
+            LOG.info(f"\n{'─' * 70}")
+            LOG.info(f"📨 [{idx}/{len(to_post)}] Preparing to post: {source_name}")
+            LOG.info(f"{'─' * 70}")
+            
+            emoji = "🔴" if force_mode else "🆕"
+            header = f"{emoji} <b>School Updates — {source_name}</b>\n━━━━━━━━━━━━━━━━━━\n\n"
+            message = header + item['report_text']
+            
+            LOG.info(f"📝 Message length: {len(message)} chars")
+            LOG.debug(f"Message preview: {message[:200]}...")
+
+            sent_successfully = False
+            for chat_id in targets:
+                LOG.info(f"📤 Sending to chat_id: {chat_id} (type: {type(chat_id)})...")
                 try:
-                    await mark_as_posted(item["snapshot_key"], snapshot_data)
-                    LOG.info(f"💾 Snapshot saved for {source_name}")
+                    # Validate chat_id
+                    if not isinstance(chat_id, (int, str)):
+                        LOG.error(f"❌ Invalid chat_id type: {type(chat_id)}")
+                        continue
+                        
+                    # Attempt to send
+                    response = await context.bot.send_message(
+                        chat_id=chat_id,
+                        text=message,
+                        parse_mode="HTML",
+                        disable_web_page_preview=True,
+                    )
+                    sent_successfully = True
+                    LOG.info(f"✅ SUCCESS: Message sent to {chat_id} (msg_id: {response.message_id})")
+                    
                 except Exception as e:
-                    LOG.error(f"❌ Failed to save snapshot: {e}")
+                    LOG.error(f"❌ FAILED to send to {chat_id}: {str(e)}")
+                    LOG.exception(f"Full error details:")
+
+            if sent_successfully:
+                posted_count += 1
+                LOG.info(f"✅ Posted {source_name} successfully")
+                
+                # Save snapshot only if not in force mode
+                if not force_mode:
+                    try:
+                        snapshot_data = {
+                            "content_hash": item["content_hash"],
+                            "item_count": item["item_count"],
+                            "site": item["source_name"],
+                            "title": f"School Updates - {item['source_name']}",
+                        }
+                        await mark_as_posted(item["snapshot_key"], snapshot_data)
+                        LOG.info(f"💾 Snapshot saved")
+                    except Exception as e:
+                        LOG.error(f"❌ Failed to save snapshot: {e}")
+                else:
+                    LOG.info(f"🚫 Force mode: Skipping snapshot save")
+                
+                # Delay between posts
+                if posted_count < len(to_post):
+                    LOG.info(f"⏳ Waiting {send_delay}s...")
+                    await asyncio.sleep(send_delay)
             else:
-                LOG.info(f"🚫 Force mode: Skipping snapshot save")
-            
-            if posted_count < len(to_post):
-                LOG.info(f"⏳ Waiting {send_delay}s before next post...")
-                await asyncio.sleep(send_delay)
-        else:
-            LOG.error(f"❌ Failed to post {source_name} to any target")
+                LOG.error(f"❌ Failed to post {source_name} to ANY target")
+
+    except Exception as e:
+        LOG.error(f"❌ CRITICAL ERROR in posting phase: {str(e)}")
+        LOG.exception(f"Full traceback:")
+        return
 
     LOG.info(f"\n{'=' * 70}")
     LOG.info(f"🏁 JOB COMPLETE: {posted_count}/{len(to_post)} source(s) posted")
     LOG.info(f"{'=' * 70}\n")
+
 
 # ═══════════════════════════════════════════════════════════════════════════
 # TRIAL MANAGEMENT
