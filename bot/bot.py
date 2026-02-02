@@ -849,42 +849,55 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
         url_count = len(urls) if urls else 0
         LOG.info(f"  📌 {src_name}: {url_count} URL(s)")
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # PROCESSING LOOP - ULTRA DEFENSIVE
+    # ═══════════════════════════════════════════════════════════════════════
     processed_count = 0
     error_count = 0
     skipped_count = 0
-    
-    # Scrape all sources with individual exception isolation
     source_list = list(DEFAULT_SCHOOL_SOURCES.items())
-    for idx, (source_name, urls) in enumerate(source_list, 1):
+    total_sources = len(source_list)
+    
+    LOG.info(f"🔄 Beginning processing loop for {total_sources} sources...")
+    
+    idx = 0
+    while idx < total_sources:
+        source_name, urls = source_list[idx]
         processed_count += 1
+        
         LOG.info(f"\n{'─' * 70}")
-        LOG.info(f"🔍 [{idx}/{len(source_list)}] Processing: {source_name}")
+        LOG.info(f"🔍 [{processed_count}/{total_sources}] Processing: {source_name}")
         LOG.info(f"{'─' * 70}")
         
+        # Pre-checks
         if not urls:
-            LOG.warning(f"⚠️  Skipping {source_name}: No URLs configured")
+            LOG.warning(f"⚠️  No URLs for {source_name}, skipping")
             skipped_count += 1
+            idx += 1
             continue
-
-        source_success = False
-        try:
-            LOG.info(f"🌐 Scraping {len(urls)} URL(s)...")
             
-            items = await scrape_school_news(
-                urls,
-                fetch_full_content=False,
-                max_articles=10
+        # Source processing with maximum isolation
+        source_eligible = None
+        try:
+            LOG.info(f"🌐 Calling scrape_school_news for {source_name}...")
+            
+            # Timeout wrapper to prevent hanging
+            items = await asyncio.wait_for(
+                scrape_school_news(urls, fetch_full_content=False, max_articles=10),
+                timeout=120.0
             )
             
             item_count = len(items) if items else 0
-            LOG.info(f"📊 Found {item_count} items")
+            LOG.info(f"📊 Scrape returned {item_count} items for {source_name}")
             
             if not items:
-                LOG.info(f"⏭️  No items returned — skipping")
+                LOG.info(f"⏭️  No items for {source_name}, skipping")
                 skipped_count += 1
+                idx += 1
                 continue
             
-            # Generate report
+            # Build message
+            LOG.info(f"📝 Building message for {source_name}...")
             report_lines = [
                 f"<b>{source_name}</b>",
                 f"<i>Updated: {now.strftime('%b %d, %Y — %H:%M WAT')}</i>",
@@ -893,17 +906,24 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             ]
 
             for item in items[:10]:
-                title_line = f"• <b>{item['title']}</b>"
-                if item.get("date"):
-                    title_line += f" — <i>{item['date']}</i>"
-                report_lines.append(title_line)
+                try:
+                    title = item.get('title', 'Untitled')
+                    title_line = f"• <b>{title}</b>"
+                    if item.get("date"):
+                        title_line += f" — <i>{item['date']}</i>"
+                    report_lines.append(title_line)
 
-                snippet = item.get("snippet", "").strip()
-                if snippet and len(snippet) > 30:
-                    snippet = snippet.replace("Read More", "").replace("Click to read", "").strip()
-                    report_lines.append(f"  └─ {snippet[:200]}... <a href=\"{item['link']}\">Read more</a>")
-                else:
-                    report_lines.append(f"  └─ <a href=\"{item['link']}\">View update</a>")
+                    snippet = item.get("snippet", "").strip()
+                    link = item.get("link", "")
+                    
+                    if snippet and len(snippet) > 30:
+                        snippet = snippet.replace("Read More", "").replace("Click to read", "").strip()
+                        report_lines.append(f"  └─ {snippet[:200]}... <a href=\"{link}\">Read more</a>")
+                    else:
+                        report_lines.append(f"  └─ <a href=\"{link}\">View update</a>")
+                except Exception as item_err:
+                    LOG.error(f"⚠️  Error processing single item in {source_name}: {item_err}")
+                    continue
 
             report_lines.extend([
                 "",
@@ -914,178 +934,228 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
 
             report_text = "\n".join(report_lines)
             
-            # Check message length (Telegram limit: 4096)
-            if len(report_text) > 4000:
-                LOG.warning(f"⚠️  Message too long ({len(report_text)} chars), truncating...")
+            # Length check
+            original_len = len(report_text)
+            if original_len > 4000:
+                LOG.warning(f"⚠️  Message too long ({original_len}), truncating...")
                 report_text = report_text[:4000] + "...\n\n<i>Message truncated</i>"
+            
+            LOG.info(f"📝 Message built: {len(report_text)} chars")
 
             # Compute hash
-            content_hash = compute_content_hash({
-                "title": source_name,
-                "item_count": len(items),
-                "raw": {"items": items[:5]}
-            })
-
+            try:
+                content_hash = compute_content_hash({
+                    "title": source_name,
+                    "item_count": len(items),
+                    "raw": {"items": items[:5]}
+                })
+            except Exception as hash_err:
+                LOG.error(f"❌ Hash computation failed for {source_name}: {hash_err}")
+                content_hash = "fallback_hash_" + str(time.time())
+            
             snapshot_key = f"school_{_slugify(source_name)}"
             LOG.info(f"🔑 Snapshot key: {snapshot_key}")
             
             # Duplicate check
             if not force_mode:
-                LOG.info(f"🔍 Checking for duplicates...")
-                is_duplicate = await check_duplicate_post(
-                    ref=snapshot_key,
-                    content_hash=content_hash,
-                    lookback_hours=24
-                )
-                if is_duplicate:
-                    LOG.info(f"⏭️  Duplicate detected — skipping")
-                    skipped_count += 1
-                    continue
+                try:
+                    is_duplicate = await check_duplicate_post(
+                        ref=snapshot_key,
+                        content_hash=content_hash,
+                        lookback_hours=24
+                    )
+                    if is_duplicate:
+                        LOG.info(f"⏭️  Duplicate for {source_name}, skipping")
+                        skipped_count += 1
+                        idx += 1
+                        continue
+                except Exception as dup_err:
+                    LOG.error(f"⚠️  Duplicate check failed for {source_name}: {dup_err}")
+                    # Continue anyway in force mode, otherwise skip
+                    if not force_mode:
+                        skipped_count += 1
+                        idx += 1
+                        continue
             else:
-                LOG.info(f"🚫 Skipping duplicate check (force mode)")
+                LOG.info(f"🚫 Duplicate check bypassed (force mode)")
 
             # Recency check
             if not force_mode:
-                LOG.info(f"⏰ Checking recency...")
-                snapshot = await load_channel_snapshot(snapshot_key)
-                if snapshot and snapshot.get("last_posted_at"):
-                    try:
+                try:
+                    snapshot = await load_channel_snapshot(snapshot_key)
+                    if snapshot and snapshot.get("last_posted_at"):
                         last_dt = datetime.fromisoformat(snapshot["last_posted_at"])
                         hours_since = (now - last_dt).total_seconds() / 3600
                         if hours_since < 12:
-                            LOG.info(f"⏭️  Too recent ({hours_since:.1f}h < 12h) — skipping")
+                            LOG.info(f"⏭️  Too recent ({hours_since:.1f}h), skipping")
                             skipped_count += 1
+                            idx += 1
                             continue
-                    except Exception as e:
-                        LOG.warning(f"⚠️  Error parsing timestamp: {e}")
-            else:
-                LOG.info(f"🚫 Skipping recency check (force mode)")
-
-            LOG.info(f"✅ {source_name} ELIGIBLE for posting ({len(items)} items)")
-            eligible_candidates.append({
+                except Exception as rec_err:
+                    LOG.error(f"⚠️  Recency check failed for {source_name}: {rec_err}")
+            
+            LOG.info(f"✅ {source_name} ELIGIBLE ({len(items)} items)")
+            source_eligible = {
                 "source_name": source_name,
                 "report_text": report_text,
                 "content_hash": content_hash,
                 "snapshot_key": snapshot_key,
                 "item_count": len(items),
-            })
-            source_success = True
-
-        except Exception as e:
+            }
+            
+        except asyncio.TimeoutError:
+            LOG.error(f"⏱️  TIMEOUT processing {source_name} after 120s")
             error_count += 1
-            LOG.error(f"❌ EXCEPTION in {source_name}: {str(e)}")
-            LOG.exception(f"Full traceback:")
-            continue
+        except Exception as e:
+            LOG.error(f"❌ CRITICAL ERROR in {source_name}: {str(e)}")
+            LOG.exception(f"Full traceback for {source_name}:")
+            error_count += 1
         
-        LOG.info(f"🏁 Completed {source_name}: {'✅ SUCCESS' if source_success else '❌ FAILED/SKIPPED'}")
-
-    # Summary before posting
+        # Only advance index if we didn't crash
+        if source_eligible:
+            eligible_candidates.append(source_eligible)
+            LOG.info(f"🏁 {source_name}: ✅ ELIGIBLE ADDED")
+        else:
+            LOG.info(f"🏁 {source_name}: ❌ NOT ELIGIBLE")
+        
+        idx += 1
+        # Small delay between sources to prevent rate limiting
+        await asyncio.sleep(5)
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # END OF LOOP - POSTING PHASE
+    # ═══════════════════════════════════════════════════════════════════════
     LOG.info(f"\n{'=' * 70}")
-    LOG.info(f"📊 PROCESSING SUMMARY")
+    LOG.info(f"📊 LOOP COMPLETE")
     LOG.info(f"{'=' * 70}")
-    LOG.info(f"Sources processed: {processed_count}")
-    LOG.info(f"Sources skipped:   {skipped_count}")
-    LOG.info(f"Errors:            {error_count}")
-    LOG.info(f"Eligible to post:  {len(eligible_candidates)}")
-    LOG.info(f"Eligible list:     {[e['source_name'] for e in eligible_candidates]}")
-
-    if not eligible_candidates:
-        LOG.error("❌ NO ELIGIBLE CANDIDATES — Nothing to post!")
+    LOG.info(f"Processed: {processed_count}/{total_sources}")
+    LOG.info(f"Skipped:   {skipped_count}")
+    LOG.info(f"Errors:    {error_count}")
+    LOG.info(f"Eligible:  {len(eligible_candidates)}")
+    
+    if eligible_candidates:
+        LOG.info(f"Eligible sources: {[e['source_name'] for e in eligible_candidates]}")
+    else:
+        LOG.error("❌ NO ELIGIBLE CANDIDATES - Aborting posting phase")
         return
 
-    # POSTING PHASE
+    # ═══════════════════════════════════════════════════════════════════════
+    # POSTING PHASE - COMPLETELY ISOLATED
+    # ═══════════════════════════════════════════════════════════════════════
     LOG.info(f"\n{'=' * 70}")
     LOG.info(f"📤 ENTERING POSTING PHASE")
     LOG.info(f"{'=' * 70}")
     
+    posted_count = 0
+    targets = CHANNEL_DEAL_CHAT_ID if isinstance(CHANNEL_DEAL_CHAT_ID, list) else [CHANNEL_DEAL_CHAT_ID]
+    
+    if not targets:
+        LOG.error("❌ No targets configured!")
+        return
+    
+    LOG.info(f"📡 Targets: {targets}")
+    
+    # Sort and limit
     try:
-        # Sort by most items
-        eligible_candidates.sort(key=lambda x: -x["item_count"])
+        eligible_candidates.sort(key=lambda x: -x.get("item_count", 0))
         to_post = eligible_candidates[:max_posts]
+        LOG.info(f"📋 Will post {len(to_post)}/{len(eligible_candidates)} sources")
+    except Exception as sort_err:
+        LOG.error(f"❌ Sorting failed: {sort_err}, using unsorted")
+        to_post = eligible_candidates[:max_posts]
+    
+    # Post each one
+    for post_idx, item in enumerate(to_post, 1):
+        source_name = item.get('source_name', 'Unknown')
+        LOG.info(f"\n{'─' * 70}")
+        LOG.info(f"📨 [{post_idx}/{len(to_post)}] Posting: {source_name}")
+        LOG.info(f"{'─' * 70}")
         
-        LOG.info(f"Will attempt to post {len(to_post)} source(s) (max allowed: {max_posts})")
-
-        posted_count = 0
-        targets = CHANNEL_DEAL_CHAT_ID if isinstance(CHANNEL_DEAL_CHAT_ID, list) else [CHANNEL_DEAL_CHAT_ID]
-        
-        if not targets:
-            LOG.error("❌ No target channels configured!")
-            return
-            
-        LOG.info(f"📡 Target channel(s): {targets}")
-        LOG.info(f"🤖 Bot instance: {context.bot}")
-
-        for idx, item in enumerate(to_post, 1):
-            source_name = item['source_name']
-            LOG.info(f"\n{'─' * 70}")
-            LOG.info(f"📨 [{idx}/{len(to_post)}] Preparing to post: {source_name}")
-            LOG.info(f"{'─' * 70}")
-            
+        # Build message with error handling
+        try:
             emoji = "🔴" if force_mode else "🆕"
             header = f"{emoji} <b>School Updates — {source_name}</b>\n━━━━━━━━━━━━━━━━━━\n\n"
-            message = header + item['report_text']
+            report_text = item.get('report_text', '')
             
-            LOG.info(f"📝 Message length: {len(message)} chars")
-            LOG.debug(f"Message preview: {message[:200]}...")
-
-            sent_successfully = False
-            for chat_id in targets:
-                LOG.info(f"📤 Sending to chat_id: {chat_id} (type: {type(chat_id)})...")
-                try:
-                    # Validate chat_id
-                    if not isinstance(chat_id, (int, str)):
-                        LOG.error(f"❌ Invalid chat_id type: {type(chat_id)}")
-                        continue
-                        
-                    # Attempt to send
-                    response = await context.bot.send_message(
+            if not report_text:
+                LOG.error(f"❌ No report_text for {source_name}, skipping")
+                continue
+                
+            message = header + report_text
+            
+            # Final length check
+            if len(message) > 4096:
+                LOG.warning(f"⚠️  Message still too long ({len(message)}), hard truncate")
+                message = message[:4093] + "..."
+            
+            LOG.info(f"📝 Final message length: {len(message)}")
+            
+        except Exception as msg_err:
+            LOG.error(f"❌ Message construction failed for {source_name}: {msg_err}")
+            continue
+        
+        # Send to all targets
+        sent_to_any = False
+        for chat_id in targets:
+            LOG.info(f"📤 Sending to {chat_id}...")
+            try:
+                # Type validation
+                if not isinstance(chat_id, (int, str)):
+                    LOG.error(f"❌ Invalid chat_id type: {type(chat_id)}")
+                    continue
+                
+                # Send with timeout
+                response = await asyncio.wait_for(
+                    context.bot.send_message(
                         chat_id=chat_id,
                         text=message,
                         parse_mode="HTML",
                         disable_web_page_preview=True,
-                    )
-                    sent_successfully = True
-                    LOG.info(f"✅ SUCCESS: Message sent to {chat_id} (msg_id: {response.message_id})")
-                    
-                except Exception as e:
-                    LOG.error(f"❌ FAILED to send to {chat_id}: {str(e)}")
-                    LOG.exception(f"Full error details:")
-
-            if sent_successfully:
-                posted_count += 1
-                LOG.info(f"✅ Posted {source_name} successfully")
+                    ),
+                    timeout=30.0
+                )
                 
-                # Save snapshot only if not in force mode
-                if not force_mode:
-                    try:
-                        snapshot_data = {
-                            "content_hash": item["content_hash"],
-                            "item_count": item["item_count"],
-                            "site": item["source_name"],
-                            "title": f"School Updates - {item['source_name']}",
-                        }
-                        await mark_as_posted(item["snapshot_key"], snapshot_data)
-                        LOG.info(f"💾 Snapshot saved")
-                    except Exception as e:
-                        LOG.error(f"❌ Failed to save snapshot: {e}")
-                else:
-                    LOG.info(f"🚫 Force mode: Skipping snapshot save")
+                sent_to_any = True
+                LOG.info(f"✅ SENT to {chat_id} (msg_id: {response.message_id})")
                 
-                # Delay between posts
-                if posted_count < len(to_post):
-                    LOG.info(f"⏳ Waiting {send_delay}s...")
-                    await asyncio.sleep(send_delay)
+            except asyncio.TimeoutError:
+                LOG.error(f"⏱️  TIMEOUT sending to {chat_id}")
+            except Exception as send_err:
+                LOG.error(f"❌ FAILED to send to {chat_id}: {str(send_err)}")
+                LOG.exception("Send error details:")
+        
+        # Handle success/failure
+        if sent_to_any:
+            posted_count += 1
+            LOG.info(f"✅ SUCCESS: {source_name} posted")
+            
+            # Save snapshot only if not force mode
+            if not force_mode:
+                try:
+                    snapshot_data = {
+                        "content_hash": item.get("content_hash"),
+                        "item_count": item.get("item_count"),
+                        "site": source_name,
+                        "title": f"School Updates - {source_name}",
+                    }
+                    await mark_as_posted(item.get("snapshot_key"), snapshot_data)
+                    LOG.info(f"💾 Snapshot saved for {source_name}")
+                except Exception as snap_err:
+                    LOG.error(f"⚠️  Snapshot save failed: {snap_err}")
             else:
-                LOG.error(f"❌ Failed to post {source_name} to ANY target")
-
-    except Exception as e:
-        LOG.error(f"❌ CRITICAL ERROR in posting phase: {str(e)}")
-        LOG.exception(f"Full traceback:")
-        return
-
+                LOG.info(f"🚫 Snapshot skipped (force mode)")
+            
+            # Delay between posts
+            if post_idx < len(to_post):
+                LOG.info(f"⏳ Waiting {send_delay}s...")
+                await asyncio.sleep(send_delay)
+        else:
+            LOG.error(f"❌ COMPLETE FAILURE: {source_name} not sent to any target")
+    
     LOG.info(f"\n{'=' * 70}")
-    LOG.info(f"🏁 JOB COMPLETE: {posted_count}/{len(to_post)} source(s) posted")
+    LOG.info(f"🏁 FINAL RESULT: {posted_count}/{len(to_post)} sources posted")
     LOG.info(f"{'=' * 70}\n")
+
 
 
 # ═══════════════════════════════════════════════════════════════════════════
