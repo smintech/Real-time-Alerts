@@ -20,7 +20,7 @@ from bs4 import BeautifulSoup, Tag
 import cloudscraper
 from requests.exceptions import RequestException
 from typing import Dict, Optional, Any, Tuple, Callable, List, Set, Union
-
+from collections import Counter
 # Settings / thresholds
 from bot.settings import (
     SUPPORTED_SITES,
@@ -222,81 +222,60 @@ def _log_extraction_attempt(source: str, raw_value: str, parsed_value: Optional[
 # === FIX: safe visible-text extraction (no raw newlines inside JS strings) ===
 async def get_visible_text_playwright(page) -> str:
     """
-    Optimized visible text extraction targeting main product area
-    Focuses on the main product container to avoid noise from recommendations
+    UPDATED: Mirroring your successful test strategies - focused ONLY on price elements
+    This is based on your working test code that gets correct prices
     """
     try:
-        # Extract text specifically from the main product container
-        text = await page.evaluate("""
+        # Using your EXACT working strategy from test code
+        result = await page.evaluate("""
             () => {
-                // 1. FIRST PRIORITY: Get text from main product container
+                // STRATEGY 1: First try to get the main product detail container
                 const mainContainer = document.querySelector('div.productDetail_productDetailsContent__VV9__');
                 
                 if (mainContainer) {
-                    // Clone to avoid modifying original
-                    const clone = mainContainer.cloneNode(true);
-                    
-                    // Remove noisy elements within the container
-                    const noiseSelectors = [
-                        'script', 'style', 'iframe', 'noscript',
-                        '[class*="ad"]', '[id*="ad"]',
-                        '[class*="recommend"]', '[class*="similar"]',
-                        '[class*="related"]', '[class*="suggestion"]',
-                        '.social-share', '.share-buttons', 'button', 'a.btn'
-                    ];
-                    
-                    noiseSelectors.forEach(sel => {
-                        clone.querySelectorAll(sel).forEach(el => el.remove());
-                    });
-                    
-                    return clone.innerText || clone.textContent || '';
+                    // Extract ALL text from this container (your successful approach)
+                    return mainContainer.innerText || mainContainer.textContent || '';
                 }
                 
-                // 2. FALLBACK: Try other product containers
-                const fallbackSelectors = [
-                    '[data-testid="product-detail"]',
-                    'main',
-                    '.product-details',
-                    'article.product-page'
-                ];
+                // STRATEGY 2: Try to find price-specific elements
+                const priceElements = document.querySelectorAll('''
+                    div.shared_specialPrice__uIZ_i,
+                    span.shared_price__gnso_,
+                    span.shared_initialPrice__cTRSe,
+                    div[data-testid="current-price"],
+                    .priceBox_priceBoxPrice__i7paS
+                ''');
                 
-                for (const selector of fallbackSelectors) {
-                    const el = document.querySelector(selector);
-                    if (el) {
-                        return el.innerText || el.textContent || '';
+                if (priceElements.length > 0) {
+                    // Combine text from all price elements
+                    const texts = Array.from(priceElements).map(el => el.textContent.trim());
+                    return texts.join(' ');
+                }
+                
+                // STRATEGY 3: Get all text with Naira symbol
+                const allElements = document.querySelectorAll('*');
+                const nairaTexts = [];
+                
+                for (const el of allElements) {
+                    const text = el.textContent;
+                    if (text && (text.includes('₦') || text.includes('NGN'))) {
+                        nairaTexts.push(text.trim());
                     }
                 }
                 
-                // 3. LAST RESORT: Body text
-                return document.body.innerText || '';
+                return nairaTexts.join(' ');
             }
         """)
         
-        text = str(text).strip()
-        text = re.sub(r'\s+', ' ', text)  # Normalize whitespace
+        text = str(result).strip()
+        text = re.sub(r'\s+', ' ', text)
         
-        LOG.info(f"✅ Extracted {len(text)} chars from product area")
+        LOG.info("Extracted %d chars of price-focused text", len(text))
         return text
         
     except Exception as e:
-        LOG.error(f"❌ JS extraction failed: {str(e)[:80]}")
-        
-        # Fallback: Simple innerText extraction
-        try:
-            text = await page.evaluate("""
-                () => {
-                    // Quick cleanup
-                    document.querySelectorAll('script, style, iframe, noscript').forEach(el => el.remove());
-                    return document.body.innerText || '';
-                }
-            """)
-            
-            text = re.sub(r'\s+', ' ', str(text)).strip()
-            LOG.info(f"⚠️ Using fallback text: {len(text)} chars")
-            return text
-        except Exception as e2:
-            LOG.error(f"❌ Fallback also failed: {str(e2)[:80]}")
-            return ""
+        LOG.error("JS extraction failed: %s", str(e)[:80])
+        return ""
 # -------------------------------------------------------------------
 # 2) Fully improved fetch_with_playwright_aggressive (with XHR capture + price_js)
 # -------------------------------------------------------------------
@@ -901,189 +880,189 @@ def _extract_previous_price(soup: BeautifulSoup, json_ld: Optional[dict], domain
 
     return best_guess
 
-# === FIX: robust parse for 'k' notation ===
-def _parse_price_string(text: str) -> Optional[float]:
-    """Parse price from text containing Naira amounts - handles k notation correctly."""
+def _extract_product_id_from_url(url: str) -> Optional[int]:
+    """
+    Extract product ID from Konga URL for filtering purposes.
+    Pattern: /product/name-6612850 or /product/name-6612850?query
+    """
+    if not url:
+        return None
+    
+    patterns = [
+        r'-(\d{6,8})(?:\?|$)',          # Pattern: -6612850 or -6612850?query
+        r'/product/.*?(\d{6,8})$',      # Pattern: /product/.../6612850
+        r'p=(\d{6,8})',                 # Pattern: ?p=6612850
+    ]
+    
+    for pattern in patterns:
+        match = re.search(pattern, url)
+        if match:
+            try:
+                product_id = int(match.group(1))
+                LOG.debug(f"Extracted product ID from URL: {product_id}")
+                return product_id
+            except (ValueError, TypeError):
+                continue
+    
+    return None
+
+def _parse_price_string(text: str, filter_product_id: Optional[int] = None) -> Optional[float]:
+    """
+    Parse price from text - FILTER OUT PRODUCT ID if it looks like a price.
+    """
     if not text:
         return None
-
-    text = text.strip().lower()
-
-    # Handle 'k' notation like "1.4k" or "1440k" -> multiply appropriately
-    k_match = re.search(r'(\d+(?:[.,]\d+)?)\s*k\b', text)
-    if k_match:
-        try:
-            val = float(k_match.group(1).replace(',', ''))
-            return val * 1000.0
-        except:
-            pass
-
-    # Remove stray currency symbols/letters and normalize commas
-    cleaned = re.sub(r'[^\d.,]', '', text).replace(',', '')
-    try:
-        if cleaned:
-            val = float(cleaned)
-            if 5000 <= val <= 5_000_000:
-                return val
-    except:
-        pass
-
-    # fallback: extract numbers as before (legacy)
-    numbers = re.findall(r'[\d,]+(?:\.\d{2})?', text)
+    
+    text = text.strip()
+    
+    # Handle concatenated prices: "₦1,140,000₦1,350,000" → extract "1,140,000"
+    if '₦' in text:
+        # Split by ₦ and take the FIRST price after the first ₦
+        parts = text.split('₦')
+        if len(parts) > 1:
+            # Get the part immediately after first ₦
+            first_price_text = parts[1]
+            # Remove any subsequent ₦ and everything after it
+            if '₦' in first_price_text:
+                first_price_text = first_price_text.split('₦')[0]
+            
+            text = first_price_text.strip()
+    
+    # Extract numbers
+    numbers = re.findall(r'[\d,]+', text)
     for num in numbers:
         try:
             clean = num.replace(',', '')
             val = float(clean)
-            if not (5000 <= val <= 5_000_000):
-                continue
-            return val
+            
+            # FILTER OUT PRODUCT ID: If the value matches the product ID (or close), skip it
+            if filter_product_id:
+                # Check if this price is actually the product ID
+                if abs(val - filter_product_id) < 100:  # Allow small difference
+                    LOG.debug(f"Filtered out product ID as price: ₦{val:,} (product ID: {filter_product_id})")
+                    continue
+            
+            # Valid price range for Konga products
+            if 5000 <= val <= 5_000_000:
+                LOG.debug(f"Valid price: ₦{val:,}")
+                return val
+            
         except:
             continue
+    
     return None
 
 def _extract_konga_current_price(soup: BeautifulSoup, page_text: str, url: str = "") -> Optional[float]:
     """
-    Konga price extraction with product ID filtering.
+    Konga price extraction - TRUST ONLY FROM div[class*="price"] selectors.
+    Filters out product ID numbers that might be mistaken as prices.
     """
     LOG.info("")
     LOG.info("┏━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓")
-    LOG.info("┃ KONGA PRICE EXTRACTION                                         ┃")
+    LOG.info("┃ KONGA PRICE EXTRACTION (PRODUCT ID FILTERED)                 ┃")
     LOG.info("┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛")
     
-    # Extract product ID from URL
-    product_id = None
-    if url:
-        # Match patterns like: /product/name-6612850 or /product/name-6612850?query
-        match = re.search(r'-(\d{6,8})(?:\?|$)', url)
-        if match:
-            product_id = int(match.group(1))
-            LOG.info("🎯 Product ID: %d (will filter from prices)", product_id)
+    # Get product ID from URL to filter it out
+    product_id = _extract_product_id_from_url(url)
+    if product_id:
+        LOG.info(f"🔍 Product ID detected: {product_id} (will filter this out)")
     
-    # PHASE 1: __NEXT_DATA__
-    LOG.info("")
-    LOG.info("📋 Phase 1: __NEXT_DATA__ parsing")
+    # ============================================
+    # STRATEGY 1: TRUSTED div[class*="price"] SELECTORS ONLY
+    # ============================================
+    LOG.info("📋 Strategy 1: Trusted price element selectors")
     LOG.info("─" * 70)
     
-    next_script = soup.find("script", {"id": "__NEXT_DATA__"})
-    if next_script and next_script.string:
-        try:
-            data = json.loads(next_script.string)
-            
-            def find_price(obj, depth=0):
-                if depth > 10:
-                    return None
-                    
-                if isinstance(obj, dict):
-                    for k, v in obj.items():
-                        k_lower = str(k).lower()
-                        
-                        # Skip ID fields
-                        if 'id' in k_lower and 'price' not in k_lower:
-                            continue
-                        
-                        # Price keywords
-                        if any(kw in k_lower for kw in ["price", "selling", "amount", "offer"]):
-                            try:
-                                if isinstance(v, (int, float)):
-                                    p = float(v)
-                                elif isinstance(v, str):
-                                    p = _parse_price_string(v)
-                                else:
-                                    continue
-                                
-                                # Validate
-                                if p and 5000 <= p <= 10_000_000:
-                                    # Filter product ID
-                                    if product_id and abs(p - product_id) < 100:
-                                        LOG.debug("    ⊗ Skipped product ID: %.0f", p)
-                                        continue
-                                    return p
-                            except:
-                                pass
-                        
-                        # Recurse
-                        if isinstance(v, (dict, list)):
-                            result = find_price(v, depth + 1)
-                            if result:
-                                return result
-                                
-                elif isinstance(obj, list):
-                    for item in obj:
-                        result = find_price(item, depth + 1)
-                        if result:
-                            return result
-                            
-                return None
-            
-            price = find_price(data)
-            if price:
-                LOG.info("  ✅ SUCCESS: __NEXT_DATA__ → ₦%.0f", price)
-                return price
-                
-        except Exception as e:
-            LOG.debug("  ⚠️  Parse error: %s", str(e)[:100])
-    
-    LOG.warning("  Phase 1 failed")
-    
-    # PHASE 2: CSS Selectors
-    LOG.info("")
-    LOG.info("📋 Phase 2: CSS selectors")
-    LOG.info("─" * 70)
-    
-    selectors = [
-        "div.priceBox_priceBoxPrice__i7paS",
-        "span.shared_price__gnso_",
-        "span[data-testid='current-price']",
-        "div[data-testid='price-current']",
-        "span.-b.-ubpt",
-        "span.prc",
-        "[data-price]",
+    # ONLY TRUST THESE SELECTORS - as per your instruction
+    trusted_selectors = [
+        'div[class*="price"]',  # Primary trusted selector
+        'span[class*="price"]',
+        '.priceBox_priceBoxPrice__i7paS',
+        'div.priceBox_priceBox__CeNMs',
+        'div[class*="priceBox"]',
+        'span.shared_price__gnso_',
+        'span[data-testid="current-price"]',
+        'div[data-testid="price-current"]',
+        'span.-b.-ubpt',
+        'span.prc',
+        '[data-price]',
     ]
     
-    for sel in selectors:
-        elements = soup.select(sel)
+    for selector in trusted_selectors:
+        elements = soup.select(selector)
         if elements:
-            LOG.debug("  [%s] %d elements", sel[:30], len(elements))
-            for el in elements[:3]:
-                text = el.get_text(strip=True)
-                p = _parse_price_string(text)
-                if p and 5000 <= p <= 10_000_000:
-                    if product_id and abs(p - product_id) < 100:
-                        LOG.debug("    ⊗ Skipped product ID: %.0f", p)
-                        continue
-                    LOG.info("  ✅ SUCCESS: %s → ₦%.0f", sel[:30], p)
-                    return p
+            LOG.info(f"Found {len(elements)} elements with selector: {selector[:40]}")
+            for el in elements[:3]:  # Check first 3 elements
+                text = el.get_text(" ", strip=True)
+                if text:
+                    price = _parse_price_string(text, product_id)
+                    if price:
+                        LOG.info(f"✅ Found via trusted selector '{selector[:30]}': ₦{price:,}")
+                        return price
     
-    LOG.warning("  Phase 2 failed")
-    
-    # PHASE 3: Visible text regex
+    # ============================================
+    # STRATEGY 2: VISIBLE TEXT FROM TRUSTED CONTAINERS
+    # ============================================
     LOG.info("")
-    LOG.info("📋 Phase 3: Visible text regex")
+    LOG.info("📋 Strategy 2: Visible text in trusted containers")
     LOG.info("─" * 70)
     
-    matches = re.findall(r'₦\s*([0-9,]+)', page_text)
-    LOG.debug("  Found %d ₦ matches", len(matches))
+    # Find main product container
+    main_containers = soup.select('div.productDetail_productDetailsContent__VV9__, main, article, [role="main"]')
     
-    prices = []
-    for match in matches[:20]:
-        p = _parse_price_string(match)
-        if p and 5000 <= p <= 10_000_000:
-            if product_id and abs(p - product_id) < 100:
+    for container in main_containers:
+        # Get all text from this container
+        container_text = container.get_text(" ", strip=True)
+        
+        # Look for price patterns in container text
+        price_pattern = r'₦\s*([\d,]+(?:\.\d{2})?)'
+        matches = re.findall(price_pattern, container_text[:3000])  # First 3000 chars
+        
+        if matches:
+            LOG.info(f"Found {len(matches)} price patterns in container")
+            for match in matches:
+                price = _parse_price_string(f"₦{match}", product_id)
+                if price:
+                    LOG.info(f"✅ Found in trusted container: ₦{price:,}")
+                    return price
+    
+    # ============================================
+    # STRATEGY 3: FILTER ALL PRICES (with product ID filtering)
+    # ============================================
+    LOG.info("")
+    LOG.info("📋 Strategy 3: Filter all page prices")
+    LOG.info("─" * 70)
+    
+    # Extract ALL prices from page and filter out product ID
+    all_text = str(soup)
+    all_prices = re.findall(r'₦\s*([\d,]+)', all_text)
+    
+    valid_prices = []
+    for price_str in all_prices[:100]:  # Limit to first 100 matches
+        try:
+            price = float(price_str.replace(',', ''))
+            
+            # FILTER: Skip if this is the product ID
+            if product_id and abs(price - product_id) < 100:
+                LOG.debug(f"    ✗ Filtered (product ID): ₦{price:,}")
                 continue
-            prices.append(p)
+            
+            # Valid price range for Konga
+            if 5000 <= price <= 5_000_000:
+                valid_prices.append(price)
+                LOG.debug(f"    ✓ Accepted: ₦{price:,}")
+                
+        except:
+            continue
     
-    if prices:
-        # Use most common or max
-        from collections import Counter
-        price_counts = Counter(prices)
-        price = price_counts.most_common(1)[0][0]
-        LOG.info("  ✅ SUCCESS: Visible text → ₦%.0f (%d candidates)", price, len(prices))
-        return price
+    if valid_prices:
+        # Take the most common price (most likely the correct one)
+        price_counts = Counter(valid_prices)
+        most_common_price, count = price_counts.most_common(1)[0]
+        LOG.info(f"✅ Selected most common price: ₦{most_common_price:,} (appeared {count} times)")
+        return most_common_price
     
-    LOG.warning("  Phase 3 failed")
-    
-    LOG.error("")
-    LOG.error("❌ ALL PHASES FAILED")
+    LOG.error("❌ ALL STRATEGIES FAILED - No valid price found")
     return None
 
 def extract_prices_from_visible_text(
@@ -1295,12 +1274,7 @@ def scrape_binance_ref(ref: str) -> Dict[str, Any]:
 
 async def scrape_ecommerce(url: str) -> Dict[str, Any]:
     """
-    FIXED: Enhanced e-commerce scraper with:
-    - Better Konga price extraction
-    - Improved Playwright handling
-    - Fallback visible-text parsing
-    - Better error messages
-    - ALL original features preserved (descriptions, images, titles)
+    Enhanced e-commerce scraper with product ID filtering for Konga.
     """
     domain = get_domain_from_url(url)
     if not any(s in domain for s in SUPPORTED_SITES):
@@ -1309,9 +1283,8 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
     html = None
     visible_text = None
 
-    # Primary fetch strategy based on domain
+    # Primary fetch strategy
     if any(d in domain for d in ("konga", "jumia")):
-        # Use Playwright for dynamic sites, with visible text for Konga
         try:
             LOG.debug("Using Playwright (with visible text) for %s", domain)
             res = await fetch_with_playwright_aggressive(url, retries=3, return_visible_text=True)
@@ -1322,17 +1295,16 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
             LOG.debug("Playwright succeeded: HTML=%d bytes, visible_text=%d bytes", 
                      len(html) if html else 0, len(visible_text) if visible_text else 0)
         except Exception as e:
-            LOG.warning("Playwright fetch failed for %s: %s - Falling back to cloudscraper", url, str(e)[:50])
+            LOG.warning("Playwright fetch failed for %s: %s - Falling back", url, str(e)[:50])
             html = None
     else:
-        # Use _fetch_html for other sites (which tries cloudscraper first)
         try:
             html = await _fetch_html(url)
         except Exception as e:
             LOG.warning("Primary fetch failed for %s: %s", url, str(e)[:50])
             html = None
     
-    # Fallback: cloudscraper if primary failed
+    # Fallback
     if html is None or len(html) < 5000:
         try:
             LOG.debug("Falling back to cloudscraper for %s", url)
@@ -1341,7 +1313,6 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
                 loop.run_in_executor(None, fetch_with_cloudscraper_aggressive, url, 4),
                 timeout=50.0
             )
-            LOG.debug("Cloudscraper succeeded: %d bytes", len(html) if html else 0)
         except asyncio.TimeoutError:
             raise NoDataError(f"Cloudscraper timeout for {url}")
         except Exception as e:
@@ -1413,7 +1384,7 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
             except:
                 pass
 
-    # Site-specific current price extraction
+    # Site-specific current price extraction WITH PRODUCT ID FILTERING
     if product["current_price"] is None:
         if "konga" in domain:
             page_text = visible_text or soup.get_text(" ", strip=True)
@@ -1421,7 +1392,9 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
                 p = _extract_konga_current_price(soup, page_text, url)
                 if p:
                     product["current_price"] = p
-                    LOG.info("Konga: Found price ₦%.0f", p)
+                    product_id = _extract_product_id_from_url(url)
+                    LOG.info("Konga: Found price ₦%.0f (filtered product ID: %s)", 
+                            p, product_id if product_id else "None")
             except Exception as e:
                 LOG.debug("Konga price extractor exception: %s", str(e)[:50])
         
@@ -1432,24 +1405,34 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
                 el = soup.select_one(sel)
                 if el:
                     text = el.get_text(" ", strip=True)
-                    p = _parse_price_string(text)
+                    p = _parse_price_string(text)  # No product ID filtering for Jumia
                     if p:
                         product["current_price"] = p
                         LOG.info("Jumia: Found price ₦%.0f via %s", p, sel)
                         break
     
-    # Fallback: regex from visible text
+    # Fallback: regex from visible text (with product ID filtering for Konga)
     if product["current_price"] is None:
         page_text = visible_text or soup.get_text(" ", strip=True)
         matches = re.findall(r"(?:₦|NGN)[\s]?([\d,]+\.?\d*)", page_text)
         if matches:
             prices = []
+            product_id = _extract_product_id_from_url(url) if "konga" in domain else None
+            
             for m in matches:
                 clean = m.replace(",", "")
                 try:
-                    prices.append(float(clean))
+                    price = float(clean)
+                    
+                    # Filter out product ID for Konga
+                    if product_id and abs(price - product_id) < 100:
+                        continue
+                    
+                    if 5000 <= price <= 5_000_000:
+                        prices.append(price)
                 except:
                     pass
+                    
             if prices:
                 product["current_price"] = max(prices)
                 LOG.info("Fallback regex found price ₦%.0f", max(prices))
@@ -1466,7 +1449,7 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
     if any(phrase in page_text_lower for phrase in ["out of stock", "sold out", "unavailable", "not available"]):
         product["stock_status"] = "out_of_stock"
 
-    # Description extraction (ENHANCED with site-specific selectors)
+    # Description extraction
     if not product["description"]:
         meta_desc = soup.find("meta", attrs={"name": "description"})
         if meta_desc and meta_desc.get("content"):
@@ -1482,7 +1465,7 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
             if desc_sel:
                 product["description"] = desc_sel.get_text(separator="\n", strip=True)
 
-    # Image extraction (COMPLETE with all strategies)
+    # Image extraction
     def _add_image_candidate(src):
         """Helper to add image with validation"""
         if not src:
@@ -1499,7 +1482,7 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
     if og_image and og_image.get("content"):
         _add_image_candidate(og_image["content"])
 
-    # Site-specific image selectors (Jumia & Konga)
+    # Site-specific image selectors
     if "jumia" in domain:
         possible = soup.select("img[class*='prd-img'], img[class*='image'], img[class*='gallery'], img")
         for img in possible:
@@ -1513,32 +1496,7 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
             if src and len(product["images"]) < 6:
                 _add_image_candidate(src)
 
-    # Generic image fallback (if site-specific didn't find enough)
-    if not product["images"]:
-        img_tags = soup.find_all("img")
-        seen = set()
-        for img in img_tags:
-            src = img.get("data-src") or img.get("src") or img.get("data-original")
-            if not src:
-                continue
-            src = urljoin(url, src.strip())
-            if src in seen:
-                continue
-            w = img.get("width") or img.get("data-width")
-            h = img.get("height") or img.get("data-height")
-            try:
-                w_n = int(w) if w and str(w).isdigit() else 0
-                h_n = int(h) if h and str(h).isdigit() else 0
-            except Exception:
-                w_n = h_n = 0
-            if w_n and h_n and (w_n < 50 or h_n < 50):
-                continue
-            seen.add(src)
-            product["images"].append(src)
-            if len(product["images"]) >= 6:
-                break
-
-    # Enhanced title extraction (ORIGINAL logic preserved)
+    # Enhanced title extraction
     if product["title"] == "Product" or "Buy" in product["title"]:
         h1 = soup.select_one("h1.-fs20, h1.-pb10, h1.brd, .v-p-hd h1, h1, .product-title, h1.product-name")
         if h1:
@@ -1546,24 +1504,11 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
         elif soup.title:
             product["title"] = soup.title.string.strip()
 
-    # VISIBLE-TEXT FALLBACK (KONGA ONLY) - applied if no price yet
-    if "konga" in domain and product["current_price"] is None:
-        page_text_visible = visible_text or soup.get_text(" ", strip=True)
-        try:
-            curr, prev = extract_prices_from_visible_text(page_text_visible)
-            if curr is not None:
-                product["current_price"] = curr
-                if prev is not None:
-                    product["previous_price"] = prev
-                LOG.info("Konga visible-text fallback → current ₦%.0f (prev %s)", curr, f"₦{prev:.0f}" if prev else "None")
-        except Exception as e:
-            LOG.debug("Konga visible-text fallback failed: %s", e)
-
     # Final validation
     if product["current_price"] is None:
         raise NoDataError(f"No price found for {url}")
 
-    # Image cleanup (ORIGINAL logic - deduplication + URL validation)
+    # Image cleanup
     cleaned = []
     seen = set()
     for i in product["images"]:
@@ -1582,8 +1527,8 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
     product["description"] = product["description"][:1500].strip()
     product["raw"] = {"json_ld": json_ld_data} if json_ld_data else {"snippet": product["title"]}
 
-    LOG.info("Successfully scraped %s — ₦%.0f — %s (desc len=%d)", 
-             product["title"], product["current_price"], domain, len(product["description"]))
+    LOG.info("Successfully scraped %s — ₦%.0f — %s", 
+             product["title"], product["current_price"], domain)
     
     return product
 
