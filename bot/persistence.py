@@ -1,15 +1,16 @@
-# persistence.py - FIXED DECIMAL/FLOAT CONVERSION + IMPROVED CLEANUP
+# persistence.py - FIXED POSTGRES SSL CONNECTION FOR NEON + IMPROVED CLEANUP
 
 import os
 import json
 import logging
 import asyncio
+import psycopg2
+import psycopg2.pool
+import psycopg2.extras
 from urllib.parse import quote_plus
 from datetime import datetime, timezone, timedelta
 import hashlib
 import redis  # pip install redis
-from psycopg2 import pool
-import psycopg2.extras
 from typing import Optional, Dict, List, Any
 from decimal import Decimal  # For handling Postgres NUMERIC
 
@@ -25,6 +26,16 @@ logger = logging.getLogger(__name__)
 REDIS_URL = os.getenv("REDIS_URL")
 REDIS_TTL_SECONDS = 48 * 3600  # 48 hours for fast dedup cache
 POSTGRES_RETENTION_DAYS = int(os.getenv("POSTGRES_RETENTION_DAYS", "30"))  # 30 days default
+
+# Neon/PostgreSQL connection settings
+POSTGRES_CONNECTION_PARAMS = {
+    "keepalives": 1,  # Enable TCP keepalives
+    "keepalives_idle": 30,  # Start after 30 seconds idle
+    "keepalives_interval": 10,  # Send every 10 seconds
+    "keepalives_count": 5,  # Max 5 keepalive packets
+    "connect_timeout": 10,  # Connection timeout
+    "sslmode": "require",  # Neon requires SSL
+}
 
 # Redis key prefixes
 CHANNEL_SNAP_PREFIX = "channel:snap:"          # Full snapshot
@@ -63,19 +74,79 @@ def get_redis():
     return _redis
 
 # ═══════════════════════════════════════════════════════════════════════════
-# POSTGRES CONNECTION POOL
+# POSTGRES CONNECTION POOL (FIXED FOR NEON SSL)
 # ═══════════════════════════════════════════════════════════════════════════
 
 _pg_pool = None
 
 def get_pg_pool():
-    """Get or create Postgres connection pool."""
+    """Get or create Postgres connection pool with Neon SSL resilience."""
     global _pg_pool
     if _pg_pool is None:
         if not DB_URL:
             raise RuntimeError("DB_URL not set for Postgres")
-        _pg_pool = pool.ThreadedConnectionPool(minconn=2, maxconn=20, dsn=DB_URL)
+        
+        # Parse DB_URL and add connection parameters
+        import urllib.parse
+        parsed = urllib.parse.urlparse(DB_URL)
+        query_params = urllib.parse.parse_qs(parsed.query)
+        
+        # Add Neon-specific connection parameters
+        for key, value in POSTGRES_CONNECTION_PARAMS.items():
+            if key not in query_params:
+                query_params[key] = [str(value)]
+        
+        # Reconstruct URL with parameters
+        new_query = urllib.parse.urlencode(query_params, doseq=True)
+        enhanced_url = urllib.parse.urlunparse(parsed._replace(query=new_query))
+        
+        # Create connection pool with resilience
+        _pg_pool = psycopg2.pool.ThreadedConnectionPool(
+            minconn=2,
+            maxconn=20,
+            dsn=enhanced_url,
+            **POSTGRES_CONNECTION_PARAMS
+        )
+        logger.info("PostgreSQL connection pool created with Neon SSL settings")
     return _pg_pool
+
+def get_pg_connection():
+    """Get connection from pool with automatic retry on SSL failure."""
+    pool_obj = get_pg_pool()
+    
+    for attempt in range(3):
+        try:
+            conn = pool_obj.getconn()
+            # Test connection
+            cur = conn.cursor()
+            cur.execute("SELECT 1")
+            cur.close()
+            conn.commit()
+            return conn
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            logger.warning(f"PostgreSQL connection attempt {attempt+1} failed: {e}")
+            if attempt < 2:
+                time.sleep(1)
+            else:
+                raise
+        except Exception as e:
+            logger.error(f"Unexpected PostgreSQL error: {e}")
+            raise
+
+def return_pg_connection(conn):
+    """Return connection to pool with proper cleanup."""
+    if conn:
+        try:
+            # Rollback any pending transaction
+            conn.rollback()
+            pool_obj = get_pg_pool()
+            pool_obj.putconn(conn)
+        except Exception as e:
+            logger.warning(f"Error returning connection to pool: {e}")
+            try:
+                conn.close()
+            except:
+                pass
 
 # ═══════════════════════════════════════════════════════════════════════════
 # KEY HELPERS
@@ -135,8 +206,7 @@ def _db_ensure_product_table():
     """Create product_snapshots table if not exists."""
     conn = None
     try:
-        pool_obj = get_pg_pool()
-        conn = pool_obj.getconn()
+        conn = get_pg_connection()
         conn.autocommit = True
         cur = conn.cursor()
         cur.execute("""
@@ -160,15 +230,13 @@ def _db_ensure_product_table():
         cur.close()
         logger.info("Ensured product_snapshots table exists")
     finally:
-        if conn:
-            pool_obj.putconn(conn)
+        return_pg_connection(conn)
 
 def _db_ensure_channel_table():
     """Create channel_snapshots table with all fields."""
     conn = None
     try:
-        pool_obj = get_pg_pool()
-        conn = pool_obj.getconn()
+        conn = get_pg_connection()
         conn.autocommit = True
         cur = conn.cursor()
         cur.execute("""
@@ -200,15 +268,13 @@ def _db_ensure_channel_table():
         cur.close()
         logger.info("Ensured channel_snapshots table exists")
     finally:
-        if conn:
-            pool_obj.putconn(conn)
+        return_pg_connection(conn)
 
 def _db_ensure_post_history_table():
     """Create channel_post_history table for tracking all posts."""
     conn = None
     try:
-        pool_obj = get_pg_pool()
-        conn = pool_obj.getconn()
+        conn = get_pg_connection()
         conn.autocommit = True
         cur = conn.cursor()
         cur.execute("""
@@ -235,8 +301,7 @@ def _db_ensure_post_history_table():
         cur.close()
         logger.info("Ensured channel_post_history table exists")
     finally:
-        if conn:
-            pool_obj.putconn(conn)
+        return_pg_connection(conn)
 
 def initialize_database():
     """Initialize all database tables and indexes."""
@@ -253,8 +318,7 @@ def _db_get_product_snapshot(url: str) -> Optional[Dict]:
     """Get product snapshot from Postgres."""
     conn = None
     try:
-        pool_obj = get_pg_pool()
-        conn = pool_obj.getconn()
+        conn = get_pg_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
             SELECT url, site, title, current_price, previous_price, 
@@ -265,17 +329,16 @@ def _db_get_product_snapshot(url: str) -> Optional[Dict]:
         """, (url,))
         row = cur.fetchone()
         cur.close()
-        return _convert_decimals(dict(row)) if row else None  # Convert Decimal
+        conn.commit()
+        return _convert_decimals(dict(row)) if row else None
     finally:
-        if conn:
-            pool_obj.putconn(conn)
+        return_pg_connection(conn)
 
 def _db_upsert_product_snapshot(snapshot: dict):
     """Insert or update product snapshot in Postgres."""
     conn = None
     try:
-        pool_obj = get_pg_pool()
-        conn = pool_obj.getconn()
+        conn = get_pg_connection()
         cur = conn.cursor()
         
         cur.execute("""
@@ -303,8 +366,7 @@ def _db_upsert_product_snapshot(snapshot: dict):
         conn.commit()
         cur.close()
     finally:
-        if conn:
-            pool_obj.putconn(conn)
+        return_pg_connection(conn)
 
 async def load_last_snapshot(url: str) -> Optional[Dict]:
     """
@@ -398,8 +460,7 @@ def _db_get_channel_snapshot(ref: str) -> Optional[Dict]:
     """Get channel snapshot from Postgres."""
     conn = None
     try:
-        pool_obj = get_pg_pool()
-        conn = pool_obj.getconn()
+        conn = get_pg_connection()
         cur = conn.cursor(cursor_factory=psycopg2.extras.RealDictCursor)
         cur.execute("""
             SELECT ref, site, title, url, current_price, raw, last_seen, 
@@ -411,6 +472,7 @@ def _db_get_channel_snapshot(ref: str) -> Optional[Dict]:
         """, (ref,))
         row = cur.fetchone()
         cur.close()
+        conn.commit()
         
         if not row:
             return None
@@ -419,17 +481,15 @@ def _db_get_channel_snapshot(ref: str) -> Optional[Dict]:
         if row.get("expires_at") and row["expires_at"] <= datetime.now(timezone.utc):
             return None
         
-        return _convert_decimals(dict(row))  # Convert Decimal
+        return _convert_decimals(dict(row))
     finally:
-        if conn:
-            pool_obj.putconn(conn)
+        return_pg_connection(conn)
 
 def _db_upsert_channel_snapshot(ref: str, snapshot: dict, expires_hours: int):
     """Insert or update channel snapshot in Postgres."""
     conn = None
     try:
-        pool_obj = get_pg_pool()
-        conn = pool_obj.getconn()
+        conn = get_pg_connection()
         cur = conn.cursor()
         
         expires_at = datetime.now(timezone.utc) + timedelta(hours=expires_hours)
@@ -468,15 +528,13 @@ def _db_upsert_channel_snapshot(ref: str, snapshot: dict, expires_hours: int):
         conn.commit()
         cur.close()
     finally:
-        if conn:
-            pool_obj.putconn(conn)
+        return_pg_connection(conn)
 
 def _db_record_post(ref: str, snapshot: dict, retention_days: int):
     """Record a post in history table."""
     conn = None
     try:
-        pool_obj = get_pg_pool()
-        conn = pool_obj.getconn()
+        conn = get_pg_connection()
         cur = conn.cursor()
         
         expires_at = datetime.now(timezone.utc) + timedelta(days=retention_days)
@@ -497,15 +555,13 @@ def _db_record_post(ref: str, snapshot: dict, retention_days: int):
         conn.commit()
         cur.close()
     finally:
-        if conn:
-            pool_obj.putconn(conn)
+        return_pg_connection(conn)
 
 def _db_check_duplicate_content(content_hash: str, lookback_hours: int = 48) -> bool:
     """Check if content hash exists in recent history."""
     conn = None
     try:
-        pool_obj = get_pg_pool()
-        conn = pool_obj.getconn()
+        conn = get_pg_connection()
         cur = conn.cursor()
         
         cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
@@ -518,10 +574,10 @@ def _db_check_duplicate_content(content_hash: str, lookback_hours: int = 48) -> 
         
         result = cur.fetchone()
         cur.close()
+        conn.commit()
         return result is not None
     finally:
-        if conn:
-            pool_obj.putconn(conn)
+        return_pg_connection(conn)
 
 async def load_channel_snapshot(ref: str) -> Optional[Dict]:
     """
@@ -714,8 +770,7 @@ def _db_delete_expired_channel_snapshots() -> int:
     """Delete expired channel snapshots from Postgres."""
     conn = None
     try:
-        pool_obj = get_pg_pool()
-        conn = pool_obj.getconn()
+        conn = get_pg_connection()
         cur = conn.cursor()
         cur.execute("DELETE FROM channel_snapshots WHERE expires_at <= NOW()")
         deleted = cur.rowcount
@@ -723,15 +778,13 @@ def _db_delete_expired_channel_snapshots() -> int:
         cur.close()
         return deleted
     finally:
-        if conn:
-            pool_obj.putconn(conn)
+        return_pg_connection(conn)
 
 def _db_delete_expired_post_history() -> int:
     """Delete expired post history from Postgres."""
     conn = None
     try:
-        pool_obj = get_pg_pool()
-        conn = pool_obj.getconn()
+        conn = get_pg_connection()
         cur = conn.cursor()
         cur.execute("DELETE FROM channel_post_history WHERE expires_at <= NOW()")
         deleted = cur.rowcount
@@ -739,8 +792,7 @@ def _db_delete_expired_post_history() -> int:
         cur.close()
         return deleted
     finally:
-        if conn:
-            pool_obj.putconn(conn)
+        return_pg_connection(conn)
 
 async def delete_expired_channel_snapshots() -> int:
     """Delete expired snapshots from Postgres."""
