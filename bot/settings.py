@@ -102,10 +102,6 @@ PAID_TIERS = {
 DEFAULT_FREE_LIMIT = MAX_WATCHES_FREE
 
 DEFAULT_SCHOOL_SOURCES = {
-    # --- Official Exam Bodies (Most Critical) ---
-    "JAMB": [
-        "https://www.jamb.gov.ng/"
-    ],
     # --- Higher Education Regulators ---
     "NUC (Universities)": [
         "https://www.nuc.edu.ng/"
@@ -117,13 +113,10 @@ DEFAULT_SCHOOL_SOURCES = {
     "Punch Education": [
         "https://punchng.com/topics/education/"
     ],
-    # --- Ministries (Often slow/heavy, but official) ---
-    "Fed Ministry of Education": [
-        "https://education.gov.ng/"
-    ],
-    "Lagos State Education": [
-        "https://lasubeb.lg.gov.ng/"
-    ],  # Replaced OEQA with LASUBEB (more active)
+
+    #"Lagos State Education": [
+        #"https://lasubeb.lg.gov.ng/"
+    #],  # Replaced OEQA with LASUBEB (more active)
 }
 
 # bot/settings.py - Additions for School News
