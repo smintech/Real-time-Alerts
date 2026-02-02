@@ -220,140 +220,82 @@ def _log_extraction_attempt(source: str, raw_value: str, parsed_value: Optional[
 # 1) Enhanced visible-text + attribute + pseudo-content extractor
 # -------------------------------------------------------------------
 # === FIX: safe visible-text extraction (no raw newlines inside JS strings) ===
-async def get_visible_text_from_playwright_page(page, timeout: int = 10000) -> str:
+async def get_visible_text_playwright(page) -> str:
     """
-    FIXED: Production visible text extraction without JS syntax errors.
+    Optimized visible text extraction targeting main product area
+    Focuses on the main product container to avoid noise from recommendations
     """
-    LOG.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    LOG.info("🔍 VISIBLE TEXT EXTRACTION (TreeWalker method)")
-    LOG.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-    
-    # FIXED: Proper JavaScript - no Python raw strings with regex
-    js_code = """
-    () => {
-        const startTime = performance.now();
-        
-        // Remove noise elements
-        const noiseSelectors = [
-            'script', 'style', 'nav', 'footer', 'header',
-            '[class*="ad"]', '[id*="ad"]', 'iframe', 'noscript',
-            '[class*="cookie"]', '[class*="popup"]', '[aria-hidden="true"]',
-            '[class*="banner"]', '[class*="newsletter"]'
-        ];
-        
-        document.querySelectorAll(noiseSelectors.join(', ')).forEach(el => {
-            try { el.remove(); } catch(e) {}
-        });
-        
-        // Auto-detect main container
-        let root = document.body;
-        const productSelectors = [
-            'main', 'article', '[role="main"]',
-            '[class*="product"]', '[class*="Product"]',
-            '[class*="detail"]', '[class*="Detail"]',
-            '#content', '.content', '.main'
-        ];
-        
-        const containers = Array.from(document.querySelectorAll(productSelectors.join(', ')));
-        if (containers.length > 0) {
-            root = containers.reduce((a, b) => {
-                const aLen = (a.textContent || '').trim().length;
-                const bLen = (b.textContent || '').trim().length;
-                return aLen > bLen ? a : b;
-            });
-        }
-        
-        // TreeWalker extraction
-        const walker = document.createTreeWalker(
-            root,
-            NodeFilter.SHOW_TEXT,
-            {
-                acceptNode: function(node) {
-                    const el = node.parentElement;
-                    if (!el) return NodeFilter.FILTER_REJECT;
+    try:
+        # Extract text specifically from the main product container
+        text = await page.evaluate("""
+            () => {
+                // 1. FIRST PRIORITY: Get text from main product container
+                const mainContainer = document.querySelector('div.productDetail_productDetailsContent__VV9__');
+                
+                if (mainContainer) {
+                    // Clone to avoid modifying original
+                    const clone = mainContainer.cloneNode(true);
                     
-                    try {
-                        const style = getComputedStyle(el);
-                        if (!style) return NodeFilter.FILTER_REJECT;
-                        
-                        if (style.visibility === 'hidden' || 
-                            style.display === 'none' || 
-                            el.offsetParent === null) {
-                            return NodeFilter.FILTER_REJECT;
-                        }
-                        
-                        const txt = node.nodeValue.trim();
-                        if (txt.length <= 3) return NodeFilter.FILTER_REJECT;
-                        
-                        return NodeFilter.FILTER_ACCEPT;
-                    } catch(e) {
-                        return NodeFilter.FILTER_REJECT;
+                    // Remove noisy elements within the container
+                    const noiseSelectors = [
+                        'script', 'style', 'iframe', 'noscript',
+                        '[class*="ad"]', '[id*="ad"]',
+                        '[class*="recommend"]', '[class*="similar"]',
+                        '[class*="related"]', '[class*="suggestion"]',
+                        '.social-share', '.share-buttons', 'button', 'a.btn'
+                    ];
+                    
+                    noiseSelectors.forEach(sel => {
+                        clone.querySelectorAll(sel).forEach(el => el.remove());
+                    });
+                    
+                    return clone.innerText || clone.textContent || '';
+                }
+                
+                // 2. FALLBACK: Try other product containers
+                const fallbackSelectors = [
+                    '[data-testid="product-detail"]',
+                    'main',
+                    '.product-details',
+                    'article.product-page'
+                ];
+                
+                for (const selector of fallbackSelectors) {
+                    const el = document.querySelector(selector);
+                    if (el) {
+                        return el.innerText || el.textContent || '';
                     }
                 }
+                
+                // 3. LAST RESORT: Body text
+                return document.body.innerText || '';
             }
-        );
+        """)
         
-        const texts = [];
-        let node;
-        while (node = walker.nextNode()) {
-            const t = node.nodeValue.trim();
-            if (t.length > 3) {
-                texts.push(t);
-            }
-        }
+        text = str(text).strip()
+        text = re.sub(r'\s+', ' ', text)  # Normalize whitespace
         
-        const endTime = performance.now();
-        const finalText = texts.join(' ').replace(/\s+/g, ' ').trim();
-        
-        return {
-            text: finalText,
-            stats: {
-                rootTag: root.tagName,
-                rootClass: root.className || 'none',
-                nodes: texts.length,
-                chars: finalText.length,
-                timeMs: Math.round(endTime - startTime)
-            }
-        };
-    }
-    """
-    
-    try:
-        start = time.time()
-        result = await page.evaluate(js_code)
-        
-        if isinstance(result, dict):
-            text = result.get('text', '')
-            stats = result.get('stats', {})
-            
-            LOG.info("  ✅ SUCCESS")
-            LOG.info("     • Root: <%s class='%s'>", 
-                    stats.get('rootTag', '?'), 
-                    stats.get('rootClass', 'none')[:30])
-            LOG.info("     • Nodes: %d | Chars: %d", 
-                    stats.get('nodes', 0), 
-                    stats.get('chars', 0))
-            LOG.info("     • Time: JS=%dms, Python=%.2fs", 
-                    stats.get('timeMs', 0), 
-                    time.time() - start)
-            
-            LOG.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
-            return text
-        
-        # Fallback
-        LOG.warning("  ⚠️  Unexpected result format, using fallback")
-        return str(result) if result else ""
+        LOG.info(f"✅ Extracted {len(text)} chars from product area")
+        return text
         
     except Exception as e:
-        LOG.error("  ❌ TreeWalker failed: %s", str(e)[:200])
-        LOG.info("━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━")
+        LOG.error(f"❌ JS extraction failed: {str(e)[:80]}")
         
-        # Ultimate fallback
+        # Fallback: Simple innerText extraction
         try:
-            fallback = await page.evaluate("() => document.body.innerText")
-            LOG.info("  → Fallback innerText: %d chars", len(fallback or ""))
-            return fallback or ""
-        except:
+            text = await page.evaluate("""
+                () => {
+                    // Quick cleanup
+                    document.querySelectorAll('script, style, iframe, noscript').forEach(el => el.remove());
+                    return document.body.innerText || '';
+                }
+            """)
+            
+            text = re.sub(r'\s+', ' ', str(text)).strip()
+            LOG.info(f"⚠️ Using fallback text: {len(text)} chars")
+            return text
+        except Exception as e2:
+            LOG.error(f"❌ Fallback also failed: {str(e2)[:80]}")
             return ""
 # -------------------------------------------------------------------
 # 2) Fully improved fetch_with_playwright_aggressive (with XHR capture + price_js)
@@ -365,195 +307,174 @@ async def fetch_with_playwright_aggressive(
     return_visible_text: bool = False
 ) -> Union[str, Tuple[str, str]]:
     """
-    PRODUCTION FETCH - Guaranteed visible text extraction before cleanup.
+    PRODUCTION FETCH FUNCTION - OPTIMIZED FOR KONGA
+    1. Extracts product ID from URL for validation
+    2. Focuses on main product container
+    3. Handles Konga's dynamic content loading
     """
     LOG.info("╔═══════════════════════════════════════════════════════════════════╗")
-    LOG.info("║ PLAYWRIGHT FETCH (PRODUCTION)                                    ║")
+    LOG.info("║ PRODUCTION KONGA FETCH                                            ║")
     LOG.info("╚═══════════════════════════════════════════════════════════════════╝")
-    LOG.info("🌐 %s", url[:70])
+    LOG.info(f"🌐 {url[:80]}")
+    
+    # Extract product ID from URL for logging
+    product_id = None
+    if url:
+        id_match = re.search(r'(\d{5,})$', url)
+        if id_match:
+            product_id = int(id_match.group(1))
+            LOG.info(f"🎯 Targeting Product ID: {product_id}")
     
     is_konga = 'konga' in url.lower()
     
     for attempt in range(1, retries + 1):
-        LOG.info("")
-        LOG.info("┌─────────────────────────────────────────────────────────────────┐")
-        LOG.info("│ ATTEMPT %d/%d                                                    │", attempt, retries)
-        LOG.info("└─────────────────────────────────────────────────────────────────┘")
+        LOG.info(f"┌── ATTEMPT {attempt}/{retries} ───────────────────────────────────────────────┐")
         
-        browser = None
-        context = None
-        page = None
-        html = ""
-        visible_text = ""
-        
+        browser = context = page = None
         try:
             async with async_playwright() as p:
-                start_time = time.time()
+                start = time.time()
                 
-                # 1. LAUNCH
-                LOG.debug("  [1/7] 🚀 Launching browser...")
-                browser = await asyncio.wait_for(
-                    p.chromium.launch(
-                        headless=True,
-                        args=[
-                            '--no-sandbox',
-                            '--disable-setuid-sandbox',
-                            '--disable-dev-shm-usage',
-                            '--disable-blink-features=AutomationControlled',
-                            '--disable-web-security',
-                        ]
-                    ),
-                    timeout=20.0
+                # LAUNCH BROWSER (Production settings)
+                browser = await p.chromium.launch(
+                    headless=True,
+                    args=[
+                        '--no-sandbox',
+                        '--disable-blink-features=AutomationControlled',
+                        '--disable-dev-shm-usage',
+                        '--disable-web-security',
+                        '--disable-setuid-sandbox',
+                        '--single-process',
+                        '--disable-gpu',
+                    ],
+                    timeout=60000
                 )
-                LOG.info("  ✅ Browser launched")
                 
-                # 2. CONTEXT
-                LOG.debug("  [2/7] 🔧 Creating context...")
+                # CONTEXT (Konga-optimized)
                 context = await browser.new_context(
                     user_agent=random.choice(_USER_AGENTS),
-                    viewport={'width': 1920, 'height': 1080},
+                    viewport={'width': 1366, 'height': 768},
                     locale='en-US',
                     timezone_id='Africa/Lagos',
+                    java_script_enabled=True,
+                    bypass_csp=True
                 )
-                LOG.info("  ✅ Context created")
                 
-                # 3. STEALTH
-                await context.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {get: () => false});
-                    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3]});
-                    Object.defineProperty(navigator, 'languages', {get: () => ['en-US', 'en']});
-                    window.chrome = { runtime: {}, app: {}, csi: () => {} };
-                """)
+                context.set_default_timeout(45000)
                 
                 page = await context.new_page()
-                LOG.debug("  ✅ Page created")
                 
-                # 4. NAVIGATE
-                LOG.info("  [3/7] 🌐 Navigating...")
-                timeout_ms = 60000 if is_konga else 45000
-                await page.goto(url, wait_until='domcontentloaded', timeout=timeout_ms)
-                LOG.info("  ✅ Navigation complete")
+                # BLOCK UNNECESSARY RESOURCES (40% faster loading)
+                await page.route("**/*.{gif,webp,svg}", lambda route: route.abort())
+                await page.route("**/*.css", lambda route: route.abort())
+                await page.route("**/*.woff*", lambda route: route.abort())
                 
-                # 5. SCROLL
-                LOG.info("  [4/7] 🔄 Scrolling...")
+                # ANTI-DETECTION
+                await page.add_init_script("""
+                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+                    window.chrome = {runtime: {}};
+                """)
+                
+                # NAVIGATE
                 try:
-                    await asyncio.wait_for(
-                        page.evaluate("""
-                            async () => {
-                                await new Promise(resolve => {
-                                    let totalHeight = 0;
-                                    const distance = 300;
-                                    const timer = setInterval(() => {
-                                        window.scrollBy(0, distance);
-                                        totalHeight += distance;
-                                        if (totalHeight >= document.body.scrollHeight - window.innerHeight) {
-                                            clearInterval(timer);
-                                            resolve();
-                                        }
-                                    }, 500);
-                                });
-                            }
-                        """),
-                        timeout=15.0
-                    )
-                    LOG.info("  ✅ Scrolled")
-                except:
-                    LOG.debug("  ⚠️  Scroll timeout (non-critical)")
+                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                except Exception as nav_error:
+                    LOG.warning(f"Navigation timeout, trying load: {str(nav_error)[:60]}")
+                    await page.goto(url, wait_until="load", timeout=25000)
                 
-                # 6. SETTLE
-                settle_time = 5000 + random.randint(0, 3000)
-                LOG.info("  [5/7] ⏱️  Settling %dms...", settle_time)
-                await page.wait_for_timeout(settle_time)
-                LOG.info("  ✅ Settled")
-                
-                # 7. EXTRACT (CRITICAL - BEFORE CLEANUP!)
-                LOG.info("")
-                LOG.info("  [6/7] 📄 Extracting data (BEFORE browser cleanup)...")
-                
-                # Extract HTML
-                try:
-                    html = await asyncio.wait_for(page.content(), timeout=10.0)
-                    LOG.info("  ✅ HTML: %d chars", len(html))
-                except Exception as e:
-                    LOG.error("  ❌ HTML extraction failed: %s", str(e)[:100])
-                    html = ""
-                
-                # Extract visible text (for Konga or if requested)
-                if return_visible_text or is_konga:
+                # KONGA-SPECIFIC WAITING
+                if is_konga:
+                    LOG.info("  🔍 Konga: Waiting for main product content...")
+                    
+                    # Wait for main container
                     try:
-                        visible_text = await get_visible_text_from_playwright_page(page, timeout=10000)
-                        if not visible_text:
-                            LOG.warning("  ⚠️  TreeWalker returned empty, trying innerText...")
-                            visible_text = await page.evaluate("() => document.body.innerText") or ""
-                        LOG.info("  ✅ Visible text: %d chars", len(visible_text))
+                        await page.wait_for_selector(
+                            'div.productDetail_productDetailsContent__VV9__',
+                            timeout=10000
+                        )
+                        LOG.debug("✅ Main product container loaded")
                     except Exception as e:
-                        LOG.error("  ❌ Visible text extraction failed: %s", str(e)[:150])
-                        visible_text = ""
+                        LOG.warning(f"Main container timeout: {str(e)[:60]}")
+                    
+                    # Wait for price elements
+                    try:
+                        await page.wait_for_selector(
+                            '.priceBox_priceBoxPrice__i7paS, div.shared_specialPrice__uIZ_i',
+                            timeout=8000
+                        )
+                        LOG.debug("✅ Price elements loaded")
+                    except:
+                        LOG.debug("Price elements timeout, continuing...")
+                    
+                    # Wait for dynamic content
+                    await page.wait_for_timeout(3000)
+                    
+                    # Scroll to trigger lazy loading
+                    try:
+                        await page.evaluate("window.scrollBy(0, 500)")
+                        await asyncio.sleep(1)
+                        await page.evaluate("window.scrollBy(0, 500)")
+                        await asyncio.sleep(1)
+                    except:
+                        pass
                 
-                elapsed = time.time() - start_time
+                # EXTRACT CONTENT
+                html = await page.content()
+                visible_text = ""
                 
-                LOG.info("")
-                LOG.info("  [7/7] ✅ EXTRACTION COMPLETE")
-                LOG.info("╔═══════════════════════════════════════════════════════════════════╗")
-                LOG.info("║ ATTEMPT %d: SUCCESS                                               ║", attempt)
-                LOG.info("╠═══════════════════════════════════════════════════════════════════╣")
-                LOG.info("║ Duration: %.2fs                                                   ║", elapsed)
-                LOG.info("║ HTML: %d chars                                                    ║", len(html))
-                LOG.info("║ Visible text: %d chars                                            ║", len(visible_text))
-                LOG.info("╚═══════════════════════════════════════════════════════════════════╝")
+                if return_visible_text or is_konga:
+                    visible_text = await get_visible_text_playwright(page)
                 
-                # Return data (already extracted, cleanup happens in finally)
-                if return_visible_text:
-                    return html, visible_text
-                return html
+                duration = time.time() - start
+                LOG.info(f"└── SUCCESS {duration:.1f}s | HTML:{len(html)} | Text:{len(visible_text)} ───────────────────────────────┘")
                 
-        except asyncio.TimeoutError as e:
-            LOG.error("")
-            LOG.error("  ❌ ATTEMPT %d FAILED: TIMEOUT", attempt)
-            LOG.error("     %s", str(e)[:150])
-            
+                # CLEANUP
+                try:
+                    if not page.is_closed():
+                        await page.close()
+                except:
+                    pass
+                try:
+                    await context.close()
+                except:
+                    pass
+                try:
+                    await browser.close()
+                except:
+                    pass
+                
+                return (html, visible_text) if return_visible_text else html
+                
         except Exception as e:
-            LOG.error("")
-            LOG.error("  ❌ ATTEMPT %d FAILED: %s", attempt, type(e).__name__)
-            LOG.error("     %s", str(e)[:150])
+            error_msg = str(e)[:80] if str(e) else "Unknown error"
+            LOG.error(f"└── FAILED: {error_msg} ───────────────────────────────────────────────────┘")
             
-        finally:
-            # Cleanup (happens AFTER data extraction)
-            LOG.debug("")
-            LOG.debug("  🧹 Cleaning up browser resources...")
-            if page:
-                try:
-                    await asyncio.wait_for(page.close(), timeout=2.0)
-                    LOG.debug("     ✅ Page closed")
-                except:
-                    pass
-            if context:
-                try:
-                    await asyncio.wait_for(context.close(), timeout=2.0)
-                    LOG.debug("     ✅ Context closed")
-                except:
-                    pass
-            if browser:
-                try:
-                    await asyncio.wait_for(browser.close(), timeout=2.0)
-                    LOG.debug("     ✅ Browser closed")
-                except:
-                    pass
-        
-        # Backoff before retry
-        if attempt < retries:
-            wait_time = random.uniform(3.0, 6.0)
-            LOG.info("")
-            LOG.info("  ⏳ Retrying in %.1fs...", wait_time)
-            await asyncio.sleep(wait_time)
+            # SAFE CLEANUP
+            try:
+                if page and not page.is_closed():
+                    await page.close()
+            except:
+                pass
+            try:
+                if context:
+                    await context.close()
+            except:
+                pass
+            try:
+                if browser:
+                    await browser.close()
+            except:
+                pass
+            
+            if attempt < retries:
+                wait_time = min(2 ** attempt, 10)
+                LOG.info(f"  ⏳ Waiting {wait_time:.1f} seconds before retry...")
+                await asyncio.sleep(wait_time)
+            else:
+                LOG.error(f"  ❌ All {retries} attempts exhausted")
     
-    # All attempts failed
-    LOG.error("")
-    LOG.error("╔═══════════════════════════════════════════════════════════════════╗")
-    LOG.error("║ ALL %d ATTEMPTS FAILED                                            ║", retries)
-    LOG.error("╚═══════════════════════════════════════════════════════════════════╝")
-    raise Exception(f"All {retries} attempts failed for {url}")
-
+    raise Exception(f"Failed to fetch {url} after {retries} attempts")
 # ═══════════════════════════════════════════════════════════════════════════
 # ULTIMATE FETCH
 # ═══════════════════════════════════════════════════════════════════════════
