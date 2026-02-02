@@ -1238,7 +1238,7 @@ async def run_bot():
             #application.job_queue.run_repeating(
                 callback=check_and_post_channel_deals,
                 interval=CHECK_INTERVAL_SECONDS,
-                first=10,
+                #first=10,
                 name="channel_deals"
             )
             application.job_queue.run_repeating(
