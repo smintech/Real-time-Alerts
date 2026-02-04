@@ -1,6 +1,7 @@
 FROM mcr.microsoft.com/playwright/python:v1.57.0-noble
 
 ENV PLAYWRIGHT_BROWSERS_PATH=/ms-playwright
+ENV PYTHONUNBUFFERED=1
 
 RUN apt-get update && apt-get install -y \
     fonts-liberation \
