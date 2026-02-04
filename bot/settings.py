@@ -123,7 +123,7 @@ DEFAULT_SCHOOL_SOURCES = {
 # IMPROVED SCHOOL NEWS KEYWORDS AND DATE PATTERNS
 # ============================================================================
 
-SCHOOL_KEYWORDS_RE = re.compile(
+_SCHOOL_KEYWORDS_RE = re.compile(
     r"""
     # Core academic terms
     \b(?:academic\s+(?:calendar|session|year|break|activities|program|schedule))\b|
