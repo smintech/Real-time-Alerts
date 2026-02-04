@@ -119,10 +119,6 @@ DEFAULT_SCHOOL_SOURCES = {
     #],  # Replaced OEQA with LASUBEB (more active)
 }
 
-# bot/settings.py - Additions for School News
-import re
-
-# ENHANCED: Broader keyword detection (handles plurals/ed forms)
 # ============================================================================
 # IMPROVED SCHOOL NEWS KEYWORDS AND DATE PATTERNS
 # ============================================================================
