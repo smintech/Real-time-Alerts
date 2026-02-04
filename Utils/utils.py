@@ -73,16 +73,14 @@ _SCRAPER_PROXIES = os.environ.get("SCRAPER_PROXIES", "") and [
 if not _SCRAPER_PROXIES:
     LOG.debug("No proxies configured — running proxy-free mode")
 
-# ═══════════════════════════════════════════════════════════════════════════
-# NEWS PATH DETECTION (IMPROVED - REMOVED SUBDOMAIN GUESS)
-# ═══════════════════════════════════════════════════════════════════════════
-
 COMMON_NEWS_PATHS = [
     "/news", "/news-events", "/news-and-events",
     "/News", "/bulletin", "/bulletins", "/Bulletin", "/news-events/",
     "/category/news", "/category/news/", "/category/press-release",
     "/topics/education/", "/category/education/", "/tags/education/",
 ]
+
+MAX_ARTICLE_AGE_DAYS = 180
 
 def candidate_listing_urls(base_url: str) -> List[str]:
     """
@@ -459,23 +457,34 @@ async def fetch_with_playwright_aggressive(
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def fetch_html_ultimate(url: str) -> str:
-    LOG.info("fetch_html_ultimate: fetching %s", url)
+    """Fetch HTML with priority for Playwright on MySchool pages."""
+    domain = get_domain_from_url(url)
     
-    try:
-        loop = asyncio.get_running_loop()
-        html = await loop.run_in_executor(None, fetch_with_cloudscraper_aggressive, url, 5)
-        return html
-    except Exception as e:
-        LOG.debug("Cloudscraper exhausted for %s: %s", url, e)
+    # Always use Playwright for MySchool article pages (they need JS)
+    if 'myschool.ng' in domain and '/news/' in url:
+        try:
+            return await fetch_with_playwright_aggressive(url)
+        except Exception as e:
+            LOG.warning(f"Playwright failed for MySchool article {url}: {e}")
+            # Fallback to cloudscraper
+            try:
+                return fetch_with_cloudscraper_aggressive(url)
+            except:
+                pass
     
+    # For other sites, try cloudscraper first (faster)
     try:
-        html = await fetch_with_playwright_aggressive(url, retries=3)
-        return html
+        return fetch_with_cloudscraper_aggressive(url)
     except Exception as e:
-        LOG.debug("Playwright exhausted for %s: %s", url, e)
+        LOG.debug(f"Cloudscraper failed for {url}: {e}")
+    
+    # Fallback to Playwright
+    try:
+        return await fetch_with_playwright_aggressive(url)
+    except Exception as e:
+        LOG.debug(f"Playwright fallback failed for {url}: {e}")
     
     raise Exception(f"Failed to fetch {url}")
-
 # ═══════════════════════════════════════════════════════════════════════════
 # RETRY DECORATOR
 # ═══════════════════════════════════════════════════════════════════════════
@@ -563,7 +572,6 @@ async def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False) ->
 # ═══════════════════════════════════════════════════════════════════════════
 # HELPER FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════
-
 async def safe_send(bot: Bot, targets: int | List[int], text: str, **kwargs) -> List[Tuple[int, bool, Optional[str]]]:
     """Sends a message to one or more chat_ids safely."""
     if not isinstance(targets, list):
@@ -597,6 +605,49 @@ def _best_identifier(raw: Dict[str, Any]) -> Optional[str]:
         if v:
             return str(v).strip().lower()
     return None
+
+def parse_myschool_date(date_str: str) -> Optional[datetime]:
+    """Parse MySchool date string."""
+    if not date_str:
+        return None
+    date_str = date_str.replace('|', '').replace('Comments', '').strip()
+    date_str = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', date_str)
+    date_formats = ['%d %B, %Y', '%d %b, %Y', '%B %d, %Y', '%b %d, %Y', '%d/%m/%Y', '%Y-%m-%d', '%d %B %Y', '%d %b %Y']
+    for fmt in date_formats:
+        try:
+            return datetime.strptime(date_str, fmt)
+        except:
+            continue
+    return None
+
+def parse_punch_date(date_str: str) -> Optional[datetime]:
+    if not date_str:
+        return None
+    date_formats_with_time = ['%B %d, %Y %I:%M %p', '%b %d, %Y %I:%M %p']
+    date_formats_no_time = ['%B %d, %Y', '%b %d, %Y']
+    for fmt in date_formats_with_time + date_formats_no_time:
+        try:
+            return datetime.strptime(date_str, fmt)
+        except:
+            continue
+    return None
+
+def parse_nuc_date(date_str: str) -> Optional[datetime]:
+    if not date_str:
+        return None
+    date_formats = ['%b %d, %Y', '%B %d, %Y']
+    for fmt in date_formats:
+        try:
+            return datetime.strptime(date_str, fmt)
+        except:
+            continue
+    return None
+
+def is_recent_date(date_obj: Optional[datetime]) -> bool:
+    if not date_obj:
+        return False
+    cutoff_date = datetime.now() - timedelta(days=MAX_ARTICLE_AGE_DAYS)
+    return date_obj >= cutoff_date
 
 def normalize_product_key(scrape_result: Dict[str, Any]) -> str:
     raw = scrape_result.get("raw") or {}
@@ -1881,939 +1932,592 @@ async def scrape_lpg_prices() -> Dict[str, Any]:
         "valid_depots_count": len(valid_prices),
         "note": "Lagos retail estimate calculated as: average depot price per kg + ₦400–600/kg typical markup",
     }
-
 # ═══════════════════════════════════════════════════════════════════════════
-# SCHOOL NEWS ARTICLE EXTRACTION (IMPROVED WITH SITE-SPECIFIC LOGIC)
+# SITE-SPECIFIC ARTICLE LISTING PAGE
 # ═══════════════════════════════════════════════════════════════════════════
+async def get_myschool_recent_articles() -> List[str]:
+    """Get recent MySchool article URLs from the listing page."""
+    base = "https://myschool.ng"
+    try:
+        listing_html = await fetch_html_ultimate(f"{base}/news/latest")
+    except Exception as e:
+        LOG.error(f"Failed to fetch MySchool listing: {e}")
+        return []
+    
+    if not listing_html:
+        return []
+    soup = BeautifulSoup(listing_html, 'lxml')
+    article_links = []
+    
+    # Look for card containers as per your analysis
+    for card in soup.select('div.card'):
+        link = card.select_one('a[href*="/news/"]')
+        if link:
+            href = link.get('href', '')
+            if '/news/' in href and not any(x in href for x in ['category', 'page', 'tag', 'author']):
+                full_url = urljoin(base, href)
+                if full_url not in article_links:
+                    article_links.append(full_url)
+    
+    # Also look for direct news links
+    for a in soup.select('a[href*="/news/"]'):
+        href = a.get('href', '')
+        if '/news/' in href and not any(x in href for x in ['category', 'page', 'tag', 'author']):
+            full_url = urljoin(base, href)
+            if full_url not in article_links:
+                article_links.append(full_url)
+    
+    return list(set(article_links))[:20]
 
-def extract_key_information(content: str) -> Dict[str, Any]:
-    """Extract structured information from article content."""
-    key_info = {
-        'dates_mentioned': [],
-        'institutions': [],
-        'exams': [],
-        'deadlines': [],
-        'important_actions': []
-    }
+async def get_punch_recent_articles() -> List[str]:
+    base = "https://punchng.com"
+    try:
+        listing_html = await fetch_html_ultimate(f"{base}/topics/education/")
+    except Exception as e:
+        LOG.error(f"Failed to fetch Punch listing: {e}")
+        return []
     
-    if not content:
-        return key_info
-    
-    # Extract dates
-    dates = _DATE_RE.findall(content) if _DATE_RE else []
-    found_dates = []
-    for d in dates:
-        if isinstance(d, tuple):
-            for part in d:
-                if part and part.strip():
-                    found_dates.append(part.strip())
-        elif isinstance(d, str):
-            found_dates.append(d)
-    key_info['dates_mentioned'] = list(dict.fromkeys(found_dates))[:5]
-    
-    # Extract institutions
-    institutions_pattern = r'\b([A-Z][A-Za-z]+\s+(?:University|Polytechnic|College|Institute))\b'
-    key_info['institutions'] = list(set(re.findall(institutions_pattern, content)))[:10]
-    
-    # Extract exam mentions
-    exam_pattern = r'\b(JAMB|WAEC|NECO|POST-UTME|UTME|GCE|BECE)\b'
-    key_info['exams'] = list(set(re.findall(exam_pattern, content, re.I)))
-    
-    # Extract deadlines
-    deadline_pattern = r'(?:deadline|closes?|ends?|due|before|by)\s+.*?(\d{1,2}\s+(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4})'
-    key_info['deadlines'] = re.findall(deadline_pattern, content, re.I)[:3]
-    
-    # Extract action items
-    action_pattern = r'\b(register|apply|submit|pay|upload|visit|contact|download)\b.*?(?:\.|;|\n)'
-    actions = re.findall(action_pattern, content, re.I)
-    key_info['important_actions'] = [a.strip() for a in actions[:5]]
-    
-    return key_info
+    if not listing_html:
+        return []
+    soup = BeautifulSoup(listing_html, 'lxml')
+    articles_with_dates = []
+    for article in soup.select('article.entry-item-simple'):
+        link = article.select_one('a[href*="punchng.com"]')
+        if not link:
+            continue
+        full_url = urljoin(base, link.get('href', ''))
+        date_elem = article.select_one('p, time, .date')
+        date_str = date_elem.get_text(strip=True) if date_elem else ""
+        date_obj = parse_punch_date(date_str)
+        articles_with_dates.append({
+            'url': full_url,
+            'date_obj': date_obj or datetime.min
+        })
+    articles_with_dates.sort(key=lambda x: x['date_obj'], reverse=True)
+    return [article['url'] for article in articles_with_dates[:15]]
 
-def clean_text(text: str) -> str:
-    """Clean extracted text."""
-    if not text:
-        return ""
-    text = re.sub(r'\s+', ' ', text)
-    text = re.sub(r'(Advertisement|ADVERTISEMENT|Subscribe|Share|Tweet|Pin)', '', text)
-    return text.strip()
-
-def extract_article_content(html: str, url: str) -> Dict[str, str]:
-    """
-    Extract article content with site-specific improvements.
-    Handles CSR/SSR via Playwright fetch (already done).
-    """
+async def get_nuc_recent_articles() -> List[str]:
+    base = "https://www.nuc.edu.ng"
+    try:
+        listing_html = await fetch_html_ultimate(base)
+    except Exception as e:
+        LOG.error(f"Failed to fetch NUC listing: {e}")
+        return []
+    
+    if not listing_html:
+        return []
+    soup = BeautifulSoup(listing_html, 'lxml')
+    articles_with_dates = []
+    for article in soup.select('article.post, .et_pb_post'):
+        link = article.select_one('a[href*="nuc.edu.ng"]')
+        if not link:
+            continue
+        href = link.get('href', '')
+        if href.endswith('.pdf') or '/wp-content/' in href:
+            continue
+        full_url = urljoin(base, href)
+        date_elem = article.select_one('span.published, .post-date, time')
+        date_str = date_elem.get_text(strip=True) if date_elem else ""
+        date_obj = parse_nuc_date(date_str)
+        articles_with_dates.append({
+            'url': full_url,
+            'date_obj': date_obj or datetime.min
+        })
+    articles_with_dates.sort(key=lambda x: x['date_obj'], reverse=True)
+    return [article['url'] for article in articles_with_dates[:15]]
+# ═══════════════════════════════════════════════════════════════════════════
+# SITE-SPECIFIC ARTICLE CONTENTS EXTRACTOR
+# ═══════════════════════════════════════════════════════════════════════════
+def extract_myschool_content(html: str, url: str) -> Dict[str, Any]:
+    """Specialized extraction for MySchool articles with better content detection."""
+    if not html:
+        return {'success': False}
+    
     soup = BeautifulSoup(html, 'lxml')
-    
-    # Remove noise
-    for elem in soup.select('script, style, [class*="ad"], [id*="ad"], [class*="banner"], [id*="banner"], iframe, noscript'):
-        try:
-            elem.decompose()
-        except Exception:
-            pass
-    
-    domain = get_domain_from_url(url)
-    
-    # Site-specific title selectors
-    title_selectors = {
-        'default': ['h1.entry-title', 'h1.post-title', 'h1', 'title', 'meta[property="og:title"]', 'h2', 'h3'],
-        'jamb.gov.ng': ['.article-title', 'h1', 'h2'],
-        'neco.gov.ng': ['.post-title', 'h1'],
-        'nuc.edu.ng': ['.page-title', 'h2 a'],
-        'myschool.ng': ['.news-title', 'h1', 'h2'],
-        'punchng.com': ['h1.entry-title', 'h1.post-title'],
-        'education.gov.ng': ['.article-header h1', 'h2'],
-        'lasubeb.lg.gov.ng': ['.news-headline', 'h3'],
-    }
-    
-    # Site-specific content selectors
-    content_selectors = {
-        'default': ['article.post-content', 'div.entry-content', 'div.post-content', 'div.article-content', 'div.content', 'article', 'div.post', 'div.article-body', 'div.main-content', 'section.article', 'div.body-text', 'div#article', 'div#content'],
-        'jamb.gov.ng': ['.article-body', 'div.content'],
-        'neco.gov.ng': ['.post-body', 'div.entry'],
-        'nuc.edu.ng': ['.page-content', 'div.article'],
-        'myschool.ng': ['.news-content', 'div.body'],
-        'punchng.com': ['.entry-content', 'div.post-content'],
-        'education.gov.ng': ['.article-content', 'div.main'],
-        'lasubeb.lg.gov.ng': ['.news-body', 'div.content'],
-    }
-    
-    # Select based on domain
-    site_key = next((k for k in content_selectors if k in domain), 'default')
-    selected_title_selectors = title_selectors.get(site_key, title_selectors['default'])
-    selected_content_selectors = content_selectors.get(site_key, content_selectors['default'])
     
     # Extract title
     title = ""
-    for selector in selected_title_selectors:
-        elem = soup.select_one(selector)
-        if elem:
-            if selector.startswith('meta'):
-                title = clean_text(elem.get('content', ''))
-            else:
-                title = clean_text(elem.get_text())
-            if title:
-                break
+    title_elem = soup.select_one('h3.page-title.blog-header-title, h1, .post-title, h2')
+    if title_elem:
+        title = title_elem.get_text(strip=True)
     
     # Extract date
-    date = None
-    if _DATE_RE:
-        date_match = _DATE_RE.search(html)
+    date_str = ""
+    date_obj = None
+    
+    # Look for posted by text
+    posted_by = soup.find(string=re.compile(r'Posted by', re.I))
+    if posted_by:
+        date_match = re.search(r'(\d{1,2}(?:st|nd|rd|th)?\s+\w+\s*,\s*\d{4}|\d{1,2}\s+\w+\s+\d{4})', str(posted_by), re.I)
         if date_match:
-            date = date_match.group(0)
+            date_str = date_match.group(1)
+            date_obj = parse_myschool_date(date_str)
     
-    # Extract content
-    content = ""
-    for selector in selected_content_selectors:
-        article_elem = soup.select_one(selector)
-        if article_elem:
-            # Remove inner noise
-            for inner_ad in article_elem.select('[class*="ad"], [id*="ad"], [class*="banner"], [id*="banner"]'):
-                try:
-                    inner_ad.decompose()
-                except Exception:
-                    pass
+    if not date_obj:
+        all_text = soup.get_text()
+        date_match = re.search(r'(\d{1,2}(?:st|nd|rd|th)?\s+\w+\s*,\s*\d{4}|\d{1,2}\s+\w+\s+\d{4})', all_text, re.I)
+        if date_match:
+            date_str = date_match.group(1)
+            date_obj = parse_myschool_date(date_str)
+    
+    # Find article content
+    all_paragraphs = soup.find_all('p')
+    article_content = []
+    
+    skip_patterns = [
+        r'Posted by',
+        r'Comments',
+        r'^\d+\s*Comments?$',
+        r'^\s*$',
+        r'^[0-9\s]+$',
+    ]
+    
+    found_article_start = False
+    for p in all_paragraphs:
+        p_text = p.get_text(strip=True)
+        
+        if any(re.match(pattern, p_text, re.I) for pattern in skip_patterns):
+            continue
+        
+        if len(p_text) < 20:
+            continue
+        
+        if (len(p_text) > 40 and 
+            re.search(r'[A-Z][^.!?]*[.!?]', p_text) and
+            not re.search(r'^(Category|Tags|Share|Related|Also read|Read also)', p_text, re.I)):
             
-            paragraphs = article_elem.find_all('p')
-            if len(paragraphs) >= 2:
-                content_parts = []
-                for p in paragraphs:
-                    text = clean_text(p.get_text())
-                    if len(text) > 50:
-                        content_parts.append(text)
-                content = "\n\n".join(content_parts)
-                break
+            found_article_start = True
+            article_content.append(p_text)
+        elif found_article_start:
+            article_content.append(p_text)
+        
+        if len(' '.join(article_content)) > 500:
+            break
     
-    # Fallback
+    content = ' '.join(article_content)
+    
+    # Fallback strategies if content is insufficient
     if not content or len(content) < 200:
-        all_paragraphs = soup.find_all('p')
-        content_parts = []
-        for p in all_paragraphs:
-            text = clean_text(p.get_text())
-            if len(text) > 30 and (_SCHOOL_KEYWORDS_RE.search(text) if _SCHOOL_KEYWORDS_RE else True):
-                content_parts.append(text)
-        content = "\n\n".join(content_parts[:20])
-    
-    if not content:
-        body = soup.select_one('body')
-        if body:
-            content = clean_text(body.get_text(separator="\n", strip=True))
-    
-    key_info = extract_key_information(content)
+        content_containers = [
+            soup.select_one('div.clearfix'),
+            soup.select_one('div.pb-5'),
+            soup.select_one('article'),
+            soup.select_one('div.entry-content'),
+            soup.select_one('main'),
+            soup.select_one('.content')
+        ]
+        
+        for container in content_containers:
+            if container:
+                for bad in container.select('script, style, nav, header, footer, .share, .comments, .ad, .widget, .related, iframe, .sidebar, .author, .social, .post-meta'):
+                    bad.decompose()
+                
+                paragraphs = container.find_all('p')
+                meaningful_paragraphs = []
+                
+                for p in paragraphs:
+                    p_text = p.get_text(strip=True)
+                    if (len(p_text) > 30 and 
+                        not re.match(r'^(Posted by|Comments|Category|Tags)', p_text, re.I)):
+                        meaningful_paragraphs.append(p_text)
+                
+                if meaningful_paragraphs:
+                    content = ' '.join(meaningful_paragraphs)
+                    break
     
     # Create snippet
     snippet = ""
     if content:
-        words = content.split()
-        if len(words) > 200:
-            snippet = ' '.join(words[:200]) + "..."
+        sentences = re.split(r'(?<=[.!?])\s+', content)
+        meaningful_sentences = []
+        
+        for sentence in sentences:
+            sentence = sentence.strip()
+            if (len(sentence) > 30 and 
+                not re.match(r'^(Comments|Posted by|Category|Tags|Share)', sentence, re.I) and
+                re.search(r'[A-Z]', sentence)):
+                
+                meaningful_sentences.append(sentence)
+                if len(' '.join(meaningful_sentences)) > 100:
+                    break
+        
+        if meaningful_sentences:
+            snippet = ' '.join(meaningful_sentences)
+            if snippet and snippet[0].islower():
+                match = re.search(r'[A-Z]', snippet)
+                if match:
+                    snippet = snippet[match.start():]
+            
+            if len(snippet) > 250:
+                if '.' in snippet[:250]:
+                    last_period = snippet[:250].rfind('.')
+                    if last_period > 150:
+                        snippet = snippet[:last_period + 1]
+                    else:
+                        snippet = snippet[:247] + "..."
+                else:
+                    snippet = snippet[:247] + "..."
         else:
-            snippet = content
+            snippet = content[:250]
+            if len(content) > 250:
+                snippet = snippet[:247] + "..."
+    
+    # Clean snippet
+    if snippet:
+        snippet = re.sub(r'^\s*Comments?\s*', '', snippet, flags=re.I)
+        snippet = snippet.strip()
+    
+    # Check for school keywords in title OR snippet
+    title_has_keywords = _SCHOOL_KEYWORDS_RE.search(title) if _SCHOOL_KEYWORDS_RE else True
+    snippet_has_keywords = _SCHOOL_KEYWORDS_RE.search(snippet) if _SCHOOL_KEYWORDS_RE else True
+    
+    success = bool(title and len(snippet) > 50 and (title_has_keywords or snippet_has_keywords))
     
     return {
-        'title': title or "Untitled Article",
-        'date': date,
-        'content': snippet,
-        'full_content': content,
-        'key_info': key_info,
+        'title': title[:200] if title else "",
+        'date_str': date_str,
+        'date_obj': date_obj,
+        'snippet': snippet,
         'url': url,
-        'word_count': len(content.split()) if content else 0
+        'success': success,
+        'has_keywords': title_has_keywords or snippet_has_keywords
     }
 
-def _is_pdf_link(href: str) -> bool:
-    """Check if link is a PDF."""
-    if not href:
-        return False
-    href_clean = href.split('?', 1)[0].split('#', 1)[0].lower()
-    return href_clean.endswith(".pdf")
-
-def _get_pdf_head_info(url: str, timeout: float = 8.0) -> dict:
-    """Get PDF metadata without downloading full file."""
-    try:
-        resp = requests.head(url, allow_redirects=True, timeout=timeout)
-        status = getattr(resp, "status_code", None)
-        content_type = (resp.headers.get("Content-Type") or "").lower()
+def extract_clean_content_v5(html: str, url: str, site_type: str = '') -> Dict[str, Any]:
+    """Main extraction function with site-specific handling."""
+    if not html:
+        return {'success': False}
+    
+    # Use specialized extraction for MySchool
+    if site_type == 'myschool':
+        return extract_myschool_content(html, url)
+    
+    soup = BeautifulSoup(html, 'lxml')
+    title = ""
+    title_selectors = {
+        'nuc': ['h1.entry-title', 'h1', '.entry-title'],
+        'punch': ['h1.post-title', 'h1', '.post-title', '.entry-title']
+    }
+    selectors = title_selectors.get(site_type, ['h1', 'h2', 'h3', '.title', '.entry-title'])
+    for sel in selectors:
+        elem = soup.select_one(sel)
+        if elem:
+            title_text = elem.get_text(strip=True)
+            if title_text and len(title_text) > 10:
+                title = title_text
+                break
+    
+    date_str = ""
+    date_obj = None
+    
+    if site_type == 'punch':
+        date_elem = soup.select_one('span.post-date, time, .entry-date')
+        if date_elem:
+            date_str = date_elem.get_text(strip=True)
+            date_obj = parse_punch_date(date_str)
+    elif site_type == 'nuc':
+        date_elem = soup.select_one('span.published, time, .post-date')
+        if date_elem:
+            date_str = date_elem.get_text(strip=True)
+            date_obj = parse_nuc_date(date_str)
+    
+    content = ""
+    content_selectors = {
+        'nuc': ['div.entry-content', 'article .content', '.post-content'],
+        'punch': ['div.post-content', '.entry-content', '.article-content']
+    }
+    selectors = content_selectors.get(site_type, ['article', 'main', '.content'])
+    for sel in selectors:
+        elem = soup.select_one(sel)
+        if elem:
+            for bad in elem.select('script, style, nav, header, footer, .share, .comments, .ad, .widget, .related, iframe'):
+                bad.decompose()
+            content = elem.get_text(' ', strip=True)
+            if len(content) > 200:
+                break
+    
+    if content:
+        if title and content.lower().startswith(title.lower()):
+            content = content[len(title):].strip()
         
-        if status is None or status >= 400 or "pdf" not in content_type:
-            try:
-                resp = requests.get(url, allow_redirects=True, timeout=timeout, stream=True)
-            except Exception as e_get:
-                return {
-                    "ok": False,
-                    "error": f"GET failed after HEAD: {e_get}",
-                    "final_url": getattr(resp, "url", url) if resp is not None else url,
-                    "status_code": status
-                }
+        if site_type == 'punch':
+            content = re.sub(r'Kindly share this story.*?(?=[A-Z])', '', content, flags=re.I | re.DOTALL)
         
-        final_status = getattr(resp, "status_code", None)
-        final_url = getattr(resp, "url", url)
-        final_content_type = (resp.headers.get("Content-Type") or "").lower()
-        content_length = None
-        if resp.headers.get("Content-Length"):
-            try:
-                content_length = int(resp.headers.get("Content-Length"))
-            except Exception:
-                content_length = None
+        content = re.sub(r'\s+', ' ', content).strip()
+    
+    snippet = ""
+    if content:
+        paragraphs = re.split(r'\.\s+', content)
+        meaningful_paragraphs = []
         
-        try:
-            if getattr(resp, "raw", None):
-                try:
-                    resp.close()
-                except Exception:
-                    pass
-        except Exception:
-            pass
-        
-        return {
-            "ok": True,
-            "content_type": final_content_type,
-            "content_length": content_length,
-            "final_url": final_url,
-            "status_code": final_status
-        }
-    except Exception as e:
-        return {"ok": False, "error": str(e), "final_url": url, "status_code": None}
-
-async def fetch_article_details(article_url: str) -> Optional[Dict[str, Any]]:
-    """Fetch and extract full article details."""
-    LOG.info(f"Fetching article: {article_url[:60]}…")
-    try:
-        html = await fetch_html_ultimate(article_url)
-        details = extract_article_content(html, article_url)
-        LOG.info(f"✓ Extracted {details['word_count']} words")
-        return details
-    except Exception as e:
-        LOG.error(f"✗ Failed to fetch article: {str(e)[:50]}")
-        return None
-
-def extract_myschool_news_from_visible(soup: BeautifulSoup, max_items: int = 10) -> List[Dict[str, Any]]:
-    """
-    myschool.ng optimized visible-text extraction: handles link-heavy pages.
-    - Scans likely containers or all <a> tags with title-like text
-    - Recovers href directly from <a> for reliable links
-    - Sets placeholder snippet ("Read more...") — details fetched later
-    """
-    items = []
-    seen_titles = set()
-
-    # Step 1: Get full visible text for fallback filtering
-    page_text = soup.get_text(separator="\n", strip=True)
-
-    # Step 2: Find potential title links (hybrid: use <a> for links, text for filtering)
-    a_tags = soup.find_all('a', href=True)
-    for a in a_tags:
-        title = a.get_text(" ", strip=True)
-        if not title or len(title) < 25 or len(title) > 140:
-            continue
-        if any(n in title.lower() for n in ['read more', 'see more', 'comments', 'share', 'like', 'views', 'advertisement', 'sponsored']):
-            continue
-        if title in seen_titles:
-            continue
-
-        # Keyword filter (required for relevance)
-        if not any(kw.lower() in title.lower() for kw in ['jamb', 'waec', 'neco', 'utme', 'admission', 'post-utme', 'cut off', 'result', 'school fees', 'registration', '2026']):
-            continue
-
-        # Guess if it's a news link (myschool structure: /news/slug)
-        href = a['href']
-        if '/news/' not in href.lower() and '/blog/' not in href.lower():
-            continue  # skip non-news links
-
-        link = urljoin("https://myschool.ng", href)
-
-        # Look for date in visible text near title (search in page_text around title position)
-        date = None
-        if _DATE_RE:
-            # Find approximate position in full text
-            pos = page_text.lower().find(title.lower())
-            if pos != -1:
-                nearby_text = page_text[max(0, pos-200):pos+len(title)+200]
-                m = _DATE_RE.search(nearby_text)
-                if m:
-                    date = m.group(0)
-
-        items.append({
-            "title": title,
-            "date": date,
-            "snippet": "Read more for full update...",  # placeholder — fetch details later
-            "link": link,
-            "source": "myschool.ng"
-        })
-        seen_titles.add(title)
-
-        if len(items) >= max_items:
-            break
-
-    # Sort: prefer items with dates, then title alpha
-    items.sort(key=lambda x: (x['date'] is None, x['title']))
-
-    LOG.info("myschool visible-text extraction → %d items with placeholder snippets", len(items))
-    return items[:max_items]
-
-# ═══════════════════════════════════════════════════════════════════════════
-# SITE-SPECIFIC EXTRACTORS (UPDATED FOR ALL SOURCES)
-# ═══════════════════════════════════════════════════════════════════════════
-
-def extract_punch_items(html: str, base_url: str) -> List[Dict[str, Any]]:
-    """Punch-specific extraction for better results."""
-    soup = BeautifulSoup(html, "lxml")
-    items = []
-    seen = set()
-
-    # candidate containers
-    container_selectors = ["article", ".td_module_wrap", ".td_module", ".post", ".entry", ".td-block-span6"]
-    title_selectors = [".td-module-title a", "h2.entry-title a", "h3.entry-title a", "h2 a", "h3 a", "a.td-image-wrap"]
-    date_selectors = ["time", ".td-post-date", ".entry-meta time", ".post-meta time"]
-    excerpt_selectors = [".td-excerpt", ".entry-summary p", ".post-excerpt p", ".td-module-meta-info .td-excerpt"]
-
-    containers = []
-    for sel in container_selectors:
-        found = soup.select(sel)
-        if found:
-            containers.extend(found)
-    if not containers:
-        containers = soup.select("ul li, .latest-news li, .news-list li")
-
-    for c in containers:
-        try:
-            title = None
-            link = None
-            for tsel in title_selectors:
-                t = c.select_one(tsel)
-                if t and t.get_text(strip=True):
-                    title = t.get_text(" ", strip=True)
-                    link = t.get("href") or t.get("data-href")
+        for para in paragraphs:
+            para = para.strip()
+            if len(para) > 30:
+                meaningful_paragraphs.append(para)
+                if len(' '.join(meaningful_paragraphs)) > 100:
                     break
-            if not title:
-                continue
-
-            link = urljoin(base_url, link) if link else None
-
-            date = None
-            for dsel in date_selectors:
-                d = c.select_one(dsel)
-                if d:
-                    date = d.get_text(" ", strip=True)
-                    break
-
-            snippet = None
-            for es in excerpt_selectors:
-                e = c.select_one(es)
-                if e:
-                    snippet = e.get_text(" ", strip=True)
-                    if len(snippet) >= 40:
-                        break
-
-            if not snippet and link:
-                snippet = "Click to read full update..."
-
-            key = f"{title[:50]}|{link}"
-            if key in seen:
-                continue
-            seen.add(key)
-
-            items.append({
-                "title": title,
-                "snippet": snippet or "Click to read full update...",
-                "date": date,
-                "link": link,
-                "source": urlparse(base_url).netloc,
-                "pdf": False
-            })
-        except Exception:
-            continue
-
-    return items
-
-def extract_myschool_items(html: str, base_url: str) -> List[Dict[str, Any]]:
-    """MySchool.ng-specific extraction with 2026-proof selectors and robust fallback."""
-    soup = BeautifulSoup(html, "lxml")
-    items = []
-    seen = set()
-
-    # 2026-optimized container selectors with data attributes and broader patterns
-    containers = soup.select(
-        ".news-item, .post, .article, .news, .news-list, .news-listing, li.news, div[class*='news'], "
-        "article, .post, .entry, li, .content-item, .story, .td_module_wrap, div[class*='post'], "
-        "div[class*='item'] , .news-card, .article-card, .post-item, "
-        "div[data-testid*='news'], a[data-testid*='news-link'], div[data-testid*='article'], "
-        ".post-content, .article-content, div[data-testid*='content-card'], .content-card, .news-block"
-    )
-
-    for c in containers:
-        try:
-            # Multi-level title/link extraction
-            title_elem = c.select_one("h2 a, h3 a, .title a, a.title, a, h2, h3, .news-title a")
-            if not title_elem:
-                continue
-                
-            title = title_elem.get_text(" ", strip=True)
-            link = title_elem.get("href") or title_elem.get("data-href")
+        
+        if meaningful_paragraphs:
+            snippet = ' '.join(meaningful_paragraphs)
             
-            if not title or len(title) < 10 or not link:
-                continue
-                
-            link = urljoin(base_url, link)
-
-            # Date extraction from multiple possible locations
-            date = None
-            date_elem = c.select_one(".date, .post-date, time, span.date, .news-date, [data-testid*='date']")
-            if date_elem:
-                date = date_elem.get_text(" ", strip=True)
-
-            # Snippet extraction with fallback chain
-            snippet = None
-            for sel in (".excerpt, .summary, .post-excerpt, .news-snippet, p, div.description, [data-testid*='excerpt']"):
-                s = c.select_one(sel)
-                if s:
-                    snippet = s.get_text(" ", strip=True)
-                    if len(snippet) >= 40:
-                        break
-            
-            if not snippet:
-                snippet = "Click to read full update..."
-
-            # Deduplication
-            key = f"{title[:60]}|{link}"
-            if key in seen:
-                continue
-            seen.add(key)
-
-            items.append({
-                "title": re.sub(r'\s+', ' ', title).strip(),
-                "snippet": snippet,
-                "date": date,
-                "link": link,
-                "source": urlparse(base_url).netloc,
-                "pdf": _is_pdf_link(link)
-            })
-        except Exception:
-            continue
-
-    # Enhanced fallback for MySchool's dynamic rendering
-    if len(items) < 3:
-        LOG.debug("MySchool fallback: Using generic a-tag scan due to low yield (%d items)", len(items))
-        for a in soup.find_all("a", href=True):
-            title = a.get_text(" ", strip=True)
-            href = a.get("href", "").strip()
-            
-            if not title or len(title) < 10:
-                continue
-            if _SCHOOL_KEYWORDS_RE and not _SCHOOL_KEYWORDS_RE.search(title):
-                continue
-                
-            full_link = urljoin(base_url, href)
-            key = f"{title[:60]}|{full_link}"
-            if key in seen:
-                continue
-            seen.add(key)
-                
-            # Extract context from parent container
-            container = a.find_parent(["li", "div", "article", "p", "td"])
-            snippet = "Click link for details."
-            date_str = None
-            
-            if container:
-                container_text = container.get_text(" ", strip=True)
-                if _DATE_RE:
-                    date_match = _DATE_RE.search(container_text)
-                    if date_match:
-                        date_str = date_match.group(0)
-                        
-                # Get sibling text for snippet
-                for sib in a.find_next_siblings(["p", "div", "span"])[:2]:
-                    sib_text = sib.get_text(" ", strip=True)
-                    if len(sib_text) > 30:
-                        snippet = sib_text[:300]
-                        break
-
-            items.append({
-                "title": title,
-                "snippet": snippet,
-                "date": date_str,
-                "link": full_link,
-                "source": urlparse(base_url).netloc,
-                "pdf": _is_pdf_link(full_link)
-            })
-
-    items.sort(key=lambda x: (x['date'] is None, -len(x['snippet'])))
-    return items[:10]
-
-def extract_jamb_items(html: str, base_url: str) -> List[Dict[str, Any]]:
-    """JAMB-specific extraction (flat p tags)."""
-    soup = BeautifulSoup(html, "lxml")
-    items = []
-    seen = set()
-
-    paragraphs = soup.find_all('p')
-    i = 0
-    while i < len(paragraphs) - 3:
-        title_p = paragraphs[i]
-        snippet_p = paragraphs[i+1]
-        link_p = paragraphs[i+2]
-        date_p = paragraphs[i+3]
-
-        title = title_p.get_text(strip=True)
-        if not title or len(title) < 10:
-            i += 1
-            continue
-
-        snippet = snippet_p.get_text(strip=True)
-        link_elem = link_p.find('a', href=True)
-        link = urljoin(base_url, link_elem.get('href')) if link_elem else None
-        date = date_p.get_text(strip=True)
-
-        key = f"{title[:50]}|{link}"
-        if key in seen:
-            i += 4
-            continue
-        seen.add(key)
-
-        items.append({
-            "title": title,
-            "snippet": snippet or "Click to read full update...",
-            "date": date,
-            "link": link,
-            "source": "jamb.gov.ng",
-            "pdf": _is_pdf_link(link) if link else False
-        })
-        i += 4
-
-    return items
-
-def extract_neco_items(html: str, base_url: str) -> List[Dict[str, Any]]:
-    """NECO-specific extraction."""
-    soup = BeautifulSoup(html, "lxml")
-    items = []
-    seen = set()
-
-    containers = soup.select(".news-item")
-    for c in containers:
-        title = c.select_one(".news-title, h3").get_text(strip=True) if c.select_one(".news-title, h3") else None
-        if not title:
-            continue
-
-        date = c.select_one(".news-date, span").get_text(strip=True) if c.select_one(".news-date, span") else None
-        snippet = c.select_one(".news-snippet, p").get_text(strip=True) if c.select_one(".news-snippet, p") else "Click to read full update..."
-        link_elem = c.select_one(".read-more-link, a")
-        link = urljoin(base_url, link_elem.get("href")) if link_elem else None
-
-        key = f"{title[:50]}|{link}"
-        if key in seen:
-            continue
-        seen.add(key)
-
-        items.append({
-            "title": title,
-            "snippet": snippet,
-            "date": date,
-            "link": link,
-            "source": "neco.gov.ng",
-            "pdf": _is_pdf_link(link) if link else False
-        })
-
-    return items
-
-def extract_nuc_items(html: str, base_url: str) -> List[Dict[str, Any]]:
-    """NUC-specific extraction (markdown-like)."""
-    soup = BeautifulSoup(html, "lxml")
-    items = []
-    seen = set()
-
-    headings = soup.select("h2")
-    for h2 in headings:
-        title_a = h2.find("a")
-        title = title_a.get_text(strip=True) if title_a else h2.get_text(strip=True)
-        link = urljoin(base_url, title_a.get("href")) if title_a else None
-
-        next_p = h2.find_next("p")
-        date = None
-        if next_p and "by |" in next_p.get_text():
-            date_match = re.search(r"by \|\s*(.+?)\s*\|", next_p.get_text())
-            date = date_match.group(1) if date_match else None
-
-        excerpt_p = next_p.find_next("p") if next_p else None
-        snippet = excerpt_p.get_text(strip=True) if excerpt_p else "Click to read full update..."
-
-        read_more_a = excerpt_p.find_next("a") if excerpt_p else None
-        read_more_link = urljoin(base_url, read_more_a.get("href")) if read_more_a and "read more" in read_more_a.get_text().lower() else link
-
-        key = f"{title[:50]}|{read_more_link}"
-        if key in seen:
-            continue
-        seen.add(key)
-
-        items.append({
-            "title": title,
-            "snippet": snippet,
-            "date": date,
-            "link": read_more_link,
-            "source": "nuc.edu.ng",
-            "pdf": _is_pdf_link(read_more_link) if read_more_link else False
-        })
-
-    return items
-
-def extract_education_items(html: str, base_url: str) -> List[Dict[str, Any]]:
-    """Education.gov.ng-specific extraction."""
-    soup = BeautifulSoup(html, "lxml")
-    items = []
-    seen = set()
-
-    containers = soup.select(".news-item")
-    for c in containers:
-        title_h3 = c.select_one("h3")
-        title = title_h3.get_text(strip=True) if title_h3 else None
-        if not title:
-            continue
-
-        link_a = c.select_one("a")
-        link = urljoin(base_url, link_a.get("href")) if link_a else None
-
-        snippet_p = c.select_one("p")
-        snippet = snippet_p.get_text(strip=True) if snippet_p else "Click to read full update..."
-
-        date = None  # No explicit date in structure; parse from snippet if needed
-        date_match = _DATE_RE.search(snippet) if _DATE_RE else None
-        date = date_match.group(0) if date_match else None
-
-        key = f"{title[:50]}|{link}"
-        if key in seen:
-            continue
-        seen.add(key)
-
-        items.append({
-            "title": title,
-            "snippet": snippet,
-            "date": date,
-            "link": link,
-            "source": "education.gov.ng",
-            "pdf": _is_pdf_link(link) if link else False
-        })
-
-    return items
-
-def extract_lasubeb_items(html: str, base_url: str) -> List[Dict[str, Any]]:
-    """LASUBEB-specific extraction (h2 + p)."""
-    soup = BeautifulSoup(html, "lxml")
-    items = []
-    seen = set()
-
-    headings = soup.select("h2")
-    for h2 in headings:
-        title = h2.get_text(strip=True)
-        if not title or len(title) < 10:
-            continue
-
-        date_p = h2.find_next("p")
-        date = date_p.get_text(strip=True) if date_p and re.match(r"^[A-z]+ \d{1,2}(?:st|nd|rd|th) \d{4}$", date_p.get_text(strip=True)) else None
-
-        snippet_p = date_p.find_next("p") if date_p else h2.find_next("p")
-        snippet = snippet_p.get_text(strip=True) if snippet_p else "Click to read full update..."
-
-        link = None  # No links in structure; assume base or none
-
-        key = f"{title[:50]}|{link}"
-        if key in seen:
-            continue
-        seen.add(key)
-
-        items.append({
-            "title": title,
-            "snippet": snippet,
-            "date": date,
-            "link": link,
-            "source": "lasubeb.lg.gov.ng",
-            "pdf": False
-        })
-
-    return items
+            if len(snippet) > 250:
+                if '.' in snippet[:250]:
+                    last_period = snippet[:250].rfind('.')
+                    if last_period > 150:
+                        snippet = snippet[:last_period + 1]
+                    else:
+                        snippet = snippet[:247] + "..."
+                else:
+                    snippet = snippet[:247] + "..."
+        else:
+            snippet = content[:250]
+            if len(content) > 250:
+                snippet = snippet[:247] + "..."
+    
+    # Check for school keywords
+    title_has_keywords = _SCHOOL_KEYWORDS_RE.search(title) if _SCHOOL_KEYWORDS_RE else True
+    snippet_has_keywords = _SCHOOL_KEYWORDS_RE.search(snippet) if _SCHOOL_KEYWORDS_RE else True
+    
+    success = bool(title and date_obj and len(snippet) > 50 and 
+                  (title_has_keywords or snippet_has_keywords) and 
+                  is_recent_date(date_obj))
+    
+    return {
+        'title': title[:200],
+        'date_str': date_str,
+        'date_obj': date_obj,
+        'snippet': snippet,
+        'url': url,
+        'success': success,
+        'has_keywords': title_has_keywords or snippet_has_keywords
+    }
 
 # ═══════════════════════════════════════════════════════════════════════════
-# IMPROVED SCHOOL NEWS LISTING EXTRACTOR WITH SITE-SPECIFIC SUPPORT
+# SITE-SPECIFIC ARTICLE DATE FILTHERING
 # ═══════════════════════════════════════════════════════════════════════════
 
-def extract_school_news_listings(html: str, base_url: str) -> List[Dict[str, Any]]:
-    """
-    FIXED: Robust generic extraction for MySchool/Punch + fallback to site-specific for government sites.
-    Returns list of articles with title, snippet (from listing page), date, and link.
-    """
-    if not html or len(html) < 1000:
-        LOG.debug("HTML too short for extraction: %s (len=%d)", base_url, len(html) if html else 0)
+
+async def scrape_myschool_recent(max_articles: int = 10) -> List[Dict]:
+    """Scrape recent MySchool articles."""
+    LOG.info("\n[STAGE] Scraping MySchool (recent first)")
+    article_urls = await get_myschool_recent_articles()
+    if not article_urls:
+        LOG.info("[MySchool] No articles found")
         return []
     
-    domain = get_domain_from_url(base_url)
+    LOG.info(f"[MySchool] Found {len(article_urls)} potential articles, fetching...")
     
-    # Try site-specific extractors first for tricky government sites
-    site_specific_items = []
-    if "jamb.gov.ng" in domain:
-        site_specific_items = extract_jamb_items(html, base_url)
-    elif "neco.gov.ng" in domain:
-        site_specific_items = extract_neco_items(html, base_url)
-    elif "nuc.edu.ng" in domain:
-        site_specific_items = extract_nuc_items(html, base_url)
-    elif "education.gov.ng" in domain:
-        site_specific_items = extract_education_items(html, base_url)
-    elif "lasubeb.lg.gov.ng" in domain:
-        site_specific_items = extract_lasubeb_items(html, base_url)
+    batch_size = 5
+    all_extracted = []
     
-    # If site-specific found enough items, return those
-    if site_specific_items and len(site_specific_items) >= 2:
-        return site_specific_items[:15]
-    
-    # OTHERWISE: Use robust generic link extraction (WORKS for MySchool.ng & Punch)
-    soup = BeautifulSoup(html, 'lxml')
-    items = []
-    seen = set()
-    
-    # Remove navigation noise
-    for elem in soup.select('script, style, nav, header, footer, aside, iframe, noscript, [class*="advertisement"], [class*="banner"], [class*="sidebar"]'):
-        try:
-            elem.decompose()
-        except:
-            pass
-    
-    # Find all links that look like news articles
-    for a in soup.find_all("a", href=True):
-        try:
-            title = a.get_text(" ", strip=True)
-            href = a.get("href", "").strip()
-            
-            # Basic validation
-            if not title or len(title) < 10 or len(title) > 200:
+    for i in range(0, len(article_urls), batch_size):
+        batch = article_urls[i:i + batch_size]
+        LOG.info(f"[MySchool] Processing batch {i//batch_size + 1}/{(len(article_urls)-1)//batch_size + 1}")
+        
+        tasks = [fetch_html_ultimate(url) for url in batch]
+        pages = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        for idx, result in enumerate(pages):
+            url = batch[idx]
+            if isinstance(result, Exception):
+                LOG.debug(f"[MySchool] Failed to fetch {url}: {result}")
+                continue
+            if not result:
                 continue
             
-            # Skip obvious non-content links
-            if href.startswith(('#', 'javascript:', 'mailto:', 'tel:')):
-                continue
-            if any(x in href.lower() for x in ['.jpg', '.png', '.pdf', '.zip', '/wp-content/uploads']):
-                continue
+            data = extract_myschool_content(result, url)
             
-            # Filter for school keywords OR news URL patterns (but keep if looks like article)
-            is_likely_news = any(x in href.lower() for x in ['/news/', '/article/', '/post/', '/story/', '/blog/', '?p=']) or \
-                           any(x in title.lower() for x in ['admission', 'exam', 'jamb', 'waec', 'neco', 'utme', 'post-utme', 'university', 'school'])
+            is_successful = data['success']
             
-            if _SCHOOL_KEYWORDS_RE and not _SCHOOL_KEYWORDS_RE.search(title) and not is_likely_news:
-                continue
+            # Accept articles with good title and snippet even if date is missing
+            if not is_successful and data['title'] and len(data.get('snippet', '')) > 50 and data.get('has_keywords', False):
+                is_successful = True
             
-            full_link = urljoin(base_url, href)
-            
-            # Skip PDFs (unless we want them marked)
-            is_pdf = _is_pdf_link(full_link)
-            
-            # Deduplicate by title+link
-            dedup_key = f"{title[:60]}|{full_link.split('?')[0]}"
-            if dedup_key in seen:
-                continue
-            seen.add(dedup_key)
-            
-            # Extract snippet from surrounding context (NOT by fetching the page)
-            snippet = "Click to read full update..."
-            date_str = None
-            
-            # Find parent container
-            container = a.find_parent(["div", "li", "article", "td", "section"])
-            
-            if container:
-                container_text = container.get_text(" ", strip=True)
-                
-                # Look for date in container (but not in the title itself)
-                if _DATE_RE:
-                    date_match = _DATE_RE.search(container_text)
-                    if date_match:
-                        date_candidate = date_match.group(0)
-                        # Ensure date is close to the title in the text (not footer date)
-                        title_pos = container_text.find(title[:30])
-                        date_pos = container_text.find(date_candidate)
-                        if title_pos >= 0 and date_pos >= 0 and abs(date_pos - title_pos) < 300:
-                            date_str = date_candidate
-                
-                # Extract snippet: Try to get text after the link or in siblings
-                snippet_text = ""
-                
-                # Method 1: Look for next siblings (p, div, span)
-                siblings = a.find_next_siblings(["p", "div", "span"])
-                for sib in siblings[:2]:
-                    sib_text = sib.get_text(" ", strip=True)
-                    # Must be substantial and not just metadata
-                    if len(sib_text) > 50 and not sib_text.startswith(("by ", "By ", "posted ", "Source:")):
-                        snippet_text = sib_text
-                        break
-                
-                # Method 2: If in li, get remaining text in li after link
-                if not snippet_text and container.name == "li":
-                    li_text = container.get_text(" ", strip=True)
-                    # Remove the link text itself to get the description
-                    snippet_text = li_text.replace(title, "", 1).strip()
-                
-                # Method 3: Look for p tags within container
-                if not snippet_text:
-                    for p in container.find_all("p", limit=2):
-                        p_text = p.get_text(" ", strip=True)
-                        if len(p_text) > 40 and p_text != title:
-                            snippet_text = p_text
-                            break
-                
-                # Clean up snippet
-                if snippet_text:
-                    snippet_text = re.sub(r'\s+', ' ', snippet_text)
-                    snippet_text = snippet_text.replace("Read More", "").replace("Continue Reading", "").replace("...", "").strip()
-                    if len(snippet_text) > 300:
-                        snippet_text = snippet_text[:297] + "..."
-                    if len(snippet_text) > 20:
-                        snippet = snippet_text
-            
-            items.append({
-                "title": clean_text(title),
-                "snippet": snippet,
-                "date": date_str,
-                "link": full_link,
-                "source": urlparse(base_url).netloc,
-                "pdf": is_pdf
-            })
-            
-        except Exception as e:
-            continue  # Skip problematic entries
+            if is_successful:
+                all_extracted.append({
+                    'title': data['title'],
+                    'date': data['date_str'],
+                    'snippet': data['snippet'],
+                    'url': url,
+                    'source': 'myschool',
+                    'pdf': False,
+                    'date_obj': data['date_obj'] or datetime.now()
+                })
     
-    # Sort: items with dates first, then by snippet length (longer = more likely real content)
-    items.sort(key=lambda x: (x['date'] is None, -len(x['snippet']), x['title']))
+    if all_extracted:
+        all_extracted.sort(key=lambda x: (x.get('date_obj', datetime.min), x['title']), reverse=True)
+        all_extracted = all_extracted[:max_articles]
     
-    LOG.info("Extracted %d items from %s", len(items), base_url)
-    return items[:15]
+    LOG.info(f"[MySchool] Extracted {len(all_extracted)} recent articles")
+    return all_extracted
 
+async def scrape_punch_recent(max_articles: int = 10) -> List[Dict]:
+    """Scrape recent Punch education articles."""
+    LOG.info("\n[STAGE] Scraping Punch (recent first)")
+    article_urls = await get_punch_recent_articles()
+    if not article_urls:
+        return []
+    
+    LOG.info(f"[Punch] Found {len(article_urls)} potential articles, fetching...")
+    tasks = [fetch_html_ultimate(url) for url in article_urls]
+    pages = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    articles = []
+    for idx, result in enumerate(pages):
+        url = article_urls[idx]
+        if isinstance(result, Exception) or not result:
+            continue
+        
+        data = extract_clean_content_v5(result, url, 'punch')
+        if data['success'] and data.get('has_keywords', False):
+            articles.append({
+                'title': data['title'],
+                'date': data['date_str'],
+                'snippet': data['snippet'],
+                'url': url,
+                'source': 'punch',
+                'pdf': False,
+                'date_obj': data['date_obj']
+            })
+    
+    articles.sort(key=lambda x: x.get('date_obj', datetime.min), reverse=True)
+    articles = articles[:max_articles]
+    LOG.info(f"[Punch] Extracted {len(articles)} recent articles")
+    return articles
+
+async def scrape_nuc_recent(max_articles: int = 8) -> List[Dict]:
+    """Scrape recent NUC articles."""
+    LOG.info("\n[STAGE] Scraping NUC (recent first)")
+    article_urls = await get_nuc_recent_articles()
+    if not article_urls:
+        return []
+    
+    LOG.info(f"[NUC] Found {len(article_urls)} potential articles, fetching...")
+    tasks = [fetch_html_ultimate(url) for url in article_urls]
+    pages = await asyncio.gather(*tasks, return_exceptions=True)
+    
+    articles = []
+    for idx, result in enumerate(pages):
+        url = article_urls[idx]
+        if isinstance(result, Exception) or not result:
+            continue
+        
+        data = extract_clean_content_v5(result, url, 'nuc')
+        if data['success'] and data.get('has_keywords', False):
+            articles.append({
+                'title': data['title'],
+                'date': data['date_str'],
+                'snippet': data['snippet'],
+                'url': url,
+                'source': 'nuc',
+                'pdf': False,
+                'date_obj': data['date_obj']
+            })
+    
+    articles.sort(key=lambda x: x.get('date_obj', datetime.min), reverse=True)
+    articles = articles[:max_articles]
+    LOG.info(f"[NUC] Extracted {len(articles)} recent articles")
+    return articles
+
+async def scrape_school_news_recent() -> List[Dict[str, Any]]:
+    """Main function to scrape recent school news from all sources."""
+    try:
+        nuc_task = asyncio.create_task(scrape_nuc_recent())
+        myschool_task = asyncio.create_task(scrape_myschool_recent())
+        punch_task = asyncio.create_task(scrape_punch_recent())
+        
+        nuc_articles, myschool_articles, punch_articles = await asyncio.gather(
+            nuc_task, myschool_task, punch_task
+        )
+        
+        all_articles = nuc_articles + myschool_articles + punch_articles
+        all_articles.sort(key=lambda x: x.get('date_obj', datetime.min), reverse=True)
+        
+        LOG.info(f"Total articles scraped: {len(all_articles)}")
+        return all_articles
+        
+    except Exception as e:
+        LOG.error(f"Error in scrape_school_news_recent: {e}")
+        return []
+# ═══════════════════════════════════════════════════════════════════════════
+# MAIN
+# ═══════════════════════════════════════════════════════════════════════════
 async def scrape_school_news(
     urls: List[str],
     fetch_full_content: bool = False,
     max_articles: int = 5
 ) -> List[Dict[str, Any]]:
     """
-    Scrape school news from given URLs.
-    Primary: generic extract_school_news_listings
-    Fallback: visible-text strategy for myschool.ng if primary yields <2 items.
-    Fetches article details/snippets for top items.
+    Main school news scraper - uses our working implementations.
     """
-    all_news = []
-
-    for base_url in urls:
-        LOG.info(f"\n{'='*70}")
-        LOG.info(f"📰 Scraping: {base_url}")
-        LOG.info(f"{'='*70}")
+    LOG.info(f"Scraping school news from {len(urls)} sources")
+    
+    # Filter to only supported sources
+    supported_sources = []
+    for url in urls:
+        domain = get_domain_from_url(url)
+        if 'myschool.ng' in domain:
+            supported_sources.append('myschool')
+        elif 'punchng.com' in domain:
+            supported_sources.append('punch')
+        elif 'nuc.edu.ng' in domain:
+            supported_sources.append('nuc')
+        else:
+            LOG.warning(f"Skipping unsupported domain: {domain}")
+    
+    all_articles = []
+    
+    # Use our working scrapers for supported sources
+    if 'myschool' in supported_sources:
+        try:
+            myschool_articles = await scrape_myschool_recent(max_articles)
+            all_articles.extend(myschool_articles)
+        except Exception as e:
+            LOG.error(f"Failed to scrape MySchool: {e}")
+    
+    if 'punch' in supported_sources:
+        try:
+            punch_articles = await scrape_punch_recent(max_articles)
+            all_articles.extend(punch_articles)
+        except Exception as e:
+            LOG.error(f"Failed to scrape Punch: {e}")
+    
+    if 'nuc' in supported_sources:
+        try:
+            nuc_articles = await scrape_nuc_recent(max_articles)
+            all_articles.extend(nuc_articles)
+        except Exception as e:
+            LOG.error(f"Failed to scrape NUC: {e}")
+    
+    # Convert to expected format
+    formatted_articles = []
+    for article in all_articles:
+        formatted_articles.append({
+            'title': article['title'],
+            'snippet': article['snippet'],
+            'date': article['date'],
+            'link': article['url'],
+            'source': article['source'],
+            'pdf': article.get('pdf', False),
+            'has_keywords': article.get('has_keywords', True)
+        })
+    
+    # Filter by keywords if regex is available
+    if _SCHOOL_KEYWORDS_RE:
+        filtered_articles = []
+        for article in formatted_articles:
+            title_match = _SCHOOL_KEYWORDS_RE.search(article['title'])
+            snippet_match = _SCHOOL_KEYWORDS_RE.search(article['snippet'])
+            if title_match or snippet_match or article.get('has_keywords', True):
+                filtered_articles.append(article)
         
-        candidates = candidate_listing_urls(base_url)
-        LOG.info(f"  Trying {len(candidates)} candidate URLs...")
-        
-        html = None
-        successful_url = None
-        
-        for candidate_url in candidates:
-            try:
-                LOG.debug(f"  Attempting: {candidate_url}")
-                test_html = await _fetch_html(candidate_url)
-                
-                if test_html and len(test_html) > 1000:
-                    test_items = extract_school_news_listings(test_html, candidate_url)
-                    if test_items and len(test_items) > 0:
-                        LOG.info(f"  ✓ SUCCESS with {candidate_url} ({len(test_items)} items)")
-                        html = test_html
-                        successful_url = candidate_url
-                        break
-                    else:
-                        LOG.debug(f"    No items found at {candidate_url}")
-                else:
-                    LOG.debug(f"    Insufficient content at {candidate_url} (len={len(test_html) if test_html else 0})")
-                
-                await asyncio.sleep(random.uniform(1, 2))
-                
-            except Exception as e:
-                LOG.debug(f"    Failed {candidate_url}: {str(e)[:50]}")
-                continue
-        
-        if not html or not successful_url:
-            LOG.warning(f"  ✗ All candidate URLs failed for {base_url}")
-            continue
-        
-        soup = BeautifulSoup(html, "lxml")
-        
-        # Primary extraction: your generic method
-        listing_items = extract_school_news_listings(html, successful_url)
-        
-        # Fallback for myschool.ng: if primary yields <2 items, switch to visible-text
-        if "myschool.ng" in successful_url.lower() and len(listing_items) < 2:
-            LOG.warning("Primary extraction yielded only %d items for myschool.ng — falling back to visible-text strategy", len(listing_items))
-            listing_items = extract_myschool_news_from_visible(soup, max_items=15)
-        
-        LOG.info(f"  ✓ Found {len(listing_items)} articles from {successful_url}")
-        
-        if not listing_items:
-            continue
-        
-        all_news.extend(listing_items)
-        
-        # Fetch full content/details for top articles, using snippets from articles
-        if fetch_full_content:
-            LOG.info(f"\n  📄 Fetching full content for top {max_articles} articles in parallel...")
-            
-            tasks = [fetch_article_details(item['link']) for item in listing_items[:max_articles] if item['link']]
-            details_list = await asyncio.gather(*tasks, return_exceptions=True)
-            
-            for item, details in zip(listing_items[:max_articles], details_list):
-                if not isinstance(details, Exception) and details:
-                    item['snippet'] = details['content']  # Use fetched summary as snippet
-                    item['full_content'] = details['full_content']
-                    item['key_info'] = details['key_info']
-                    item['word_count'] = details['word_count']
-                    if details['date'] and not item['date']:
-                        item['date'] = details['date']
-                else:
-                    LOG.warning("Failed to fetch details for %s", item['title'][:30])
-        
-        LOG.info("\n  ✓ Processed {len(listing_items)} articles from {successful_url}")
-        
-        LOG.info("-" * 70)
-        await asyncio.sleep(random.uniform(3, 6))
-
-    LOG.info(f"\n{'='*70}")
-    LOG.info(f"📊 TOTAL: {len(all_news)} articles from {len(urls)} sources")
-    LOG.info(f"{'='*70}\n")
-
-    return all_news
+        formatted_articles = filtered_articles
+    
+    # Sort by date (newest first)
+    formatted_articles.sort(key=lambda x: (
+        x['date'] is None,
+        -(datetime.strptime(x['date'], '%d %B, %Y').timestamp() if x['date'] and re.search(r'\d{4}', x['date']) else 0)
+    ))
+    
+    LOG.info(f"Returning {len(formatted_articles)} articles")
+    return formatted_articles[:max_articles * 3]  # Return reasonable number
