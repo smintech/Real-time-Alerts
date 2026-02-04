@@ -123,65 +123,65 @@ DEFAULT_SCHOOL_SOURCES = {
 # IMPROVED SCHOOL NEWS KEYWORDS AND DATE PATTERNS
 # ============================================================================
 
-_SCHOOL_KEYWORDS_RE = re.compile(
+SCHOOL_KEYWORDS_RE = re.compile(
     r"""
     # Core academic terms
-    \b(?:academic\s+(?:calendar|session|year|break|calendar|activities|program|schedule))\b|
+    \b(?:academic\s+(?:calendar|session|year|break|activities|program|schedule))\b|
     \b(?:semester|session|term)\b|
     
     # Exams and assessments
-    \b(?:exam(?:ination)?s?|test(?:s)?|assessment(?:s)?|quiz(?:zes)?)\b|
-    \b(?:JAMB|UTME|POST-UTME|DE|Direct\s+Entry)\b|
-    \b(?:WAEC|NECO|GCE|BECE|NABTEB|SSCE|SSC|WASSCE)\b|
-    \b(?:result(?:s)?|score(?:s)?|mark(?:s)?|grade(?:s)?)\b|
+    \b(?:exams?|tests?|assessments?|quizzes?)\b|
+    \b(?:JAMB|UTME|POST[- ]?UTME|DE|Direct\s+Entry)\b|
+    \b(?:WAEC|NECO|GCE|BECE|NABTEB|SSCE?|WASSCE)\b|
+    \b(?:results?|scores?|marks?|grades?)\b|
     \b(?:mock|preliminary|practice|trial)\b|
     \b(?:rescheduled?|postponed?|cancell?ed?|deferred?|moved)\b|
     
     # Admissions and registration
-    \b(?:admission(?:s)?|matriculation|enrollment|entrance)\b|
-    \b(?:registration|enrolment|application(?:s)?|applying)\b|
-    \b(?:cut-?off|cutoff|aggregate|score|points)\b|
-    \b(?:form(?:s)?|portal|website|platform|interface)\b|
+    \b(?:admissions?|matriculation|enrol(?:l|)ment|entrance)\b|
+    \b(?:registrations?|applications?|applying)\b|
+    \b(?:cut[- ]?off|cutoff|aggregate|points?)\b|
+    \b(?:forms?|portal|website|platform|interface)\b|
     
     # Institutions and education bodies
-    \b(?:university|college|polytechnic|institute|academy|school)\b|
+    \b(?:universit(?:y|ies)|college|polytechnic|institute|academy|school)\b|
     \b(?:varsity|uni|poly|tech|col|inst)\b|
     \b(?:NUC|JAMB|NECO|WAEC|TETFUND|NBTI|NBTE|NCCE)\b|
-    \b(?:education|educational|learning|teaching|tuition)\b|
+    \b(?:education\w*|learning|teaching|tuition)\b|
     
     # Academic activities
-    \b(?:resumption|resumed?|resum(?:ing|ption)?)\b|
-    \b(?:holiday|break|vacation|recess|closure|closed?)\b|
+    \b(?:resum(?:ed?|ing|ption)?)\b|
+    \b(?:holidays?|break|vacation|recess|closures?|closed)\b|
     \b(?:strike|industrial\s+action|protest|union)\b|
-    \b(?:suspend(?:ed|sion)?|suspension|halted?)\b|
+    \b(?:suspend(?:ed|sion)?|halted?)\b|
     
     # Academic materials and resources
     \b(?:timetable|schedule|calendar|plan|agenda)\b|
     \b(?:syllabus|curriculum|course\s+outline|scheme)\b|
-    \b(?:textbook(?:s)?|material(?:s)?|resource(?:s)?|handout(?:s)?)\b|
+    \b(?:textbooks?|materials?|resources?|handouts?)\b|
     
     # Fees and financials
-    \b(?:fee(?:s)?|tuition|charges|payment(?:s)?)\b|
-    \b(?:scholarship(?:s)?|bursary|grant(?:s)?|award(?:s)?)\b|
-    \b(?:funding|finance|financial|monetary)\b|
+    \b(?:fees?|tuition|charges|payments?)\b|
+    \b(?:scholarships?|bursary|grants?|awards?)\b|
+    \b(?:funding|financ(?:e|ial)|monetary)\b|
     
     # Deadlines and announcements
     \b(?:deadline|due\s+date|closing\s+date|expir(?:y|ation))\b|
     \b(?:announcement|notice|circular|memo|bulletin|update)\b|
     \b(?:important|urgent|critical|vital|crucial)\b|
-    \b(?:release(?:d)?|published?|issued?|shared?)\b|
+    \b(?:released?|published?|issued?|shared?)\b|
     
     # Student activities
-    \b(?:student(?:s)?|undergraduate(?:s)?|postgraduate(?:s)?)\b|
-    \b(?:fresh(?:er|man)|fresher(?:s)?|new\s+student(?:s)?)\b|
+    \b(?:students?|undergraduates?|postgraduates?)\b|
+    \b(?:fresh(?:er|man|men)?|new\s+students?)\b|
     \b(?:orientation|induction|matriculation|convocation)\b|
     
     # Teaching staff
-    \b(?:lecturer(?:s)?|professor(?:s)?|teacher(?:s)?|instructor(?:s)?)\b|
-    \b(?:staff|faculty|academic\s+staff|non-?academic)\b|
+    \b(?:lecturers?|professors?|teachers?|instructors?)\b|
+    \b(?:staff|faculty|academic\s+staff|non[- ]?academic)\b|
     
     # Online platforms
-    \b(?:portal|website|platform|online|digital|e-?\s*learning)\b|
+    \b(?:portal|website|platform|online|digital|e[- ]?learning)\b|
     \b(?:upload|download|submit|register|apply|login)\b|
     
     # Date-related terms
@@ -189,22 +189,40 @@ _SCHOOL_KEYWORDS_RE = re.compile(
     \b(?:end(?:s)?|conclude(?:s)?|finish(?:es)?|complete(?:s)?)\b|
     \b(?:extend(?:ed|sion)?|prolonged?|additional|extra)\b|
     
-    # COVID/emergency terms (still relevant)
-    \b(?:COVID|coronavirus|pandemic|lockdown|remote)\b|
-    \b(?:online|virtual|digital|e-?\s*class(?:es)?)\b
+    # COVID/emergency terms
+    \b(?:COVID(?:[- ]19)?|coronavirus|pandemic|lockdown|remote)\b|
+    \b(?:online|virtual|digital|e[- ]?class(?:es)?)\b|
+    
+    # NYSC and service-related terms
+    \b(?:NYSC|National\s+Y(?:outh|)\s+S(?:ervice|)\s+C(?:orps|))\b|
+    \b(?:corper|corpers|copper|coppers)\b|  # Common Nigerian slang/spelling variations
+    \b(?:service\s+years?|national\s+service|youth\s+service)\b|
+    \b(?:mobilization|mobilisation|call[- ]up|posting)\b|
+    \b(?:CDS|Community\s+Development\s+Service|primary\s+assignment)\b|
+    \b(?:P(?:assing|)\s+O(?:ut|)\s+C(?:eremony|)|convocation)\b|
+    
+    # Additional important terms
+    \b(?:CGPA|GPA|transcript|course\s+work)\b|
+    \b(?:prerequisite|elective|core\s+course|module)\b|
+    \b(?:hostel|accommodation|campus|facilit(?:y|ies))\b|
+    \b(?:dean|HOD|Head\s+of\s+Department|registry|bursary)\b|
+    
+    # Graduation and completion
+    \b(?:graduate|graduands?|graduation|convocation)\b|
+    \b(?:alumn(?:us|i)|alumna(?:e)?|old\s+students?)\b|
+    \b(?:clearance|clearance\s+form|exit\s+form)\b
     """,
     flags=re.I | re.X
 )
 
 _DATE_RE = re.compile(
     r"""
-    # Full date formats (most specific first)
-    (?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)?,?\s*
-    (?:\b\d{1,2}\s+
-        (?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|
-         Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)
-        (?:\s+\d{4})?\b
-    )|
+    # Full date formats with optional weekday
+    (?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)(?:,\s*)?
+    \s*\b\d{1,2}\s+
+    (?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|
+     Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)
+    (?:\s+\d{4})?\b|
     
     # ISO format: 2024-02-04
     \b\d{4}-\d{2}-\d{2}\b|
@@ -232,16 +250,22 @@ _DATE_RE = re.compile(
     \b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)
     \s+\d{1,2},?\s+(?:'?\d{2,4})\b|
     
-    # Relative dates: today, yesterday, tomorrow, next week, last month
+    # Relative dates
     \b(?:today|yesterday|tomorrow|now|current(?:ly)?)\b|
+    \b(?:this\s+(?:week|month|year|semester|session|term))\b|
     \b(?:last|next|previous|upcoming|coming|forthcoming)\s+
     (?:week|month|year|semester|session|term)\b|
+    \b(?:in\s+\d+\s+(?:days?|weeks?|months?|years?))\b|
+    \b(?:from\s+now|hence|after|later)\b|
     
     # Year-only patterns for academic years: 2024/2025, 2024-2025
     \b\d{4}[/\-]\d{4}\b|
     
     # Quarter references: Q1 2024, 1st Quarter 2024
-    \b(?:Q[1-4]|Quarter\s+[1-4])\s+\d{4}\b
+    \b(?:Q[1-4]|Quarter\s+[1-4])\s+\d{4}\b|
+    
+    # Simple year patterns
+    \b(?:the\s+year\s+)?\d{4}\b
     """,
     flags=re.I | re.X
 )
