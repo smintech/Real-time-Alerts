@@ -1935,11 +1935,10 @@ async def scrape_lpg_prices() -> Dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════════════════
 # SITE-SPECIFIC ARTICLE LISTING PAGE
 # ═══════════════════════════════════════════════════════════════════════════
-async def get_myschool_recent_articles() -> List[str]:
+async def get_myschool_recent_articles(base_url: str = "https://myschool.ng") -> List[str]:
     """Get recent MySchool article URLs from the listing page."""
-    base = "https://myschool.ng"
     try:
-        listing_html = await fetch_html_ultimate(f"{base}/news/latest")
+        listing_html = await fetch_html_ultimate(f"{base_url}/news/latest")
     except Exception as e:
         LOG.error(f"Failed to fetch MySchool listing: {e}")
         return []
@@ -1949,13 +1948,13 @@ async def get_myschool_recent_articles() -> List[str]:
     soup = BeautifulSoup(listing_html, 'lxml')
     article_links = []
     
-    # Look for card containers as per your analysis
+    # Look for card containers
     for card in soup.select('div.card'):
         link = card.select_one('a[href*="/news/"]')
         if link:
             href = link.get('href', '')
             if '/news/' in href and not any(x in href for x in ['category', 'page', 'tag', 'author']):
-                full_url = urljoin(base, href)
+                full_url = urljoin(base_url, href)
                 if full_url not in article_links:
                     article_links.append(full_url)
     
@@ -1963,16 +1962,15 @@ async def get_myschool_recent_articles() -> List[str]:
     for a in soup.select('a[href*="/news/"]'):
         href = a.get('href', '')
         if '/news/' in href and not any(x in href for x in ['category', 'page', 'tag', 'author']):
-            full_url = urljoin(base, href)
+            full_url = urljoin(base_url, href)
             if full_url not in article_links:
                 article_links.append(full_url)
     
     return list(set(article_links))[:20]
 
-async def get_punch_recent_articles() -> List[str]:
-    base = "https://punchng.com"
+async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> List[str]:
     try:
-        listing_html = await fetch_html_ultimate(f"{base}/topics/education/")
+        listing_html = await fetch_html_ultimate(f"{base_url}/topics/education/")
     except Exception as e:
         LOG.error(f"Failed to fetch Punch listing: {e}")
         return []
@@ -1985,7 +1983,7 @@ async def get_punch_recent_articles() -> List[str]:
         link = article.select_one('a[href*="punchng.com"]')
         if not link:
             continue
-        full_url = urljoin(base, link.get('href', ''))
+        full_url = urljoin(base_url, link.get('href', ''))
         date_elem = article.select_one('p, time, .date')
         date_str = date_elem.get_text(strip=True) if date_elem else ""
         date_obj = parse_punch_date(date_str)
@@ -1996,10 +1994,9 @@ async def get_punch_recent_articles() -> List[str]:
     articles_with_dates.sort(key=lambda x: x['date_obj'], reverse=True)
     return [article['url'] for article in articles_with_dates[:15]]
 
-async def get_nuc_recent_articles() -> List[str]:
-    base = "https://www.nuc.edu.ng"
+async def get_nuc_recent_articles(base_url: str = "https://www.nuc.edu.ng") -> List[str]:
     try:
-        listing_html = await fetch_html_ultimate(base)
+        listing_html = await fetch_html_ultimate(base_url)
     except Exception as e:
         LOG.error(f"Failed to fetch NUC listing: {e}")
         return []
@@ -2015,7 +2012,7 @@ async def get_nuc_recent_articles() -> List[str]:
         href = link.get('href', '')
         if href.endswith('.pdf') or '/wp-content/' in href:
             continue
-        full_url = urljoin(base, href)
+        full_url = urljoin(base_url, href)
         date_elem = article.select_one('span.published, .post-date, time')
         date_str = date_elem.get_text(strip=True) if date_elem else ""
         date_obj = parse_nuc_date(date_str)
@@ -2295,12 +2292,10 @@ def extract_clean_content_v5(html: str, url: str, site_type: str = '') -> Dict[s
 # ═══════════════════════════════════════════════════════════════════════════
 # SITE-SPECIFIC ARTICLE DATE FILTHERING
 # ═══════════════════════════════════════════════════════════════════════════
-
-
-async def scrape_myschool_recent(max_articles: int = 10) -> List[Dict]:
+async def scrape_myschool_recent(base_url: str = "https://myschool.ng", max_articles: int = 10) -> List[Dict]:
     """Scrape recent MySchool articles."""
-    LOG.info("\n[STAGE] Scraping MySchool (recent first)")
-    article_urls = await get_myschool_recent_articles()
+    LOG.info(f"\n[STAGE] Scraping MySchool from {base_url}")
+    article_urls = await get_myschool_recent_articles(base_url)
     if not article_urls:
         LOG.info("[MySchool] No articles found")
         return []
@@ -2329,7 +2324,6 @@ async def scrape_myschool_recent(max_articles: int = 10) -> List[Dict]:
             
             is_successful = data['success']
             
-            # Accept articles with good title and snippet even if date is missing
             if not is_successful and data['title'] and len(data.get('snippet', '')) > 50 and data.get('has_keywords', False):
                 is_successful = True
             
@@ -2341,7 +2335,8 @@ async def scrape_myschool_recent(max_articles: int = 10) -> List[Dict]:
                     'url': url,
                     'source': 'myschool',
                     'pdf': False,
-                    'date_obj': data['date_obj'] or datetime.now()
+                    'date_obj': data['date_obj'] or datetime.now(),
+                    'base_url': base_url  # Store which base URL was used
                 })
     
     if all_extracted:
@@ -2351,10 +2346,10 @@ async def scrape_myschool_recent(max_articles: int = 10) -> List[Dict]:
     LOG.info(f"[MySchool] Extracted {len(all_extracted)} recent articles")
     return all_extracted
 
-async def scrape_punch_recent(max_articles: int = 10) -> List[Dict]:
+async def scrape_punch_recent(base_url: str = "https://punchng.com", max_articles: int = 10) -> List[Dict]:
     """Scrape recent Punch education articles."""
-    LOG.info("\n[STAGE] Scraping Punch (recent first)")
-    article_urls = await get_punch_recent_articles()
+    LOG.info(f"\n[STAGE] Scraping Punch from {base_url}")
+    article_urls = await get_punch_recent_articles(base_url)
     if not article_urls:
         return []
     
@@ -2377,7 +2372,8 @@ async def scrape_punch_recent(max_articles: int = 10) -> List[Dict]:
                 'url': url,
                 'source': 'punch',
                 'pdf': False,
-                'date_obj': data['date_obj']
+                'date_obj': data['date_obj'],
+                'base_url': base_url
             })
     
     articles.sort(key=lambda x: x.get('date_obj', datetime.min), reverse=True)
@@ -2385,10 +2381,10 @@ async def scrape_punch_recent(max_articles: int = 10) -> List[Dict]:
     LOG.info(f"[Punch] Extracted {len(articles)} recent articles")
     return articles
 
-async def scrape_nuc_recent(max_articles: int = 8) -> List[Dict]:
+async def scrape_nuc_recent(base_url: str = "https://www.nuc.edu.ng", max_articles: int = 8) -> List[Dict]:
     """Scrape recent NUC articles."""
-    LOG.info("\n[STAGE] Scraping NUC (recent first)")
-    article_urls = await get_nuc_recent_articles()
+    LOG.info(f"\n[STAGE] Scraping NUC from {base_url}")
+    article_urls = await get_nuc_recent_articles(base_url)
     if not article_urls:
         return []
     
@@ -2411,7 +2407,8 @@ async def scrape_nuc_recent(max_articles: int = 8) -> List[Dict]:
                 'url': url,
                 'source': 'nuc',
                 'pdf': False,
-                'date_obj': data['date_obj']
+                'date_obj': data['date_obj'],
+                'base_url': base_url
             })
     
     articles.sort(key=lambda x: x.get('date_obj', datetime.min), reverse=True)
@@ -2448,76 +2445,91 @@ async def scrape_school_news(
     max_articles: int = 5
 ) -> List[Dict[str, Any]]:
     """
-    Main school news scraper - uses our working implementations.
+    Scrape school news from given URLs using our improved scrapers.
+    Supports: myschool.ng, punchng.com, nuc.edu.ng
     """
-    LOG.info(f"Scraping school news from {len(urls)} sources")
+    LOG.info(f"\n{'='*70}")
+    LOG.info("📰 SCHOOL NEWS SCRAPER")
+    LOG.info(f"{'='*70}")
     
-    # Filter to only supported sources
-    supported_sources = []
-    for url in urls:
-        domain = get_domain_from_url(url)
-        if 'myschool.ng' in domain:
-            supported_sources.append('myschool')
-        elif 'punchng.com' in domain:
-            supported_sources.append('punch')
-        elif 'nuc.edu.ng' in domain:
-            supported_sources.append('nuc')
-        else:
-            LOG.warning(f"Skipping unsupported domain: {domain}")
+    if not urls:
+        LOG.warning("No URLs provided to scrape_school_news")
+        return []
     
     all_articles = []
     
-    # Use our working scrapers for supported sources
-    if 'myschool' in supported_sources:
+    # Process each URL individually
+    for url in urls:
+        domain = get_domain_from_url(url)
+        
+        # Extract base URL (remove path)
+        parsed_url = urlparse(url)
+        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        
+        LOG.info(f"🌐 Processing: {url}")
+        LOG.info(f"  Base URL: {base_url}")
+        
+        # Scrape based on domain
         try:
-            myschool_articles = await scrape_myschool_recent(max_articles)
-            all_articles.extend(myschool_articles)
+            if 'myschool.ng' in domain:
+                LOG.info("  📌 Detected MySchool.ng")
+                articles = await scrape_myschool_recent(base_url, max_articles)
+                all_articles.extend(articles)
+                
+            elif 'punchng.com' in domain:
+                LOG.info("  📌 Detected Punch.ng")
+                articles = await scrape_punch_recent(base_url, max_articles)
+                all_articles.extend(articles)
+                
+            elif 'nuc.edu.ng' in domain:
+                LOG.info("  📌 Detected NUC.edu.ng")
+                articles = await scrape_nuc_recent(base_url, max_articles)
+                all_articles.extend(articles)
+                
+            else:
+                LOG.warning(f"  ⚠️  Unsupported domain: {domain}")
+                continue
+                
         except Exception as e:
-            LOG.error(f"Failed to scrape MySchool: {e}")
+            LOG.error(f"  ✗ Failed to scrape {domain}: {e}")
     
-    if 'punch' in supported_sources:
-        try:
-            punch_articles = await scrape_punch_recent(max_articles)
-            all_articles.extend(punch_articles)
-        except Exception as e:
-            LOG.error(f"Failed to scrape Punch: {e}")
-    
-    if 'nuc' in supported_sources:
-        try:
-            nuc_articles = await scrape_nuc_recent(max_articles)
-            all_articles.extend(nuc_articles)
-        except Exception as e:
-            LOG.error(f"Failed to scrape NUC: {e}")
-    
-    # Convert to expected format
-    formatted_articles = []
+    # Filter by school keywords
+    filtered_articles = []
     for article in all_articles:
-        formatted_articles.append({
-            'title': article['title'],
-            'snippet': article['snippet'],
-            'date': article['date'],
-            'link': article['url'],
-            'source': article['source'],
+        title = article.get('title', '')
+        snippet = article.get('snippet', '')
+        
+        # Check if article has school keywords
+        title_has_keywords = bool(_SCHOOL_KEYWORDS_RE.search(title)) if title else False
+        snippet_has_keywords = bool(_SCHOOL_KEYWORDS_RE.search(snippet)) if snippet else False
+        
+        # Keep articles with keywords or if we couldn't check
+        if title_has_keywords or snippet_has_keywords or not _SCHOOL_KEYWORDS_RE:
+            article['has_keywords'] = True
+            filtered_articles.append(article)
+        else:
+            LOG.debug(f"Filtered out: {title[:50]}... (no school keywords)")
+    
+    LOG.info(f"\n📊 Results: {len(all_articles)} total → {len(filtered_articles)} with keywords")
+    
+    # Format for output
+    formatted_results = []
+    for article in filtered_articles[:max_articles * 3]:
+        formatted_results.append({
+            'title': article.get('title', 'Untitled'),
+            'snippet': article.get('snippet', ''),
+            'date': article.get('date', ''),
+            'link': article.get('url', ''),
+            'source': article.get('source', 'unknown'),
             'pdf': article.get('pdf', False),
+            'date_obj': article.get('date_obj'),
             'has_keywords': article.get('has_keywords', True)
         })
     
-    # Filter by keywords if regex is available
-    if _SCHOOL_KEYWORDS_RE:
-        filtered_articles = []
-        for article in formatted_articles:
-            title_match = _SCHOOL_KEYWORDS_RE.search(article['title'])
-            snippet_match = _SCHOOL_KEYWORDS_RE.search(article['snippet'])
-            if title_match or snippet_match or article.get('has_keywords', True):
-                filtered_articles.append(article)
-        
-        formatted_articles = filtered_articles
-    
     # Sort by date (newest first)
-    formatted_articles.sort(key=lambda x: (
-        x['date'] is None,
-        -(datetime.strptime(x['date'], '%d %B, %Y').timestamp() if x['date'] and re.search(r'\d{4}', x['date']) else 0)
+    formatted_results.sort(key=lambda x: (
+        x.get('date_obj') is None,
+        -(x.get('date_obj', datetime.now()).timestamp() if x.get('date_obj') else 0)
     ))
     
-    LOG.info(f"Returning {len(formatted_articles)} articles")
-    return formatted_articles[:max_articles * 3]  # Return reasonable number
+    return formatted_results[:max_articles * 2]  # Return reasonable number
