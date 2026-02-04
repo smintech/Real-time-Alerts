@@ -123,14 +123,129 @@ DEFAULT_SCHOOL_SOURCES = {
 import re
 
 # ENHANCED: Broader keyword detection (handles plurals/ed forms)
+# ============================================================================
+# IMPROVED SCHOOL NEWS KEYWORDS AND DATE PATTERNS
+# ============================================================================
+
 _SCHOOL_KEYWORDS_RE = re.compile(
-    r"\b(resum(?:ption|ed|e)|reschedule|academic\s+calendar|holiday|exam(?:s|ination)?|postponed?|cancel|strike|suspend|closur|announcement|notice|circular|scholarship|admission|registration|results?|mock|timetable|portal|deadline)\b",
-    flags=re.I
+    r"""
+    # Core academic terms
+    \b(?:academic\s+(?:calendar|session|year|break|calendar|activities|program|schedule))\b|
+    \b(?:semester|session|term)\b|
+    
+    # Exams and assessments
+    \b(?:exam(?:ination)?s?|test(?:s)?|assessment(?:s)?|quiz(?:zes)?)\b|
+    \b(?:JAMB|UTME|POST-UTME|DE|Direct\s+Entry)\b|
+    \b(?:WAEC|NECO|GCE|BECE|NABTEB|SSCE|SSC|WASSCE)\b|
+    \b(?:result(?:s)?|score(?:s)?|mark(?:s)?|grade(?:s)?)\b|
+    \b(?:mock|preliminary|practice|trial)\b|
+    \b(?:rescheduled?|postponed?|cancell?ed?|deferred?|moved)\b|
+    
+    # Admissions and registration
+    \b(?:admission(?:s)?|matriculation|enrollment|entrance)\b|
+    \b(?:registration|enrolment|application(?:s)?|applying)\b|
+    \b(?:cut-?off|cutoff|aggregate|score|points)\b|
+    \b(?:form(?:s)?|portal|website|platform|interface)\b|
+    
+    # Institutions and education bodies
+    \b(?:university|college|polytechnic|institute|academy|school)\b|
+    \b(?:varsity|uni|poly|tech|col|inst)\b|
+    \b(?:NUC|JAMB|NECO|WAEC|TETFUND|NBTI|NBTE|NCCE)\b|
+    \b(?:education|educational|learning|teaching|tuition)\b|
+    
+    # Academic activities
+    \b(?:resumption|resumed?|resum(?:ing|ption)?)\b|
+    \b(?:holiday|break|vacation|recess|closure|closed?)\b|
+    \b(?:strike|industrial\s+action|protest|union)\b|
+    \b(?:suspend(?:ed|sion)?|suspension|halted?)\b|
+    
+    # Academic materials and resources
+    \b(?:timetable|schedule|calendar|plan|agenda)\b|
+    \b(?:syllabus|curriculum|course\s+outline|scheme)\b|
+    \b(?:textbook(?:s)?|material(?:s)?|resource(?:s)?|handout(?:s)?)\b|
+    
+    # Fees and financials
+    \b(?:fee(?:s)?|tuition|charges|payment(?:s)?)\b|
+    \b(?:scholarship(?:s)?|bursary|grant(?:s)?|award(?:s)?)\b|
+    \b(?:funding|finance|financial|monetary)\b|
+    
+    # Deadlines and announcements
+    \b(?:deadline|due\s+date|closing\s+date|expir(?:y|ation))\b|
+    \b(?:announcement|notice|circular|memo|bulletin|update)\b|
+    \b(?:important|urgent|critical|vital|crucial)\b|
+    \b(?:release(?:d)?|published?|issued?|shared?)\b|
+    
+    # Student activities
+    \b(?:student(?:s)?|undergraduate(?:s)?|postgraduate(?:s)?)\b|
+    \b(?:fresh(?:er|man)|fresher(?:s)?|new\s+student(?:s)?)\b|
+    \b(?:orientation|induction|matriculation|convocation)\b|
+    
+    # Teaching staff
+    \b(?:lecturer(?:s)?|professor(?:s)?|teacher(?:s)?|instructor(?:s)?)\b|
+    \b(?:staff|faculty|academic\s+staff|non-?academic)\b|
+    
+    # Online platforms
+    \b(?:portal|website|platform|online|digital|e-?\s*learning)\b|
+    \b(?:upload|download|submit|register|apply|login)\b|
+    
+    # Date-related terms
+    \b(?:begin(?:s|ning)?|start(?:s)?|commence(?:s|ment)?)\b|
+    \b(?:end(?:s)?|conclude(?:s)?|finish(?:es)?|complete(?:s)?)\b|
+    \b(?:extend(?:ed|sion)?|prolonged?|additional|extra)\b|
+    
+    # COVID/emergency terms (still relevant)
+    \b(?:COVID|coronavirus|pandemic|lockdown|remote)\b|
+    \b(?:online|virtual|digital|e-?\s*class(?:es)?)\b
+    """,
+    flags=re.I | re.X
 )
 
 _DATE_RE = re.compile(
-    r"(\b\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)[a-z,.]*\s*\d{4}\b)|"
-    r"(\b\d{4}-\d{2}-\d{2}\b)|"
-    r"(\b\d{1,2}[/-]\d{1,2}[/-]\d{2,4}\b)",
-    flags=re.I
+    r"""
+    # Full date formats (most specific first)
+    (?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)?,?\s*
+    (?:\b\d{1,2}\s+
+        (?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|
+         Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)
+        (?:\s+\d{4})?\b
+    )|
+    
+    # ISO format: 2024-02-04
+    \b\d{4}-\d{2}-\d{2}\b|
+    
+    # Month Day, Year: February 4, 2024
+    \b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|
+       Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)
+    \s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}\b|
+    
+    # Day Month Year: 4th February 2024
+    \b\d{1,2}(?:st|nd|rd|th)?\s+
+    (?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|
+     Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)
+    \s+\d{4}\b|
+    
+    # Numeric formats: 04/02/2024, 04-02-2024, 04.02.2024
+    \b\d{1,2}[/\-\.]\d{1,2}[/\-\.]\d{2,4}\b|
+    
+    # With time: February 4, 2024 8:38 pm
+    \b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|
+       Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)
+    \s+\d{1,2}(?:st|nd|rd|th)?,?\s+\d{4}\s+\d{1,2}:\d{2}\s*(?:am|pm|AM|PM)\b|
+    
+    # Abbreviated: Feb 4, '24 or 4 Feb '24
+    \b(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)
+    \s+\d{1,2},?\s+(?:'?\d{2,4})\b|
+    
+    # Relative dates: today, yesterday, tomorrow, next week, last month
+    \b(?:today|yesterday|tomorrow|now|current(?:ly)?)\b|
+    \b(?:last|next|previous|upcoming|coming|forthcoming)\s+
+    (?:week|month|year|semester|session|term)\b|
+    
+    # Year-only patterns for academic years: 2024/2025, 2024-2025
+    \b\d{4}[/\-]\d{4}\b|
+    
+    # Quarter references: Q1 2024, 1st Quarter 2024
+    \b(?:Q[1-4]|Quarter\s+[1-4])\s+\d{4}\b
+    """,
+    flags=re.I | re.X
 )
