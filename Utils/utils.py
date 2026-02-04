@@ -79,8 +79,8 @@ COMMON_NEWS_PATHS = [
     "/category/news", "/category/news/", "/category/press-release",
     "/topics/education/", "/category/education/", "/tags/education/",
 ]
-
 MAX_ARTICLE_AGE_DAYS = 180
+_BROWSER_SEMAPHORE = asyncio.Semaphore(3)
 
 def candidate_listing_urls(base_url: str) -> List[str]:
     """
@@ -277,7 +277,6 @@ async def get_visible_text_playwright(page) -> str:
 # -------------------------------------------------------------------
 # 2) Fully improved fetch_with_playwright_aggressive (with XHR capture + price_js)
 # -------------------------------------------------------------------
-# === FIX: fetch_with_playwright_aggressive — improved error handling and finalization ===
 async def fetch_with_playwright_aggressive(
     url: str,
     retries: int = 3,
@@ -290,166 +289,183 @@ async def fetch_with_playwright_aggressive(
     3. Handles Konga's dynamic content loading
     """
     LOG.info("╔═══════════════════════════════════════════════════════════════════╗")
-    LOG.info("║ PRODUCTION KONGA FETCH                                            ║")
+    LOG.info("║ PRODUCTION FIXES                                            ║")
     LOG.info("╚═══════════════════════════════════════════════════════════════════╝")
     LOG.info(f"🌐 {url[:80]}")
     
     # Extract product ID from URL for logging
     product_id = None
     if url:
-        id_match = re.search(r'(\d{5,})$', url)
+        id_match = re.search(r'(\\d{5,})$', url)
         if id_match:
             product_id = int(id_match.group(1))
             LOG.info(f"🎯 Targeting Product ID: {product_id}")
     
     is_konga = 'konga' in url.lower()
     
-    for attempt in range(1, retries + 1):
-        LOG.info(f"┌── ATTEMPT {attempt}/{retries} ───────────────────────────────────────────────┐")
-        
-        browser = context = page = None
-        try:
-            async with async_playwright() as p:
-                start = time.time()
-                
-                # LAUNCH BROWSER (Production settings)
-                browser = await p.chromium.launch(
-                    headless=True,
-                    args=[
-                        '--no-sandbox',
-                        '--disable-blink-features=AutomationControlled',
-                        '--disable-dev-shm-usage',
-                        '--disable-web-security',
-                        '--disable-setuid-sandbox',
-                        '--single-process',
-                        '--disable-gpu',
-                    ],
-                    timeout=60000
-                )
-                
-                # CONTEXT (Konga-optimized)
-                context = await browser.new_context(
-                    user_agent=random.choice(_USER_AGENTS),
-                    viewport={'width': 1366, 'height': 768},
-                    locale='en-US',
-                    timezone_id='Africa/Lagos',
-                    java_script_enabled=True,
-                    bypass_csp=True
-                )
-                
-                context.set_default_timeout(45000)
-                
-                page = await context.new_page()
-                
-                # BLOCK UNNECESSARY RESOURCES (40% faster loading)
-                await page.route("**/*.{gif,webp,svg}", lambda route: route.abort())
-                await page.route("**/*.css", lambda route: route.abort())
-                await page.route("**/*.woff*", lambda route: route.abort())
-                
-                # ANTI-DETECTION
-                await page.add_init_script("""
-                    Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                    Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-                    window.chrome = {runtime: {}};
-                """)
-                
-                # NAVIGATE
-                try:
-                    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-                except Exception as nav_error:
-                    LOG.warning(f"Navigation timeout, trying load: {str(nav_error)[:60]}")
-                    await page.goto(url, wait_until="load", timeout=25000)
-                
-                # KONGA-SPECIFIC WAITING
-                if is_konga:
-                    LOG.info("  🔍 Konga: Waiting for main product content...")
+    # Use semaphore to limit concurrent browser instances
+    async with _BROWSER_SEMAPHORE:
+        for attempt in range(1, retries + 1):
+            LOG.info(f"┌── ATTEMPT {attempt}/{retries} ───────────────────────────────────────────────┐")
+            
+            browser = None
+            context = None
+            page = None
+            
+            try:
+                async with async_playwright() as p:
+                    start = time.time()
                     
-                    # Wait for main container
+                    # LAUNCH BROWSER (Production settings)
+                    # FIXED: Added --no-zygote flag critical for Docker stability
+                    browser = await p.chromium.launch(
+                        headless=True,
+                        args=[
+                            '--no-sandbox',
+                            '--no-zygote',  # CRITICAL: Prevents process forking issues in Docker
+                            '--disable-blink-features=AutomationControlled',
+                            '--disable-dev-shm-usage',
+                            '--disable-web-security',
+                            '--disable-setuid-sandbox',
+                            '--single-process',
+                            '--disable-gpu',
+                            '--disable-software-rasterizer',
+                            '--disable-background-networking',
+                            '--disable-background-timer-throttling',
+                            '--disable-renderer-backgrounding',
+                            '--disable-features=IsolateOrigins,site-per-process',
+                        ],
+                        timeout=60000
+                    )
+                    
+                    # CONTEXT (Konga-optimized)
+                    context = await browser.new_context(
+                        user_agent=random.choice(_USER_AGENTS),
+                        viewport={'width': 1366, 'height': 768},
+                        locale='en-US',
+                        timezone_id='Africa/Lagos',
+                        java_script_enabled=True,
+                        bypass_csp=True
+                    )
+                    
+                    # FIXED: Set timeouts on context, not browser
+                    context.set_default_timeout(30000)
+                    context.set_default_navigation_timeout(30000)
+                    
+                    page = await context.new_page()
+                    
+                    # BLOCK UNNECESSARY RESOURCES (40% faster loading)
+                    await page.route("**/*.{gif,webp,svg}", lambda route: route.abort())
+                    await page.route("**/*.css", lambda route: route.abort())
+                    await page.route("**/*.woff*", lambda route: route.abort())
+                    
+                    # ANTI-DETECTION
+                    await page.add_init_script("""
+                        Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                        Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+                        window.chrome = {runtime: {}};
+                    """)
+                    
+                    # NAVIGATE
                     try:
-                        await page.wait_for_selector(
-                            'div.productDetail_productDetailsContent__VV9__',
-                            timeout=10000
-                        )
-                        LOG.debug("✅ Main product container loaded")
-                    except Exception as e:
-                        LOG.warning(f"Main container timeout: {str(e)[:60]}")
+                        # FIXED: Use domcontentloaded for faster initial response
+                        await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                    except Exception as nav_error:
+                        LOG.warning(f"Navigation timeout, trying load: {str(nav_error)[:60]}")
+                        # Fallback to load with shorter timeout
+                        await page.goto(url, wait_until="load", timeout=20000)
                     
-                    # Wait for price elements
+                    # KONGA-SPECIFIC WAITING
+                    if is_konga:
+                        LOG.info("  🔍 Konga: Waiting for main product content...")
+                        
+                        # Wait for main container with reduced timeout
+                        try:
+                            await page.wait_for_selector(
+                                'div.productDetail_productDetailsContent__VV9__',
+                                timeout=8000
+                            )
+                            LOG.debug("✅ Main product container loaded")
+                        except Exception as e:
+                            LOG.warning(f"Main container timeout: {str(e)[:60]}")
+                        
+                        # Wait for price elements with reduced timeout
+                        try:
+                            await page.wait_for_selector(
+                                '.priceBox_priceBoxPrice__i7paS, div.shared_specialPrice__uIZ_i',
+                                timeout=5000
+                            )
+                            LOG.debug("✅ Price elements loaded")
+                        except:
+                            LOG.debug("Price elements timeout, continuing...")
+                        
+                        # Reduced wait for dynamic content
+                        await page.wait_for_timeout(2000)
+                        
+                        # Minimal scroll to trigger lazy loading
+                        try:
+                            await page.evaluate("window.scrollBy(0, 300)")
+                            await asyncio.sleep(0.5)
+                        except:
+                            pass
+                    
+                    # EXTRACT CONTENT
+                    html = await page.content()
+                    visible_text = ""
+                    
+                    if return_visible_text or is_konga:
+                        visible_text = await get_visible_text_playwright(page)
+                    
+                    duration = time.time() - start
+                    LOG.info(f"└── SUCCESS {duration:.1f}s | HTML:{len(html)} | Text:{len(visible_text)} ───────────────────────────────┘")
+                    
+                    # FIXED: Proper cleanup - close resources in reverse order
+                    if page:
+                        try:
+                            await page.close()
+                        except Exception:
+                            pass
+                    if context:
+                        try:
+                            await context.close()
+                        except Exception:
+                            pass
+                    if browser:
+                        try:
+                            await browser.close()
+                        except Exception:
+                            pass
+                    
+                    return (html, visible_text) if return_visible_text else html
+                    
+            except Exception as e:
+                error_msg = str(e)[:80] if str(e) else "Unknown error"
+                LOG.error(f"└── FAILED: {error_msg} ───────────────────────────────────────────────────┘")
+                
+                # FIXED: Safe cleanup without checking is_closed() which can throw
+                if page:
                     try:
-                        await page.wait_for_selector(
-                            '.priceBox_priceBoxPrice__i7paS, div.shared_specialPrice__uIZ_i',
-                            timeout=8000
-                        )
-                        LOG.debug("✅ Price elements loaded")
-                    except:
-                        LOG.debug("Price elements timeout, continuing...")
-                    
-                    # Wait for dynamic content
-                    await page.wait_for_timeout(3000)
-                    
-                    # Scroll to trigger lazy loading
+                        await page.close()
+                    except Exception:
+                        pass
+                if context:
                     try:
-                        await page.evaluate("window.scrollBy(0, 500)")
-                        await asyncio.sleep(1)
-                        await page.evaluate("window.scrollBy(0, 500)")
-                        await asyncio.sleep(1)
-                    except:
+                        await context.close()
+                    except Exception:
+                        pass
+                if browser:
+                    try:
+                        await browser.close()
+                    except Exception:
                         pass
                 
-                # EXTRACT CONTENT
-                html = await page.content()
-                visible_text = ""
-                
-                if return_visible_text or is_konga:
-                    visible_text = await get_visible_text_playwright(page)
-                
-                duration = time.time() - start
-                LOG.info(f"└── SUCCESS {duration:.1f}s | HTML:{len(html)} | Text:{len(visible_text)} ───────────────────────────────┘")
-                
-                # CLEANUP
-                try:
-                    if not page.is_closed():
-                        await page.close()
-                except:
-                    pass
-                try:
-                    await context.close()
-                except:
-                    pass
-                try:
-                    await browser.close()
-                except:
-                    pass
-                
-                return (html, visible_text) if return_visible_text else html
-                
-        except Exception as e:
-            error_msg = str(e)[:80] if str(e) else "Unknown error"
-            LOG.error(f"└── FAILED: {error_msg} ───────────────────────────────────────────────────┘")
-            
-            # SAFE CLEANUP
-            try:
-                if page and not page.is_closed():
-                    await page.close()
-            except:
-                pass
-            try:
-                if context:
-                    await context.close()
-            except:
-                pass
-            try:
-                if browser:
-                    await browser.close()
-            except:
-                pass
-            
-            if attempt < retries:
-                wait_time = min(2 ** attempt, 10)
-                LOG.info(f"  ⏳ Waiting {wait_time:.1f} seconds before retry...")
-                await asyncio.sleep(wait_time)
-            else:
-                LOG.error(f"  ❌ All {retries} attempts exhausted")
+                if attempt < retries:
+                    # Exponential backoff with jitter
+                    wait_time = min(2 ** attempt + random.uniform(0, 1), 10)
+                    LOG.info(f"  ⏳ Waiting {wait_time:.1f} seconds before retry...")
+                    await asyncio.sleep(wait_time)
+                else:
+                    LOG.error(f"  ❌ All {retries} attempts exhausted")
     
     raise Exception(f"Failed to fetch {url} after {retries} attempts")
 # ═══════════════════════════════════════════════════════════════════════════
@@ -457,34 +473,24 @@ async def fetch_with_playwright_aggressive(
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def fetch_html_ultimate(url: str) -> str:
-    """Fetch HTML with priority for Playwright on MySchool pages."""
+    """Fetch HTML with semaphore-controlled concurrency."""
     domain = get_domain_from_url(url)
     
-    # Always use Playwright for MySchool article pages (they need JS)
     if 'myschool.ng' in domain and '/news/' in url:
-        try:
-            return await fetch_with_playwright_aggressive(url)
-        except Exception as e:
-            LOG.warning(f"Playwright failed for MySchool article {url}: {e}")
-            # Fallback to cloudscraper
+        async with _BROWSER_SEMAPHORE:  # Limit concurrent Playwright instances
             try:
-                return fetch_with_cloudscraper_aggressive(url)
-            except:
-                pass
+                return await fetch_with_playwright_aggressive(url)
+            except Exception as e:
+                LOG.warning(f"Playwright failed: {e}")
+                # Don't fallback to cloudscraper for JS-heavy pages
+                raise
     
-    # For other sites, try cloudscraper first (faster)
+    # For other sites, try cloudscraper first (lighter)
     try:
         return fetch_with_cloudscraper_aggressive(url)
-    except Exception as e:
-        LOG.debug(f"Cloudscraper failed for {url}: {e}")
-    
-    # Fallback to Playwright
-    try:
-        return await fetch_with_playwright_aggressive(url)
-    except Exception as e:
-        LOG.debug(f"Playwright fallback failed for {url}: {e}")
-    
-    raise Exception(f"Failed to fetch {url}")
+    except Exception:
+        async with _BROWSER_SEMAPHORE:
+            return await fetch_with_playwright_aggressive(url)
 # ═══════════════════════════════════════════════════════════════════════════
 # RETRY DECORATOR
 # ═══════════════════════════════════════════════════════════════════════════
