@@ -839,15 +839,8 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     eligible_candidates = []
     now = datetime.now(TIMEZONE)
     
-    # Define source URLs (hardcoded since our scrapers work this way)
-    SCHOOL_SOURCES = {
-        'MySchool.ng': ['https://myschool.ng/news/latest'],
-        'Punch Education': ['https://punchng.com/topics/education/'],
-        'NUC Updates': ['https://www.nuc.edu.ng']
-    }
-    
-    LOG.info(f"📋 SCHOOL_SOURCES loaded: {len(SCHOOL_SOURCES)} source(s)")
-    for src_name, urls in SCHOOL_SOURCES.items():
+    LOG.info(f"📋 DEFAULT_SCHOOL_SOURCES loaded: {len(DEFAULT_SCHOOL_SOURCES)} source(s)")
+    for src_name, urls in DEFAULT_SCHOOL_SOURCES.items():
         LOG.info(f"  📌 {src_name}: {urls[0][:60]}...")
     
     # ═══════════════════════════════════════════════════════════════════════
@@ -856,7 +849,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     processed_count = 0
     error_count = 0
     skipped_count = 0
-    source_list = list(SCHOOL_SOURCES.items())
+    source_list = list(DEFAULT_SCHOOL_SOURCES.items())
     total_sources = len(source_list)
     
     LOG.info(f"🔄 Beginning processing loop for {total_sources} sources...")
