@@ -839,23 +839,24 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     eligible_candidates = []
     now = datetime.now(TIMEZONE)
     
-    # Verify sources configuration
-    LOG.info(f"📋 DEFAULT_SCHOOL_SOURCES loaded: {len(DEFAULT_SCHOOL_SOURCES)} source(s)")
-    if not DEFAULT_SCHOOL_SOURCES:
-        LOG.error("❌ DEFAULT_SCHOOL_SOURCES is empty! Check your configuration.")
-        return
-        
-    for src_name, urls in DEFAULT_SCHOOL_SOURCES.items():
-        url_count = len(urls) if urls else 0
-        LOG.info(f"  📌 {src_name}: {url_count} URL(s)")
-
+    # Define source URLs (hardcoded since our scrapers work this way)
+    SCHOOL_SOURCES = {
+        'MySchool.ng': ['https://myschool.ng/news/latest'],
+        'Punch Education': ['https://punchng.com/topics/education/'],
+        'NUC Updates': ['https://www.nuc.edu.ng']
+    }
+    
+    LOG.info(f"📋 SCHOOL_SOURCES loaded: {len(SCHOOL_SOURCES)} source(s)")
+    for src_name, urls in SCHOOL_SOURCES.items():
+        LOG.info(f"  📌 {src_name}: {urls[0][:60]}...")
+    
     # ═══════════════════════════════════════════════════════════════════════
-    # PROCESSING LOOP - ULTRA DEFENSIVE
+    # PROCESSING LOOP
     # ═══════════════════════════════════════════════════════════════════════
     processed_count = 0
     error_count = 0
     skipped_count = 0
-    source_list = list(DEFAULT_SCHOOL_SOURCES.items())
+    source_list = list(SCHOOL_SOURCES.items())
     total_sources = len(source_list)
     
     LOG.info(f"🔄 Beginning processing loop for {total_sources} sources...")
@@ -869,14 +870,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
         LOG.info(f"🔍 [{processed_count}/{total_sources}] Processing: {source_name}")
         LOG.info(f"{'─' * 70}")
         
-        # Pre-checks
-        if not urls:
-            LOG.warning(f"⚠️  No URLs for {source_name}, skipping")
-            skipped_count += 1
-            idx += 1
-            continue
-            
-        # Source processing with maximum isolation
+        # Source processing
         source_eligible = None
         try:
             LOG.info(f"🌐 Calling scrape_school_news for {source_name}...")
@@ -896,40 +890,64 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 idx += 1
                 continue
             
-            # Build message
+            # Build message with better formatting
             LOG.info(f"📝 Building message for {source_name}...")
+            
+            # Sort items by date (newest first)
+            items.sort(key=lambda x: (
+                x.get('date') is None,
+                -(datetime.strptime(x['date'], '%d %B, %Y').timestamp() 
+                  if x.get('date') and re.search(r'\d{4}', x.get('date', '')) 
+                  else 0)
+            ))
+            
+            # Build formatted message
             report_lines = [
-                f"<b>{source_name}</b>",
-                f"<i>Updated: {now.strftime('%b %d, %Y — %H:%M WAT')}</i>",
-                "━━━━━━━━━━━━━━━━━━",
+                f"<b>📢 {source_name}</b>",
+                f"<i>📅 Updated: {now.strftime('%b %d, %Y — %H:%M WAT')}</i>",
+                "",
+                f"<b>Found {len(items)} updates:</b>",
                 "",
             ]
 
-            for item in items[:10]:
+            for i, item in enumerate(items[:8], 1):  # Show max 8 items
                 try:
                     title = item.get('title', 'Untitled')
-                    title_line = f"• <b>{title}</b>"
-                    if item.get("date"):
-                        title_line += f" — <i>{item['date']}</i>"
-                    report_lines.append(title_line)
-
-                    snippet = item.get("snippet", "").strip()
-                    link = item.get("link", "")
+                    date = item.get('date', '')
+                    snippet = item.get('snippet', '').strip()
+                    link = item.get('link', '')
                     
+                    # Format item with number and direct link
+                    item_line = f"<b>{i}. {title}</b>"
+                    if date:
+                        item_line += f" — <i>{date}</i>"
+                    report_lines.append(item_line)
+                    
+                    # Add snippet if available
                     if snippet and len(snippet) > 30:
+                        # Clean up snippet
                         snippet = snippet.replace("Read More", "").replace("Click to read", "").strip()
-                        report_lines.append(f"  └─ {snippet[:200]}... <a href=\"{link}\">Read more</a>")
-                    else:
-                        report_lines.append(f"  └─ <a href=\"{link}\">View update</a>")
+                        if len(snippet) > 150:
+                            snippet = snippet[:147] + "..."
+                        report_lines.append(f"   {snippet}")
+                    
+                    # Add direct link - ALWAYS include this
+                    report_lines.append(f"   🔗 <a href=\"{link}\">Read full article →</a>")
+                    
+                    report_lines.append("")  # Empty line between items
+                    
                 except Exception as item_err:
-                    LOG.error(f"⚠️  Error processing single item in {source_name}: {item_err}")
+                    LOG.error(f"⚠️  Error processing item in {source_name}: {item_err}")
                     continue
 
+            # Add footer with source link
+            source_url = urls[0] if urls else ""
             report_lines.extend([
+                f"<i>💡 Tip: Click any link above to read the full article</i>",
                 "",
-                f"<b>Updates found: {len(items)}</b>",
+                f"🔗 <a href=\"{source_url}\">Visit {source_name}</a>",
                 "",
-                f"🔗 <a href=\"{urls[0]}\">Visit {source_name}</a>",
+                f"<i>#EducationUpdates #{source_name.replace(' ', '')}</i>"
             ])
 
             report_text = "\n".join(report_lines)
@@ -938,7 +956,19 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             original_len = len(report_text)
             if original_len > 4000:
                 LOG.warning(f"⚠️  Message too long ({original_len}), truncating...")
-                report_text = report_text[:4000] + "...\n\n<i>Message truncated</i>"
+                # Keep header and first few items
+                lines = report_text.split('\n')
+                # Find where to cut (keep header and first 4 items)
+                item_count = 0
+                for i, line in enumerate(lines):
+                    if re.match(r'^\d+\.\s+', line):
+                        item_count += 1
+                        if item_count >= 5:
+                            lines = lines[:i]
+                            lines.append("\n<i>(Additional items truncated due to message length limit)</i>")
+                            lines.extend(report_lines[-4:])  # Keep footer
+                            break
+                report_text = "\n".join(lines)
             
             LOG.info(f"📝 Message built: {len(report_text)} chars")
 
@@ -947,7 +977,8 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 content_hash = compute_content_hash({
                     "title": source_name,
                     "item_count": len(items),
-                    "raw": {"items": items[:5]}
+                    "items": [{"title": item.get('title'), "date": item.get('date')} 
+                             for item in items[:3]]
                 })
             except Exception as hash_err:
                 LOG.error(f"❌ Hash computation failed for {source_name}: {hash_err}")
@@ -971,7 +1002,6 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                         continue
                 except Exception as dup_err:
                     LOG.error(f"⚠️  Duplicate check failed for {source_name}: {dup_err}")
-                    # Continue anyway in force mode, otherwise skip
                     if not force_mode:
                         skipped_count += 1
                         idx += 1
@@ -986,7 +1016,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                     if snapshot and snapshot.get("last_posted_at"):
                         last_dt = datetime.fromisoformat(snapshot["last_posted_at"])
                         hours_since = (now - last_dt).total_seconds() / 3600
-                        if hours_since < 12:
+                        if hours_since < 6:  # More frequent updates allowed (6 hours)
                             LOG.info(f"⏭️  Too recent ({hours_since:.1f}h), skipping")
                             skipped_count += 1
                             idx += 1
@@ -1036,11 +1066,11 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     if eligible_candidates:
         LOG.info(f"Eligible sources: {[e['source_name'] for e in eligible_candidates]}")
     else:
-        LOG.error("❌ NO ELIGIBLE CANDIDATES - Aborting posting phase")
+        LOG.warning("⚠️  No eligible candidates - nothing to post")
         return
 
     # ═══════════════════════════════════════════════════════════════════════
-    # POSTING PHASE - COMPLETELY ISOLATED
+    # POSTING PHASE
     # ═══════════════════════════════════════════════════════════════════════
     LOG.info(f"\n{'=' * 70}")
     LOG.info(f"📤 ENTERING POSTING PHASE")
@@ -1055,7 +1085,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     
     LOG.info(f"📡 Targets: {targets}")
     
-    # Sort and limit
+    # Sort by number of items (most items first)
     try:
         eligible_candidates.sort(key=lambda x: -x.get("item_count", 0))
         to_post = eligible_candidates[:max_posts]
@@ -1071,22 +1101,28 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
         LOG.info(f"📨 [{post_idx}/{len(to_post)}] Posting: {source_name}")
         LOG.info(f"{'─' * 70}")
         
-        # Build message with error handling
+        # Build final message
         try:
-            emoji = "🔴" if force_mode else "🆕"
-            header = f"{emoji} <b>School Updates — {source_name}</b>\n━━━━━━━━━━━━━━━━━━\n\n"
-            report_text = item.get('report_text', '')
+            # Add header emoji based on source
+            emoji_map = {
+                'MySchool.ng': '📚',
+                'Punch Education': '📰',
+                'NUC Updates': '🎓'
+            }
+            emoji = emoji_map.get(source_name, '📢')
             
-            if not report_text:
+            # Create clean message without extra header (already in report_text)
+            message = item.get('report_text', '')
+            
+            if not message:
                 LOG.error(f"❌ No report_text for {source_name}, skipping")
                 continue
                 
-            message = header + report_text
-            
             # Final length check
             if len(message) > 4096:
-                LOG.warning(f"⚠️  Message still too long ({len(message)}), hard truncate")
-                message = message[:4093] + "..."
+                LOG.warning(f"⚠️  Message too long ({len(message)}), truncating...")
+                # Simple truncation keeping header
+                message = message[:4090] + "..."
             
             LOG.info(f"📝 Final message length: {len(message)}")
             
@@ -1099,7 +1135,6 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
         for chat_id in targets:
             LOG.info(f"📤 Sending to {chat_id}...")
             try:
-                # Type validation
                 if not isinstance(chat_id, (int, str)):
                     LOG.error(f"❌ Invalid chat_id type: {type(chat_id)}")
                     continue
@@ -1110,7 +1145,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                         chat_id=chat_id,
                         text=message,
                         parse_mode="HTML",
-                        disable_web_page_preview=True,
+                        disable_web_page_preview=False,  # Allow preview for better UX
                     ),
                     timeout=30.0
                 )
@@ -1122,7 +1157,6 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 LOG.error(f"⏱️  TIMEOUT sending to {chat_id}")
             except Exception as send_err:
                 LOG.error(f"❌ FAILED to send to {chat_id}: {str(send_err)}")
-                LOG.exception("Send error details:")
         
         # Handle success/failure
         if sent_to_any:
