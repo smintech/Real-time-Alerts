@@ -43,8 +43,6 @@ from Utils.utils import (
     get_domain_from_url,
     scrape_fuel_prices,
     scrape_lpg_prices,
-    extract_school_news_listings,
-    fetch_article_details,
     scrape_school_news,
     safe_send,  # Import from utils
 )
