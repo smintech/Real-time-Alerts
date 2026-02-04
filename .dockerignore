@@ -1,8 +1,43 @@
-__pycache__
+# Python
+__pycache__/
 *.pyc
-.git
-.gitignore
-.env
+*.pyo
+*.pyd
+*.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtual environments
 venv/
 .venv/
+
+# Env & secrets
+.env
+.env.*
+*.key
+*.pem
+*.crt
+
+# Git
+.git/
+.gitignore
+
+# Node / frontend
 node_modules/
+npm-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# OS junk
+.DS_Store
+Thumbs.db
+
+# Editors / IDEs
+.vscode/
+.idea/
+*.swp
+
+# Docker noise
+Dockerfile
