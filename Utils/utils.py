@@ -723,17 +723,34 @@ def _best_identifier(raw: Dict[str, Any]) -> Optional[str]:
     return None
 
 def parse_myschool_date(date_str: str) -> Optional[datetime]:
-    """Parse MySchool date string."""
+    """Parse MySchool date string with better pattern matching."""
     if not date_str:
         return None
+    
+    # Clean the date string
     date_str = date_str.replace('|', '').replace('Comments', '').strip()
+    
+    # Remove ordinal suffixes (st, nd, rd, th)
     date_str = re.sub(r'(\d+)(st|nd|rd|th)', r'\1', date_str)
-    date_formats = ['%d %B, %Y', '%d %b, %Y', '%B %d, %Y', '%b %d, %Y', '%d/%m/%Y', '%Y-%m-%d', '%d %B %Y', '%d %b %Y']
+    
+    # Try multiple date formats
+    date_formats = [
+        '%d %B, %Y',    # 3 February, 2026
+        '%d %b, %Y',    # 3 Feb, 2026
+        '%B %d, %Y',    # February 3, 2026
+        '%b %d, %Y',    # Feb 3, 2026
+        '%d/%m/%Y',     # 03/02/2026
+        '%Y-%m-%d',     # 2026-02-03
+        '%d %B %Y',     # 3 February 2026
+        '%d %b %Y',     # 3 Feb 2026
+    ]
+    
     for fmt in date_formats:
         try:
             return datetime.strptime(date_str, fmt)
-        except:
+        except ValueError:
             continue
+    
     return None
 
 def parse_punch_date(date_str: str) -> Optional[datetime]:
@@ -2053,46 +2070,73 @@ async def scrape_lpg_prices() -> Dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════════════════
 async def get_myschool_recent_articles(base_url: str = "https://myschool.ng") -> List[str]:
     """
-    Get recent MySchool article URLs using shared Playwright context.
-    Replaces the old version that used fetch_html_ultimate.
+    Get recent MySchool article URLs - FIXED based on analysis.
+    MySchool articles are on the homepage in card containers.
     """
     try:
-        # Use shared context for consistency
+        # FIXED: Use homepage as listing page
         listing_html = await shared_playwright.fetch_html(
-            f"{base_url}/news/latest",
-            wait_for_selector='div.card',
-            scroll_to_load=True
+            base_url,  # Homepage has all articles
+            wait_for_selector='.card, .col-sm-6',
+            scroll_to_load=True,
+            timeout=30000
         )
         
         if not listing_html:
-            LOG.warning(f"No HTML content for {base_url}/news/latest")
+            LOG.warning(f"No HTML content for {base_url}")
             return []
         
         soup = BeautifulSoup(listing_html, 'lxml')
-        article_links = []
+        article_urls = []
         
-        # Look for card containers
-        for card in soup.select('div.card'):
+        # FIXED: Strategy 1 - Look for article cards (from analysis)
+        # Articles are in: col-sm-6 col-lg-4 col-xl-4 mb-4 > .card
+        for card_container in soup.select('.col-sm-6.col-lg-4.col-xl-4.mb-4'):
+            card = card_container.select_one('.card')
+            if not card:
+                continue
+            
+            # Find article link inside card
             link = card.select_one('a[href*="/news/"]')
             if link:
                 href = link.get('href', '')
-                if '/news/' in href and not any(x in href for x in ['category', 'page', 'tag', 'author']):
+                if href and '/news/' in href and not any(x in href for x in ['category', 'tag', 'author', '#']):
                     full_url = urljoin(base_url, href)
-                    if full_url not in article_links:
-                        article_links.append(full_url)
+                    if full_url not in article_urls:
+                        article_urls.append(full_url)
         
-        # Also look for direct news links
-        for a in soup.select('a[href*="/news/"]'):
-            href = a.get('href', '')
-            if '/news/' in href and not any(x in href for x in ['category', 'page', 'tag', 'author']):
-                full_url = urljoin(base_url, href)
-                if full_url not in article_links:
-                    article_links.append(full_url)
+        # FIXED: Strategy 2 - Direct card elements
+        for card in soup.select('.card'):
+            link = card.select_one('a[href*="/news/"]')
+            if link:
+                href = link.get('href', '')
+                if href and '/news/' in href:
+                    full_url = urljoin(base_url, href)
+                    if full_url not in article_urls:
+                        article_urls.append(full_url)
         
-        return list(set(article_links))[:20]
+        # Strategy 3 - Direct news links as fallback
+        if not article_urls:
+            for a in soup.select('a[href*="/news/"]'):
+                href = a.get('href', '')
+                if href and '/news/' in href and not any(x in href for x in ['category', 'tag', 'author', '#']):
+                    full_url = urljoin(base_url, href)
+                    if full_url not in article_urls:
+                        article_urls.append(full_url)
+        
+        # Deduplicate
+        unique_urls = []
+        seen = set()
+        for url in article_urls:
+            if url not in seen:
+                seen.add(url)
+                unique_urls.append(url)
+        
+        LOG.info(f"[MySchool] Found {len(unique_urls)} article URLs from homepage")
+        return unique_urls[:20]  # Limit to 20 most recent
         
     except Exception as e:
-        LOG.error(f"Failed to fetch MySchool listing using shared context: {e}")
+        LOG.error(f"Failed to fetch MySchool listing: {e}")
         return []
 
 # Update the other news site functions to also use shared context consistently
@@ -2101,8 +2145,8 @@ async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> Li
     try:
         listing_html = await shared_playwright.fetch_html(
             f"{base_url}/topics/education/",
-            wait_for_selector='article.entry-item-simple',
-            scroll_to_load=True
+            wait_for_selector='article',
+            scroll_to_load=False
         )
         
         if not listing_html:
@@ -2117,7 +2161,7 @@ async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> Li
                 continue
             
             full_url = urljoin(base_url, link.get('href', ''))
-            date_elem = article.select_one('p, time, .date')
+            date_elem = article.select_one('.post-date')
             date_str = date_elem.get_text(strip=True) if date_elem else ""
             date_obj = parse_punch_date(date_str)
             articles_with_dates.append({
@@ -2138,7 +2182,7 @@ async def get_nuc_recent_articles(base_url: str = "https://www.nuc.edu.ng") -> L
         listing_html = await shared_playwright.fetch_html(
             base_url,
             wait_for_selector='article.post, .et_pb_post',
-            scroll_to_load=True
+            scroll_to_load=False
         )
         
         if not listing_html:
@@ -2175,125 +2219,140 @@ async def get_nuc_recent_articles(base_url: str = "https://www.nuc.edu.ng") -> L
 # SITE-SPECIFIC ARTICLE CONTENTS EXTRACTOR
 # ═══════════════════════════════════════════════════════════════════════════
 def extract_myschool_content(html: str, url: str) -> Dict[str, Any]:
-    """Specialized extraction for MySchool articles with better content detection."""
+    """Improved extraction for MySchool articles based on analysis."""
     if not html:
         return {'success': False}
     
     soup = BeautifulSoup(html, 'lxml')
     
-    # Extract title
+    # FIXED: Extract title - analysis shows h3.page-title.blog-header-title
     title = ""
-    title_elem = soup.select_one('h3.page-title.blog-header-title, h1, .post-title, h2')
+    title_elem = soup.select_one('h3.page-title.blog-header-title')
     if title_elem:
         title = title_elem.get_text(strip=True)
     
-    # Extract date
+    # Fallback title selectors
+    if not title:
+        for selector in ['h1', 'h2', '.entry-title', '.post-title', 'title']:
+            elem = soup.select_one(selector)
+            if elem:
+                title_text = elem.get_text(strip=True)
+                if title_text and len(title_text) > 10:
+                    title = title_text
+                    break
+    
+    # FIXED: Extract date - pattern: "Posted by ... | 3rd February, 2026"
     date_str = ""
     date_obj = None
     
-    # Look for posted by text
-    posted_by = soup.find(string=re.compile(r'Posted by', re.I))
-    if posted_by:
-        date_match = re.search(r'(\d{1,2}(?:st|nd|rd|th)?\s+\w+\s*,\s*\d{4}|\d{1,2}\s+\w+\s+\d{4})', str(posted_by), re.I)
-        if date_match:
-            date_str = date_match.group(1)
-            date_obj = parse_myschool_date(date_str)
+    # Look for the posted by pattern
+    all_text = soup.get_text()
     
-    if not date_obj:
-        all_text = soup.get_text()
-        date_match = re.search(r'(\d{1,2}(?:st|nd|rd|th)?\s+\w+\s*,\s*\d{4}|\d{1,2}\s+\w+\s+\d{4})', all_text, re.I)
-        if date_match:
-            date_str = date_match.group(1)
-            date_obj = parse_myschool_date(date_str)
-    
-    # Find article content
-    all_paragraphs = soup.find_all('p')
-    article_content = []
-    
-    skip_patterns = [
-        r'Posted by',
-        r'Comments',
-        r'^\d+\s*Comments?$',
-        r'^\s*$',
-        r'^[0-9\s]+$',
+    # Pattern 1: "Posted by Myschool Paul 3rd February, 2026 | 3 Comments"
+    posted_patterns = [
+        r'Posted by[^|]*\|[^|]*(\d{1,2}(?:st|nd|rd|th)?\s+\w+\s*,\s*\d{4})',
+        r'Posted by[^|]*(\d{1,2}(?:st|nd|rd|th)?\s+\w+\s*,\s*\d{4})',
+        r'(\d{1,2}(?:st|nd|rd|th)?\s+\w+\s*,\s*\d{4})\s*\|'
     ]
     
-    found_article_start = False
-    for p in all_paragraphs:
-        p_text = p.get_text(strip=True)
-        
-        if any(re.match(pattern, p_text, re.I) for pattern in skip_patterns):
-            continue
-        
-        if len(p_text) < 20:
-            continue
-        
-        if (len(p_text) > 40 and 
-            re.search(r'[A-Z][^.!?]*[.!?]', p_text) and
-            not re.search(r'^(Category|Tags|Share|Related|Also read|Read also)', p_text, re.I)):
-            
-            found_article_start = True
-            article_content.append(p_text)
-        elif found_article_start:
-            article_content.append(p_text)
-        
-        if len(' '.join(article_content)) > 500:
+    for pattern in posted_patterns:
+        match = re.search(pattern, all_text, re.IGNORECASE)
+        if match:
+            date_str = match.group(1).strip()
             break
     
-    content = ' '.join(article_content)
-    
-    # Fallback strategies if content is insufficient
-    if not content or len(content) < 200:
-        content_containers = [
-            soup.select_one('div.clearfix'),
-            soup.select_one('div.pb-5'),
-            soup.select_one('article'),
-            soup.select_one('div.entry-content'),
-            soup.select_one('main'),
-            soup.select_one('.content')
+    # Pattern 2: Direct date in text
+    if not date_str:
+        date_patterns = [
+            r'(\d{1,2}(?:st|nd|rd|th)?\s+\w+\s*,\s*\d{4})',
+            r'(\d{1,2}\s+\w+\s+\d{4})',
+            r'(\d{4}-\d{2}-\d{2})'
         ]
+        for pattern in date_patterns:
+            match = re.search(pattern, all_text[:2000])  # Search first 2000 chars
+            if match:
+                date_str = match.group(1)
+                break
+    
+    if date_str:
+        date_obj = parse_myschool_date(date_str)
+    
+    # FIXED: Extract content - analysis shows content in div.clearfix or div.pb-5
+    content = ""
+    
+    # Try containers from analysis
+    content_containers = [
+        soup.select_one('div.clearfix'),
+        soup.select_one('div.pb-5'),
+        soup.select_one('article'),
+        soup.select_one('div.entry-content'),
+        soup.select_one('main'),
+        soup.select_one('.content')
+    ]
+    
+    for container in content_containers:
+        if container:
+            # Remove unwanted elements
+            unwanted_selectors = [
+                'script', 'style', 'nav', 'header', 'footer', 
+                '.share', '.comments', '.ad', '.widget', 
+                '.related', 'iframe', '.sidebar', '.author-box',
+                '.social-share', '.post-meta', '.newsletter'
+            ]
+            
+            for selector in unwanted_selectors:
+                for elem in container.select(selector):
+                    elem.decompose()
+            
+            # Get text content
+            text = container.get_text(' ', strip=True)
+            if len(text) > 200:
+                content = text
+                break
+    
+    # If still no content, extract paragraphs
+    if not content or len(content) < 200:
+        paragraphs = []
+        for p in soup.select('p'):
+            p_text = p.get_text(strip=True)
+            # Skip short paragraphs and navigation text
+            if (len(p_text) > 50 and 
+                not re.match(r'^Posted by|^Comments|^Share|^Related|^Also read|^Read also|^Category|^Tags', p_text, re.I) and
+                not p_text.isdigit() and
+                '©' not in p_text and
+                'http' not in p_text.lower()):
+                paragraphs.append(p_text)
         
-        for container in content_containers:
-            if container:
-                for bad in container.select('script, style, nav, header, footer, .share, .comments, .ad, .widget, .related, iframe, .sidebar, .author, .social, .post-meta'):
-                    bad.decompose()
-                
-                paragraphs = container.find_all('p')
-                meaningful_paragraphs = []
-                
-                for p in paragraphs:
-                    p_text = p.get_text(strip=True)
-                    if (len(p_text) > 30 and 
-                        not re.match(r'^(Posted by|Comments|Category|Tags)', p_text, re.I)):
-                        meaningful_paragraphs.append(p_text)
-                
-                if meaningful_paragraphs:
-                    content = ' '.join(meaningful_paragraphs)
-                    break
+        if paragraphs:
+            content = ' '.join(paragraphs)
     
     # Create snippet
     snippet = ""
     if content:
+        # Clean content
+        content = re.sub(r'\s+', ' ', content)
+        
+        # Take first meaningful sentences
         sentences = re.split(r'(?<=[.!?])\s+', content)
         meaningful_sentences = []
         
         for sentence in sentences:
             sentence = sentence.strip()
+            # Filter out short sentences and navigation text
             if (len(sentence) > 30 and 
-                not re.match(r'^(Comments|Posted by|Category|Tags|Share)', sentence, re.I) and
-                re.search(r'[A-Z]', sentence)):
+                not re.match(r'^(Posted by|Comments|Share|Related|Also read|Read also|Category|Tags)', sentence, re.I) and
+                re.search(r'[A-Z]', sentence) and
+                '©' not in sentence and
+                'http' not in sentence.lower()):
                 
                 meaningful_sentences.append(sentence)
-                if len(' '.join(meaningful_sentences)) > 100:
+                if len(' '.join(meaningful_sentences)) > 150:
                     break
         
         if meaningful_sentences:
             snippet = ' '.join(meaningful_sentences)
-            if snippet and snippet[0].islower():
-                match = re.search(r'[A-Z]', snippet)
-                if match:
-                    snippet = snippet[match.start():]
             
+            # Truncate if needed
             if len(snippet) > 250:
                 if '.' in snippet[:250]:
                     last_period = snippet[:250].rfind('.')
@@ -2313,16 +2372,20 @@ def extract_myschool_content(html: str, url: str) -> Dict[str, Any]:
         snippet = re.sub(r'^\s*Comments?\s*', '', snippet, flags=re.I)
         snippet = snippet.strip()
     
-    # Check for school keywords in title OR snippet
+    # Check for school keywords
     title_has_keywords = _SCHOOL_KEYWORDS_RE.search(title) if _SCHOOL_KEYWORDS_RE else True
     snippet_has_keywords = _SCHOOL_KEYWORDS_RE.search(snippet) if _SCHOOL_KEYWORDS_RE else True
     
-    # FIXED: Check date recency
+    # Check date recency
     date_is_recent = is_recent_date(date_obj) if date_obj else False
     
-    success = bool(title and len(snippet) > 50 and 
-                  (title_has_keywords or snippet_has_keywords) and 
-                  date_is_recent)
+    # Success criteria
+    success = bool(
+        title and 
+        len(snippet) > 50 and 
+        (title_has_keywords or snippet_has_keywords) and 
+        date_is_recent
+    )
     
     return {
         'title': title[:200] if title else "",
@@ -2450,34 +2513,33 @@ def extract_clean_content_v5(html: str, url: str, site_type: str = '') -> Dict[s
 # SITE-SPECIFIC ARTICLE DATE FILTHERING
 # ═══════════════════════════════════════════════════════════════════════════
 async def scrape_myschool_recent(base_url: str = "https://myschool.ng", max_articles: int = 10) -> List[Dict]:
-    """Scrape recent MySchool articles using shared context with date filtering."""
+    """Improved MySchool scraper based on analysis findings."""
     LOG.info(f"\n[STAGE] Scraping MySchool from {base_url}")
     
     try:
-        # Get article URLs using shared context
+        # Get article URLs from homepage
         article_urls = await get_myschool_recent_articles(base_url)
         
         if not article_urls:
             LOG.info("[MySchool] No articles found")
             return []
         
-        LOG.info(f"[MySchool] Found {len(article_urls)} potential articles, fetching...")
+        LOG.info(f"[MySchool] Found {len(article_urls)} potential articles")
         
-        # Fetch articles using shared context
-        batch_size = 3
         all_extracted = []
+        batch_size = 3
         
         for i in range(0, len(article_urls), batch_size):
             batch = article_urls[i:i + batch_size]
             LOG.debug(f"[MySchool] Processing batch {i//batch_size + 1}/{(len(article_urls)-1)//batch_size + 1}")
             
-            # Fetch batch concurrently
             tasks = []
             for url in batch:
                 task = shared_playwright.fetch_html(
                     url,
-                    wait_for_selector='h3.page-title.blog-header-title',
-                    scroll_to_load=True
+                    wait_for_selector='h3.page-title.blog-header-title, div.clearfix, div.pb-5',
+                    scroll_to_load=False,
+                    timeout=30000
                 )
                 tasks.append(task)
             
@@ -2493,7 +2555,6 @@ async def scrape_myschool_recent(base_url: str = "https://myschool.ng", max_arti
                 
                 data = extract_myschool_content(result, url)
                 
-                # Only add if successful (which includes date filtering)
                 if data.get('success'):
                     all_extracted.append({
                         'title': data['title'],
@@ -2506,9 +2567,17 @@ async def scrape_myschool_recent(base_url: str = "https://myschool.ng", max_arti
                         'base_url': base_url,
                         'has_keywords': data.get('has_keywords', True)
                     })
+                    LOG.debug(f"[MySchool] ✓ {data['title'][:50]}...")
+                else:
+                    LOG.debug(f"[MySchool] ✗ Failed: {url}")
+                    if data.get('title'):
+                        LOG.debug(f"  Title: {data['title']}")
+                    if data.get('date_obj'):
+                        LOG.debug(f"  Date: {data['date_obj']}")
+                    LOG.debug(f"  Snippet length: {len(data.get('snippet', ''))}")
         
+        # Sort by date and limit
         if all_extracted:
-            # Sort by date (newest first)
             all_extracted.sort(key=lambda x: x.get('date_obj', datetime.min), reverse=True)
             all_extracted = all_extracted[:max_articles]
         
@@ -2518,8 +2587,6 @@ async def scrape_myschool_recent(base_url: str = "https://myschool.ng", max_arti
     except Exception as e:
         LOG.error(f"Error in scrape_myschool_recent: {e}")
         return []
-
-# Update punch and nuc scraping functions to use shared context consistently
 
 async def scrape_punch_recent(base_url: str = "https://punchng.com", max_articles: int = 10) -> List[Dict]:
     """Scrape recent Punch education articles using shared context with date filtering."""
@@ -2731,7 +2798,7 @@ async def scrape_school_news(
                     for url in batch:
                         task = shared_playwright.fetch_html(
                             url,
-                            wait_for_selector='h3.page-title.blog-header-title',
+                            wait_for_selector='.card, .col-sm-6',
                             scroll_to_load=True
                         )
                         tasks.append(task)
@@ -2768,7 +2835,7 @@ async def scrape_school_news(
                     for url in batch:
                         task = shared_playwright.fetch_html(
                             url,
-                            wait_for_selector='h1.post-title',
+                            wait_for_selector='article',
                             scroll_to_load=True
                         )
                         tasks.append(task)
