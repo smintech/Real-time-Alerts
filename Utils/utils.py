@@ -2068,7 +2068,7 @@ async def scrape_lpg_prices() -> Dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════════════════
 # SITE-SPECIFIC ARTICLE LISTING PAGE
 # ═══════════════════════════════════════════════════════════════════════════
-async def get_myschool_recent_articles(base_url: str = "https://myschool.ng") -> List[str]:
+async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news") -> List[str]:
     """
     Get recent MySchool article URLs - FIXED based on analysis.
     MySchool articles are on the homepage in card containers.
