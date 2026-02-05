@@ -7,6 +7,7 @@ import asyncio
 import psycopg2
 import psycopg2.pool
 import psycopg2.extras
+import time
 from urllib.parse import quote_plus
 from datetime import datetime, timezone, timedelta
 import hashlib
