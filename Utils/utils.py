@@ -13,7 +13,7 @@ from http import HTTPStatus
 import asyncio
 import requests
 import shutil
-from datetime import datetime
+from datetime import datetime, timedelta
 from functools import wraps
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup, Tag
@@ -21,6 +21,7 @@ import cloudscraper
 from requests.exceptions import RequestException
 from typing import Dict, Optional, Any, Tuple, Callable, List, Set, Union
 from collections import Counter
+from playwright._impl._errors import TargetClosedError
 # Settings / thresholds
 from bot.settings import (
     SUPPORTED_SITES,
@@ -274,9 +275,147 @@ async def get_visible_text_playwright(page) -> str:
     except Exception as e:
         LOG.error("JS extraction failed: %s", str(e)[:80])
         return ""
-# -------------------------------------------------------------------
-# 2) Fully improved fetch_with_playwright_aggressive (with XHR capture + price_js)
-# -------------------------------------------------------------------
+# ═══════════════════════════════════════════════════════════════════════════
+# SHARED PLAYWRIGHT MANAGER (New Class) - WITH IMPORT FIXES
+# ═══════════════════════════════════════════════════════════════════════════
+class SharedPlaywrightManager:
+    """Manages a single shared Playwright browser instance for all scrapers."""
+    
+    _instance = None
+    _lock = asyncio.Lock()
+    
+    def __new__(cls):
+        if cls._instance is None:
+            cls._instance = super(SharedPlaywrightManager, cls).__new__(cls)
+            cls._instance._initialized = False
+        return cls._instance
+    
+    async def initialize(self):
+        """Initialize the shared Playwright instance."""
+        async with self._lock:
+            if not self._initialized:
+                try:
+                    self.playwright = await async_playwright().start()
+                    self.browser = await self.playwright.chromium.launch(
+                        headless=True,
+                        args=[
+                            '--no-sandbox',
+                            '--no-zygote',
+                            '--disable-blink-features=AutomationControlled',
+                            '--disable-dev-shm-usage',
+                            '--disable-web-security',
+                            '--disable-setuid-sandbox',
+                            '--single-process',
+                            '--disable-gpu',
+                            '--disable-software-rasterizer',
+                        ],
+                        timeout=60000
+                    )
+                    self.context = await self.browser.new_context(
+                        user_agent=random.choice(_USER_AGENTS),
+                        viewport={'width': 1366, 'height': 768},
+                        locale='en-US',
+                        timezone_id='Africa/Lagos',
+                        java_script_enabled=True,
+                        bypass_csp=True
+                    )
+                    self.context.set_default_timeout(45000)
+                    self.context.set_default_navigation_timeout(45000)
+                    self._initialized = True
+                    LOG.info("✅ Shared Playwright manager initialized")
+                except Exception as e:
+                    LOG.error(f"❌ Failed to initialize shared Playwright: {e}")
+                    raise
+    
+    async def get_page(self, url: str = "") -> Optional[Any]:
+        """Get a new page from the shared context."""
+        if not self._initialized:
+            await self.initialize()
+        
+        try:
+            page = await self.context.new_page()
+            
+            # Anti-detection
+            await page.add_init_script("""
+                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+                Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
+                window.chrome = {runtime: {}};
+            """)
+            
+            # Block unnecessary resources (40% faster loading)
+            await page.route("**/*.{gif,webp,svg}", lambda route: route.abort())
+            await page.route("**/*.css", lambda route: route.abort())
+            await page.route("**/*.woff*", lambda route: route.abort())
+            
+            return page
+        except Exception as e:
+            LOG.error(f"Failed to create page from shared context: {e}")
+            return None
+    
+    async def fetch_html(self, url: str, wait_for_selector: str = None, 
+                        scroll_to_load: bool = False) -> str:
+        """Fetch HTML using shared Playwright context."""
+        page = None
+        try:
+            page = await self.get_page(url)
+            if not page:
+                return ""
+            
+            # Navigate with appropriate wait strategy
+            wait_until = "networkidle" if scroll_to_load else "domcontentloaded"
+            try:
+                await page.goto(url, wait_until=wait_until, timeout=45000)
+            except Exception as nav_error:
+                LOG.warning(f"Navigation timeout: {str(nav_error)[:60]}")
+                await page.goto(url, wait_until="load", timeout=20000)
+            
+            # Scroll to trigger lazy loading if needed
+            if scroll_to_load:
+                for i in range(3):
+                    await page.evaluate(f"window.scrollBy(0, document.body.scrollHeight * {(i + 1) / 3})")
+                    await asyncio.sleep(0.5)
+            
+            # Wait for selector if specified
+            if wait_for_selector:
+                try:
+                    await page.wait_for_selector(wait_for_selector, timeout=10000)
+                except Exception:
+                    pass
+            
+            await asyncio.sleep(1)
+            
+            html = await page.content()
+            return html
+            
+        except Exception as e:
+            LOG.error(f"Shared context fetch failed for {url}: {e}")
+            raise
+        finally:
+            if page:
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+    
+    async def cleanup(self):
+        """Clean up shared Playwright resources."""
+        async with self._lock:
+            if self._initialized:
+                try:
+                    if self.context:
+                        await self.context.close()
+                    if self.browser:
+                        await self.browser.close()
+                    if self.playwright:
+                        await self.playwright.stop()
+                    self._initialized = False
+                    LOG.info("✅ Shared Playwright manager cleaned up")
+                except Exception as e:
+                    LOG.error(f"Error cleaning up Playwright: {e}")
+
+# Global shared instance
+shared_playwright = SharedPlaywrightManager()
+
 async def fetch_with_playwright_aggressive(
     url: str,
     retries: int = 3,
@@ -296,7 +435,7 @@ async def fetch_with_playwright_aggressive(
     # Extract product ID from URL for logging
     product_id = None
     if url:
-        id_match = re.search(r'(\\d{5,})$', url)
+        id_match = re.search(r'(\d{5,})$', url)
         if id_match:
             product_id = int(id_match.group(1))
             LOG.info(f"🎯 Targeting Product ID: {product_id}")
@@ -317,12 +456,11 @@ async def fetch_with_playwright_aggressive(
                     start = time.time()
                     
                     # LAUNCH BROWSER (Production settings)
-                    # FIXED: Added --no-zygote flag critical for Docker stability
                     browser = await p.chromium.launch(
                         headless=True,
                         args=[
                             '--no-sandbox',
-                            '--no-zygote',  # CRITICAL: Prevents process forking issues in Docker
+                            '--no-zygote',
                             '--disable-blink-features=AutomationControlled',
                             '--disable-dev-shm-usage',
                             '--disable-web-security',
@@ -348,13 +486,12 @@ async def fetch_with_playwright_aggressive(
                         bypass_csp=True
                     )
                     
-                    # FIXED: Set timeouts on context, not browser
                     context.set_default_timeout(30000)
                     context.set_default_navigation_timeout(30000)
                     
                     page = await context.new_page()
                     
-                    # BLOCK UNNECESSARY RESOURCES (40% faster loading)
+                    # BLOCK UNNECESSARY RESOURCES
                     await page.route("**/*.{gif,webp,svg}", lambda route: route.abort())
                     await page.route("**/*.css", lambda route: route.abort())
                     await page.route("**/*.woff*", lambda route: route.abort())
@@ -368,28 +505,24 @@ async def fetch_with_playwright_aggressive(
                     
                     # NAVIGATE
                     try:
-                        # FIXED: Use domcontentloaded for faster initial response
                         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
                     except Exception as nav_error:
                         LOG.warning(f"Navigation timeout, trying load: {str(nav_error)[:60]}")
-                        # Fallback to load with shorter timeout
                         await page.goto(url, wait_until="load", timeout=20000)
                     
                     # KONGA-SPECIFIC WAITING
                     if is_konga:
                         LOG.info("  🔍 Konga: Waiting for main product content...")
                         
-                        # Wait for main container with reduced timeout
                         try:
                             await page.wait_for_selector(
                                 'div.productDetail_productDetailsContent__VV9__',
                                 timeout=8000
                             )
                             LOG.debug("✅ Main product container loaded")
-                        except Exception as e:
-                            LOG.warning(f"Main container timeout: {str(e)[:60]}")
+                        except Exception:
+                            LOG.debug("Main container timeout, continuing...")
                         
-                        # Wait for price elements with reduced timeout
                         try:
                             await page.wait_for_selector(
                                 '.priceBox_priceBoxPrice__i7paS, div.shared_specialPrice__uIZ_i',
@@ -399,10 +532,8 @@ async def fetch_with_playwright_aggressive(
                         except:
                             LOG.debug("Price elements timeout, continuing...")
                         
-                        # Reduced wait for dynamic content
                         await page.wait_for_timeout(2000)
                         
-                        # Minimal scroll to trigger lazy loading
                         try:
                             await page.evaluate("window.scrollBy(0, 300)")
                             await asyncio.sleep(0.5)
@@ -419,48 +550,27 @@ async def fetch_with_playwright_aggressive(
                     duration = time.time() - start
                     LOG.info(f"└── SUCCESS {duration:.1f}s | HTML:{len(html)} | Text:{len(visible_text)} ───────────────────────────────┘")
                     
-                    # FIXED: Proper cleanup - close resources in reverse order
-                    if page:
-                        try:
-                            await page.close()
-                        except Exception:
-                            pass
-                    if context:
-                        try:
-                            await context.close()
-                        except Exception:
-                            pass
-                    if browser:
-                        try:
-                            await browser.close()
-                        except Exception:
-                            pass
-                    
                     return (html, visible_text) if return_visible_text else html
                     
             except Exception as e:
-                error_msg = str(e)[:80] if str(e) else "Unknown error"
-                LOG.error(f"└── FAILED: {error_msg} ───────────────────────────────────────────────────┘")
-                
-                # FIXED: Safe cleanup without checking is_closed() which can throw
-                if page:
-                    try:
-                        await page.close()
-                    except Exception:
-                        pass
-                if context:
-                    try:
-                        await context.close()
-                    except Exception:
-                        pass
-                if browser:
-                    try:
-                        await browser.close()
-                    except Exception:
-                        pass
+                error_type = type(e).__name__
+                if error_type == 'TargetClosedError':
+                    LOG.warning(f"TargetClosedError while fetching {url}")
+                elif error_type == 'CancelledError':
+                    LOG.info("Fetch cancelled")
+                    raise
+                else:
+                    LOG.error(f"└── FAILED: {error_type}: {str(e)[:100]}")
+            finally:
+                # Clean up resources
+                for resource in [page, context, browser]:
+                    if resource:
+                        try:
+                            await resource.close()
+                        except:
+                            pass
                 
                 if attempt < retries:
-                    # Exponential backoff with jitter
                     wait_time = min(2 ** attempt + random.uniform(0, 1), 10)
                     LOG.info(f"  ⏳ Waiting {wait_time:.1f} seconds before retry...")
                     await asyncio.sleep(wait_time)
@@ -1942,92 +2052,125 @@ async def scrape_lpg_prices() -> Dict[str, Any]:
 # SITE-SPECIFIC ARTICLE LISTING PAGE
 # ═══════════════════════════════════════════════════════════════════════════
 async def get_myschool_recent_articles(base_url: str = "https://myschool.ng") -> List[str]:
-    """Get recent MySchool article URLs from the listing page."""
+    """
+    Get recent MySchool article URLs using shared Playwright context.
+    Replaces the old version that used fetch_html_ultimate.
+    """
     try:
-        listing_html = await fetch_html_ultimate(f"{base_url}/news/latest")
-    except Exception as e:
-        LOG.error(f"Failed to fetch MySchool listing: {e}")
-        return []
-    
-    if not listing_html:
-        return []
-    soup = BeautifulSoup(listing_html, 'lxml')
-    article_links = []
-    
-    # Look for card containers
-    for card in soup.select('div.card'):
-        link = card.select_one('a[href*="/news/"]')
-        if link:
-            href = link.get('href', '')
+        # Use shared context for consistency
+        listing_html = await shared_playwright.fetch_html(
+            f"{base_url}/news/latest",
+            wait_for_selector='div.card',
+            scroll_to_load=True
+        )
+        
+        if not listing_html:
+            LOG.warning(f"No HTML content for {base_url}/news/latest")
+            return []
+        
+        soup = BeautifulSoup(listing_html, 'lxml')
+        article_links = []
+        
+        # Look for card containers
+        for card in soup.select('div.card'):
+            link = card.select_one('a[href*="/news/"]')
+            if link:
+                href = link.get('href', '')
+                if '/news/' in href and not any(x in href for x in ['category', 'page', 'tag', 'author']):
+                    full_url = urljoin(base_url, href)
+                    if full_url not in article_links:
+                        article_links.append(full_url)
+        
+        # Also look for direct news links
+        for a in soup.select('a[href*="/news/"]'):
+            href = a.get('href', '')
             if '/news/' in href and not any(x in href for x in ['category', 'page', 'tag', 'author']):
                 full_url = urljoin(base_url, href)
                 if full_url not in article_links:
                     article_links.append(full_url)
-    
-    # Also look for direct news links
-    for a in soup.select('a[href*="/news/"]'):
-        href = a.get('href', '')
-        if '/news/' in href and not any(x in href for x in ['category', 'page', 'tag', 'author']):
-            full_url = urljoin(base_url, href)
-            if full_url not in article_links:
-                article_links.append(full_url)
-    
-    return list(set(article_links))[:20]
-
-async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> List[str]:
-    try:
-        listing_html = await fetch_html_ultimate(f"{base_url}/topics/education/")
+        
+        return list(set(article_links))[:20]
+        
     except Exception as e:
-        LOG.error(f"Failed to fetch Punch listing: {e}")
+        LOG.error(f"Failed to fetch MySchool listing using shared context: {e}")
         return []
-    
-    if not listing_html:
+
+# Update the other news site functions to also use shared context consistently
+async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> List[str]:
+    """Get recent Punch education articles using shared context."""
+    try:
+        listing_html = await shared_playwright.fetch_html(
+            f"{base_url}/topics/education/",
+            wait_for_selector='article.entry-item-simple',
+            scroll_to_load=True
+        )
+        
+        if not listing_html:
+            return []
+        
+        soup = BeautifulSoup(listing_html, 'lxml')
+        articles_with_dates = []
+        
+        for article in soup.select('article.entry-item-simple'):
+            link = article.select_one('a[href*="punchng.com"]')
+            if not link:
+                continue
+            
+            full_url = urljoin(base_url, link.get('href', ''))
+            date_elem = article.select_one('p, time, .date')
+            date_str = date_elem.get_text(strip=True) if date_elem else ""
+            date_obj = parse_punch_date(date_str)
+            articles_with_dates.append({
+                'url': full_url,
+                'date_obj': date_obj or datetime.min
+            })
+        
+        articles_with_dates.sort(key=lambda x: x['date_obj'], reverse=True)
+        return [article['url'] for article in articles_with_dates[:15]]
+        
+    except Exception as e:
+        LOG.error(f"Failed to fetch Punch listing using shared context: {e}")
         return []
-    soup = BeautifulSoup(listing_html, 'lxml')
-    articles_with_dates = []
-    for article in soup.select('article.entry-item-simple'):
-        link = article.select_one('a[href*="punchng.com"]')
-        if not link:
-            continue
-        full_url = urljoin(base_url, link.get('href', ''))
-        date_elem = article.select_one('p, time, .date')
-        date_str = date_elem.get_text(strip=True) if date_elem else ""
-        date_obj = parse_punch_date(date_str)
-        articles_with_dates.append({
-            'url': full_url,
-            'date_obj': date_obj or datetime.min
-        })
-    articles_with_dates.sort(key=lambda x: x['date_obj'], reverse=True)
-    return [article['url'] for article in articles_with_dates[:15]]
 
 async def get_nuc_recent_articles(base_url: str = "https://www.nuc.edu.ng") -> List[str]:
+    """Get recent NUC articles using shared context."""
     try:
-        listing_html = await fetch_html_ultimate(base_url)
+        listing_html = await shared_playwright.fetch_html(
+            base_url,
+            wait_for_selector='article.post, .et_pb_post',
+            scroll_to_load=True
+        )
+        
+        if not listing_html:
+            return []
+        
+        soup = BeautifulSoup(listing_html, 'lxml')
+        articles_with_dates = []
+        
+        for article in soup.select('article.post, .et_pb_post'):
+            link = article.select_one('a[href*="nuc.edu.ng"]')
+            if not link:
+                continue
+            
+            href = link.get('href', '')
+            if href.endswith('.pdf') or '/wp-content/' in href:
+                continue
+            
+            full_url = urljoin(base_url, href)
+            date_elem = article.select_one('span.published, .post-date, time')
+            date_str = date_elem.get_text(strip=True) if date_elem else ""
+            date_obj = parse_nuc_date(date_str)
+            articles_with_dates.append({
+                'url': full_url,
+                'date_obj': date_obj or datetime.min
+            })
+        
+        articles_with_dates.sort(key=lambda x: x['date_obj'], reverse=True)
+        return [article['url'] for article in articles_with_dates[:15]]
+        
     except Exception as e:
-        LOG.error(f"Failed to fetch NUC listing: {e}")
+        LOG.error(f"Failed to fetch NUC listing using shared context: {e}")
         return []
-    
-    if not listing_html:
-        return []
-    soup = BeautifulSoup(listing_html, 'lxml')
-    articles_with_dates = []
-    for article in soup.select('article.post, .et_pb_post'):
-        link = article.select_one('a[href*="nuc.edu.ng"]')
-        if not link:
-            continue
-        href = link.get('href', '')
-        if href.endswith('.pdf') or '/wp-content/' in href:
-            continue
-        full_url = urljoin(base_url, href)
-        date_elem = article.select_one('span.published, .post-date, time')
-        date_str = date_elem.get_text(strip=True) if date_elem else ""
-        date_obj = parse_nuc_date(date_str)
-        articles_with_dates.append({
-            'url': full_url,
-            'date_obj': date_obj or datetime.min
-        })
-    articles_with_dates.sort(key=lambda x: x['date_obj'], reverse=True)
-    return [article['url'] for article in articles_with_dates[:15]]
 # ═══════════════════════════════════════════════════════════════════════════
 # SITE-SPECIFIC ARTICLE CONTENTS EXTRACTOR
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2174,7 +2317,12 @@ def extract_myschool_content(html: str, url: str) -> Dict[str, Any]:
     title_has_keywords = _SCHOOL_KEYWORDS_RE.search(title) if _SCHOOL_KEYWORDS_RE else True
     snippet_has_keywords = _SCHOOL_KEYWORDS_RE.search(snippet) if _SCHOOL_KEYWORDS_RE else True
     
-    success = bool(title and len(snippet) > 50 and (title_has_keywords or snippet_has_keywords))
+    # FIXED: Check date recency
+    date_is_recent = is_recent_date(date_obj) if date_obj else False
+    
+    success = bool(title and len(snippet) > 50 and 
+                  (title_has_keywords or snippet_has_keywords) and 
+                  date_is_recent)
     
     return {
         'title': title[:200] if title else "",
@@ -2187,7 +2335,7 @@ def extract_myschool_content(html: str, url: str) -> Dict[str, Any]:
     }
 
 def extract_clean_content_v5(html: str, url: str, site_type: str = '') -> Dict[str, Any]:
-    """Main extraction function with site-specific handling."""
+    """Main extraction function with site-specific handling and date filtering."""
     if not html:
         return {'success': False}
     
@@ -2281,9 +2429,12 @@ def extract_clean_content_v5(html: str, url: str, site_type: str = '') -> Dict[s
     title_has_keywords = _SCHOOL_KEYWORDS_RE.search(title) if _SCHOOL_KEYWORDS_RE else True
     snippet_has_keywords = _SCHOOL_KEYWORDS_RE.search(snippet) if _SCHOOL_KEYWORDS_RE else True
     
+    # FIXED: Check date recency - timedelta is imported at the top
+    date_is_recent = is_recent_date(date_obj) if date_obj else False
+    
     success = bool(title and date_obj and len(snippet) > 50 and 
                   (title_has_keywords or snippet_has_keywords) and 
-                  is_recent_date(date_obj))
+                  date_is_recent)
     
     return {
         'title': title[:200],
@@ -2299,229 +2450,640 @@ def extract_clean_content_v5(html: str, url: str, site_type: str = '') -> Dict[s
 # SITE-SPECIFIC ARTICLE DATE FILTHERING
 # ═══════════════════════════════════════════════════════════════════════════
 async def scrape_myschool_recent(base_url: str = "https://myschool.ng", max_articles: int = 10) -> List[Dict]:
-    """Scrape recent MySchool articles."""
+    """Scrape recent MySchool articles using shared context with date filtering."""
     LOG.info(f"\n[STAGE] Scraping MySchool from {base_url}")
-    article_urls = await get_myschool_recent_articles(base_url)
-    if not article_urls:
-        LOG.info("[MySchool] No articles found")
-        return []
     
-    LOG.info(f"[MySchool] Found {len(article_urls)} potential articles, fetching...")
-    
-    batch_size = 5
-    all_extracted = []
-    
-    for i in range(0, len(article_urls), batch_size):
-        batch = article_urls[i:i + batch_size]
-        LOG.info(f"[MySchool] Processing batch {i//batch_size + 1}/{(len(article_urls)-1)//batch_size + 1}")
-        
-        tasks = [fetch_html_ultimate(url) for url in batch]
-        pages = await asyncio.gather(*tasks, return_exceptions=True)
-        
-        for idx, result in enumerate(pages):
-            url = batch[idx]
-            if isinstance(result, Exception):
-                LOG.debug(f"[MySchool] Failed to fetch {url}: {result}")
-                continue
-            if not result:
-                continue
-            
-            data = extract_myschool_content(result, url)
-            
-            is_successful = data['success']
-            
-            if not is_successful and data['title'] and len(data.get('snippet', '')) > 50 and data.get('has_keywords', False):
-                is_successful = True
-            
-            if is_successful:
-                all_extracted.append({
-                    'title': data['title'],
-                    'date': data['date_str'],
-                    'snippet': data['snippet'],
-                    'url': url,
-                    'source': 'myschool',
-                    'pdf': False,
-                    'date_obj': data['date_obj'] or datetime.now(),
-                    'base_url': base_url  # Store which base URL was used
-                })
-    
-    if all_extracted:
-        all_extracted.sort(key=lambda x: (x.get('date_obj', datetime.min), x['title']), reverse=True)
-        all_extracted = all_extracted[:max_articles]
-    
-    LOG.info(f"[MySchool] Extracted {len(all_extracted)} recent articles")
-    return all_extracted
-
-async def scrape_punch_recent(base_url: str = "https://punchng.com", max_articles: int = 10) -> List[Dict]:
-    """Scrape recent Punch education articles."""
-    LOG.info(f"\n[STAGE] Scraping Punch from {base_url}")
-    article_urls = await get_punch_recent_articles(base_url)
-    if not article_urls:
-        return []
-    
-    LOG.info(f"[Punch] Found {len(article_urls)} potential articles, fetching...")
-    tasks = [fetch_html_ultimate(url) for url in article_urls]
-    pages = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    articles = []
-    for idx, result in enumerate(pages):
-        url = article_urls[idx]
-        if isinstance(result, Exception) or not result:
-            continue
-        
-        data = extract_clean_content_v5(result, url, 'punch')
-        if data['success'] and data.get('has_keywords', False):
-            articles.append({
-                'title': data['title'],
-                'date': data['date_str'],
-                'snippet': data['snippet'],
-                'url': url,
-                'source': 'punch',
-                'pdf': False,
-                'date_obj': data['date_obj'],
-                'base_url': base_url
-            })
-    
-    articles.sort(key=lambda x: x.get('date_obj', datetime.min), reverse=True)
-    articles = articles[:max_articles]
-    LOG.info(f"[Punch] Extracted {len(articles)} recent articles")
-    return articles
-
-async def scrape_nuc_recent(base_url: str = "https://www.nuc.edu.ng", max_articles: int = 8) -> List[Dict]:
-    """Scrape recent NUC articles."""
-    LOG.info(f"\n[STAGE] Scraping NUC from {base_url}")
-    article_urls = await get_nuc_recent_articles(base_url)
-    if not article_urls:
-        return []
-    
-    LOG.info(f"[NUC] Found {len(article_urls)} potential articles, fetching...")
-    tasks = [fetch_html_ultimate(url) for url in article_urls]
-    pages = await asyncio.gather(*tasks, return_exceptions=True)
-    
-    articles = []
-    for idx, result in enumerate(pages):
-        url = article_urls[idx]
-        if isinstance(result, Exception) or not result:
-            continue
-        
-        data = extract_clean_content_v5(result, url, 'nuc')
-        if data['success'] and data.get('has_keywords', False):
-            articles.append({
-                'title': data['title'],
-                'date': data['date_str'],
-                'snippet': data['snippet'],
-                'url': url,
-                'source': 'nuc',
-                'pdf': False,
-                'date_obj': data['date_obj'],
-                'base_url': base_url
-            })
-    
-    articles.sort(key=lambda x: x.get('date_obj', datetime.min), reverse=True)
-    articles = articles[:max_articles]
-    LOG.info(f"[NUC] Extracted {len(articles)} recent articles")
-    return articles
-
-async def scrape_school_news_recent() -> List[Dict[str, Any]]:
-    """Main function to scrape recent school news from all sources."""
     try:
-        nuc_task = asyncio.create_task(scrape_nuc_recent())
-        myschool_task = asyncio.create_task(scrape_myschool_recent())
-        punch_task = asyncio.create_task(scrape_punch_recent())
+        # Get article URLs using shared context
+        article_urls = await get_myschool_recent_articles(base_url)
         
-        nuc_articles, myschool_articles, punch_articles = await asyncio.gather(
-            nuc_task, myschool_task, punch_task
-        )
+        if not article_urls:
+            LOG.info("[MySchool] No articles found")
+            return []
         
-        all_articles = nuc_articles + myschool_articles + punch_articles
-        all_articles.sort(key=lambda x: x.get('date_obj', datetime.min), reverse=True)
+        LOG.info(f"[MySchool] Found {len(article_urls)} potential articles, fetching...")
         
-        LOG.info(f"Total articles scraped: {len(all_articles)}")
-        return all_articles
+        # Fetch articles using shared context
+        batch_size = 3
+        all_extracted = []
+        
+        for i in range(0, len(article_urls), batch_size):
+            batch = article_urls[i:i + batch_size]
+            LOG.debug(f"[MySchool] Processing batch {i//batch_size + 1}/{(len(article_urls)-1)//batch_size + 1}")
+            
+            # Fetch batch concurrently
+            tasks = []
+            for url in batch:
+                task = shared_playwright.fetch_html(
+                    url,
+                    wait_for_selector='h3.page-title.blog-header-title',
+                    scroll_to_load=True
+                )
+                tasks.append(task)
+            
+            pages = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for idx, result in enumerate(pages):
+                url = batch[idx]
+                if isinstance(result, Exception):
+                    LOG.debug(f"[MySchool] Failed to fetch {url}: {result}")
+                    continue
+                if not result:
+                    continue
+                
+                data = extract_myschool_content(result, url)
+                
+                # Only add if successful (which includes date filtering)
+                if data.get('success'):
+                    all_extracted.append({
+                        'title': data['title'],
+                        'date': data['date_str'],
+                        'snippet': data['snippet'],
+                        'url': url,
+                        'source': 'myschool',
+                        'pdf': False,
+                        'date_obj': data['date_obj'],
+                        'base_url': base_url,
+                        'has_keywords': data.get('has_keywords', True)
+                    })
+        
+        if all_extracted:
+            # Sort by date (newest first)
+            all_extracted.sort(key=lambda x: x.get('date_obj', datetime.min), reverse=True)
+            all_extracted = all_extracted[:max_articles]
+        
+        LOG.info(f"[MySchool] Extracted {len(all_extracted)} recent articles")
+        return all_extracted
         
     except Exception as e:
-        LOG.error(f"Error in scrape_school_news_recent: {e}")
+        LOG.error(f"Error in scrape_myschool_recent: {e}")
+        return []
+
+# Update punch and nuc scraping functions to use shared context consistently
+
+async def scrape_punch_recent(base_url: str = "https://punchng.com", max_articles: int = 10) -> List[Dict]:
+    """Scrape recent Punch education articles using shared context with date filtering."""
+    LOG.info(f"\n[STAGE] Scraping Punch from {base_url}")
+    
+    try:
+        # Get article URLs using shared context
+        article_urls = await get_punch_recent_articles(base_url)
+        
+        if not article_urls:
+            LOG.info("[Punch] No articles found")
+            return []
+        
+        LOG.info(f"[Punch] Found {len(article_urls)} recent articles, fetching content...")
+        
+        # Fetch articles using shared context
+        batch_size = 3
+        articles = []
+        
+        for i in range(0, len(article_urls), batch_size):
+            batch = article_urls[i:i + batch_size]
+            LOG.debug(f"[Punch] Processing batch {i//batch_size + 1}/{(len(article_urls)-1)//batch_size + 1}")
+            
+            # Fetch batch concurrently
+            tasks = []
+            for url in batch:
+                task = shared_playwright.fetch_html(
+                    url,
+                    wait_for_selector='h1.post-title',
+                    scroll_to_load=True
+                )
+                tasks.append(task)
+            
+            pages = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for idx, result in enumerate(pages):
+                url = batch[idx]
+                if isinstance(result, Exception):
+                    LOG.debug(f"[Punch] Failed to fetch {url}: {result}")
+                    continue
+                if not result:
+                    continue
+                
+                data = extract_clean_content_v5(result, url, 'punch')
+                if data.get('success') and data.get('has_keywords', False):
+                    articles.append({
+                        'title': data['title'],
+                        'date': data['date_str'],
+                        'snippet': data['snippet'],
+                        'url': url,
+                        'source': 'punch',
+                        'pdf': False,
+                        'date_obj': data['date_obj'],
+                        'base_url': base_url,
+                        'has_keywords': data.get('has_keywords', True)
+                    })
+        
+        articles.sort(key=lambda x: x.get('date_obj', datetime.min), reverse=True)
+        articles = articles[:max_articles]
+        LOG.info(f"[Punch] Extracted {len(articles)} recent articles")
+        return articles
+        
+    except Exception as e:
+        LOG.error(f"Error in scrape_punch_recent: {e}")
+        return []
+
+async def scrape_nuc_recent(base_url: str = "https://www.nuc.edu.ng", max_articles: int = 8) -> List[Dict]:
+    """Scrape recent NUC articles using shared context with date filtering."""
+    LOG.info(f"\n[STAGE] Scraping NUC from {base_url}")
+    
+    try:
+        # Get article URLs using shared context
+        article_urls = await get_nuc_recent_articles(base_url)
+        
+        if not article_urls:
+            LOG.info("[NUC] No articles found")
+            return []
+        
+        LOG.info(f"[NUC] Found {len(article_urls)} recent articles, fetching content...")
+        
+        # Fetch articles using shared context
+        batch_size = 3
+        articles = []
+        
+        for i in range(0, len(article_urls), batch_size):
+            batch = article_urls[i:i + batch_size]
+            LOG.debug(f"[NUC] Processing batch {i//batch_size + 1}/{(len(article_urls)-1)//batch_size + 1}")
+            
+            # Fetch batch concurrently
+            tasks = []
+            for url in batch:
+                task = shared_playwright.fetch_html(
+                    url,
+                    wait_for_selector='h1.entry-title',
+                    scroll_to_load=True
+                )
+                tasks.append(task)
+            
+            pages = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            for idx, result in enumerate(pages):
+                url = batch[idx]
+                if isinstance(result, Exception):
+                    LOG.debug(f"[NUC] Failed to fetch {url}: {result}")
+                    continue
+                if not result:
+                    continue
+                
+                data = extract_clean_content_v5(result, url, 'nuc')
+                if data.get('success') and data.get('has_keywords', False):
+                    articles.append({
+                        'title': data['title'],
+                        'date': data['date_str'],
+                        'snippet': data['snippet'],
+                        'url': url,
+                        'source': 'nuc',
+                        'pdf': False,
+                        'date_obj': data['date_obj'],
+                        'base_url': base_url,
+                        'has_keywords': data.get('has_keywords', True)
+                    })
+        
+        articles.sort(key=lambda x: x.get('date_obj', datetime.min), reverse=True)
+        articles = articles[:max_articles]
+        LOG.info(f"[NUC] Extracted {len(articles)} recent articles")
+        return articles
+        
+    except Exception as e:
+        LOG.error(f"Error in scrape_nuc_recent: {e}")
         return []
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN
 # ═══════════════════════════════════════════════════════════════════════════
 async def scrape_school_news(
-    urls: List[str],
+    urls: Union[List[str], Dict[str, Dict[str, Any]]],
     fetch_full_content: bool = False,
     max_articles: int = 5
 ) -> List[Dict[str, Any]]:
     """
-    Scrape school news from given URLs using our improved scrapers.
-    Supports: myschool.ng, punchng.com, nuc.edu.ng
+    Unified function to scrape school news from:
+    1. A list of specific article URLs
+    2. A dict of site configurations for scraping recent articles
+    
+    Supports both specific URL scraping and recent article discovery.
+    
+    Args:
+        urls: Either:
+              - List of specific article URLs to scrape
+              - Dict of site configs: {
+                  'site_name': {
+                      'base_url': 'https://example.com',
+                      'task': scrape_function,  # Optional
+                      'max_articles': 10,        # Optional
+                      'type': 'nuc'/'myschool'/'punch'/'generic'  # Optional
+                  }
+              }
+        fetch_full_content: Whether to fetch full article content
+        max_articles: Maximum articles to return per site
+    
+    Returns:
+        List of formatted article dictionaries
     """
     LOG.info(f"\n{'='*70}")
-    LOG.info("📰 SCHOOL NEWS SCRAPER")
+    LOG.info("📰 UNIFIED SCHOOL NEWS SCRAPER")
     LOG.info(f"{'='*70}")
     
+    # Handle empty input
     if not urls:
-        LOG.warning("No URLs provided to scrape_school_news")
+        LOG.warning("No URLs or site configs provided")
         return []
+    
+    # Initialize shared Playwright context
+    if not shared_playwright._initialized:
+        LOG.info("Initializing shared Playwright context...")
+        await shared_playwright.initialize()
     
     all_articles = []
     
-    # Process each URL individually
-    for url in urls:
-        domain = get_domain_from_url(url)
+    # ============================================================
+    # CASE 1: List of specific article URLs
+    # ============================================================
+    if isinstance(urls, list):
+        LOG.info(f"📋 Processing {len(urls)} specific article URLs")
         
-        # Extract base URL (remove path)
-        parsed_url = urlparse(url)
-        base_url = f"{parsed_url.scheme}://{parsed_url.netloc}"
+        # Group URLs by domain for batch processing
+        url_groups = {}
+        for url in urls:
+            domain = get_domain_from_url(url)
+            if domain not in url_groups:
+                url_groups[domain] = []
+            url_groups[domain].append(url)
         
-        LOG.info(f"🌐 Processing: {url}")
-        LOG.info(f"  Base URL: {base_url}")
+        LOG.info(f"  Found {len(url_groups)} unique domains")
         
-        # Scrape based on domain
-        try:
+        # Process each domain group
+        for domain, domain_urls in url_groups.items():
+            LOG.info(f"\n🌐 Processing domain: {domain}")
+            LOG.info(f"  URLs: {len(domain_urls)}")
+            
+            # Use appropriate scraper based on domain
             if 'myschool.ng' in domain:
-                LOG.info("  📌 Detected MySchool.ng")
-                articles = await scrape_myschool_recent(base_url, max_articles)
-                all_articles.extend(articles)
-                
+                # For MySchool, scrape each URL individually
+                batch_size = 3
+                for i in range(0, len(domain_urls), batch_size):
+                    batch = domain_urls[i:i + batch_size]
+                    
+                    # Fetch batch concurrently
+                    tasks = []
+                    for url in batch:
+                        task = shared_playwright.fetch_html(
+                            url,
+                            wait_for_selector='h3.page-title.blog-header-title',
+                            scroll_to_load=True
+                        )
+                        tasks.append(task)
+                    
+                    pages = await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    for idx, result in enumerate(pages):
+                        url = batch[idx]
+                        if isinstance(result, Exception) or not result:
+                            LOG.debug(f"  ✗ Failed to fetch {url}")
+                            continue
+                        
+                        data = extract_myschool_content(result, url)
+                        if data.get('success'):
+                            all_articles.append({
+                                'title': data['title'],
+                                'date': data['date_str'],
+                                'snippet': data['snippet'],
+                                'url': url,
+                                'source': 'myschool',
+                                'pdf': False,
+                                'date_obj': data['date_obj'],
+                                'has_keywords': data.get('has_keywords', True)
+                            })
+            
             elif 'punchng.com' in domain:
-                LOG.info("  📌 Detected Punch.ng")
-                articles = await scrape_punch_recent(base_url, max_articles)
-                all_articles.extend(articles)
-                
+                # For Punch, scrape each URL individually
+                batch_size = 3
+                for i in range(0, len(domain_urls), batch_size):
+                    batch = domain_urls[i:i + batch_size]
+                    
+                    # Fetch batch concurrently
+                    tasks = []
+                    for url in batch:
+                        task = shared_playwright.fetch_html(
+                            url,
+                            wait_for_selector='h1.post-title',
+                            scroll_to_load=True
+                        )
+                        tasks.append(task)
+                    
+                    pages = await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    for idx, result in enumerate(pages):
+                        url = batch[idx]
+                        if isinstance(result, Exception) or not result:
+                            LOG.debug(f"  ✗ Failed to fetch {url}")
+                            continue
+                        
+                        data = extract_clean_content_v5(result, url, 'punch')
+                        if data.get('success'):
+                            all_articles.append({
+                                'title': data['title'],
+                                'date': data['date_str'],
+                                'snippet': data['snippet'],
+                                'url': url,
+                                'source': 'punch',
+                                'pdf': False,
+                                'date_obj': data['date_obj'],
+                                'has_keywords': data.get('has_keywords', True)
+                            })
+            
             elif 'nuc.edu.ng' in domain:
-                LOG.info("  📌 Detected NUC.edu.ng")
-                articles = await scrape_nuc_recent(base_url, max_articles)
-                all_articles.extend(articles)
-                
+                # For NUC, scrape each URL individually
+                batch_size = 3
+                for i in range(0, len(domain_urls), batch_size):
+                    batch = domain_urls[i:i + batch_size]
+                    
+                    # Fetch batch concurrently
+                    tasks = []
+                    for url in batch:
+                        task = shared_playwright.fetch_html(
+                            url,
+                            wait_for_selector='h1.entry-title',
+                            scroll_to_load=True
+                        )
+                        tasks.append(task)
+                    
+                    pages = await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    for idx, result in enumerate(pages):
+                        url = batch[idx]
+                        if isinstance(result, Exception) or not result:
+                            LOG.debug(f"  ✗ Failed to fetch {url}")
+                            continue
+                        
+                        data = extract_clean_content_v5(result, url, 'nuc')
+                        if data.get('success'):
+                            all_articles.append({
+                                'title': data['title'],
+                                'date': data['date_str'],
+                                'snippet': data['snippet'],
+                                'url': url,
+                                'source': 'nuc',
+                                'pdf': False,
+                                'date_obj': data['date_obj'],
+                                'has_keywords': data.get('has_keywords', True)
+                            })
+            
             else:
-                LOG.warning(f"  ⚠️  Unsupported domain: {domain}")
-                continue
-                
-        except Exception as e:
-            LOG.error(f"  ✗ Failed to scrape {domain}: {e}")
+                # Generic handling for unknown domains
+                LOG.warning(f"  ⚠️  Unknown domain: {domain} - attempting generic scrape")
+                batch_size = 2
+                for i in range(0, len(domain_urls), batch_size):
+                    batch = domain_urls[i:i + batch_size]
+                    
+                    tasks = []
+                    for url in batch:
+                        task = shared_playwright.fetch_html(
+                            url,
+                            wait_for_selector='h1, h2, article, main',
+                            scroll_to_load=True
+                        )
+                        tasks.append(task)
+                    
+                    pages = await asyncio.gather(*tasks, return_exceptions=True)
+                    
+                    for idx, result in enumerate(pages):
+                        url = batch[idx]
+                        if isinstance(result, Exception) or not result:
+                            continue
+                        
+                        # Try to determine site type
+                        site_type = 'generic'
+                        if 'punch' in domain:
+                            site_type = 'punch'
+                        elif 'nuc' in domain:
+                            site_type = 'nuc'
+                        elif 'myschool' in domain:
+                            site_type = 'myschool'
+                        
+                        data = extract_clean_content_v5(result, url, site_type)
+                        if data.get('success'):
+                            all_articles.append({
+                                'title': data['title'],
+                                'date': data['date_str'],
+                                'snippet': data['snippet'],
+                                'url': url,
+                                'source': domain,
+                                'pdf': False,
+                                'date_obj': data['date_obj'],
+                                'has_keywords': data.get('has_keywords', True)
+                            })
     
-    # Filter by school keywords
-    filtered_articles = []
+    # ============================================================
+    # CASE 2: Dict of site configurations for recent articles
+    # ============================================================
+    elif isinstance(urls, dict):
+        LOG.info(f"📋 Processing {len(urls)} site configurations for recent articles")
+        
+        site_configs = urls  # Use the provided dict directly
+        
+        # If no specific configs provided, use defaults
+        if not site_configs:
+            site_configs = {
+                'nuc': {
+                    'task': scrape_nuc_recent,
+                    'max_articles': 8,
+                    'base_url': 'https://www.nuc.edu.ng',
+                    'type': 'nuc'
+                },
+                'myschool': {
+                    'task': scrape_myschool_recent,
+                    'max_articles': 10,
+                    'base_url': 'https://myschool.ng',
+                    'type': 'myschool'
+                },
+                'punch': {
+                    'task': scrape_punch_recent,
+                    'max_articles': 10,
+                    'base_url': 'https://punchng.com',
+                    'type': 'punch'
+                }
+            }
+        
+        # Create tasks for all sites concurrently
+        tasks = []
+        site_names = []
+        
+        for site_name, config in site_configs.items():
+            LOG.info(f"\n🎯 Setting up {site_name}")
+            
+            # Determine which function to use
+            task_func = config.get('task')
+            if not task_func:
+                # Try to infer based on type or domain
+                site_type = config.get('type', 'generic')
+                base_url = config.get('base_url', '')
+                
+                if site_type == 'nuc' or 'nuc.edu.ng' in base_url:
+                    task_func = scrape_nuc_recent
+                elif site_type == 'myschool' or 'myschool.ng' in base_url:
+                    task_func = scrape_myschool_recent
+                elif site_type == 'punch' or 'punchng.com' in base_url:
+                    task_func = scrape_punch_recent
+                else:
+                    # Generic recent scraping
+                    async def generic_recent_scraper(base_url: str, max_articles: int = 10):
+                        """Generic recent article scraper for unknown sites."""
+                        try:
+                            LOG.info(f"  🔍 Attempting generic scrape of {base_url}")
+                            
+                            # Try common news paths
+                            candidate_urls = candidate_listing_urls(base_url)
+                            articles = []
+                            
+                            for candidate in candidate_urls[:3]:  # Try first 3 candidates
+                                try:
+                                    html = await shared_playwright.fetch_html(
+                                        candidate,
+                                        wait_for_selector='article, .post, .news-item, h1, h2',
+                                        scroll_to_load=True
+                                    )
+                                    
+                                    if html:
+                                        soup = BeautifulSoup(html, 'lxml')
+                                        
+                                        # Look for article links
+                                        article_links = []
+                                        for a in soup.select('a[href*="/"]'):
+                                            href = a.get('href', '')
+                                            full_url = urljoin(base_url, href)
+                                            
+                                            # Filter for plausible article URLs
+                                            if (len(href) > 20 and 
+                                                not any(x in href.lower() for x in ['.pdf', '.jpg', '.png', '.css', '.js']) and
+                                                not any(x in href for x in ['category', 'tag', 'author', 'page=', '?'])):
+                                                article_links.append(full_url)
+                                        
+                                        # Scrape found articles
+                                        for article_url in article_links[:5]:
+                                            try:
+                                                article_html = await shared_playwright.fetch_html(
+                                                    article_url,
+                                                    wait_for_selector='h1, article, main',
+                                                    scroll_to_load=False
+                                                )
+                                                
+                                                if article_html:
+                                                    data = extract_clean_content_v5(article_html, article_url, 'generic')
+                                                    if data.get('success'):
+                                                        articles.append({
+                                                            'title': data['title'],
+                                                            'date': data['date_str'],
+                                                            'snippet': data['snippet'],
+                                                            'url': article_url,
+                                                            'source': get_domain_from_url(base_url),
+                                                            'pdf': False,
+                                                            'date_obj': data['date_obj'],
+                                                            'has_keywords': data.get('has_keywords', True)
+                                                        })
+                                            except Exception as e:
+                                                LOG.debug(f"  Failed to scrape {article_url}: {e}")
+                                        
+                                        if articles:
+                                            break
+                                    
+                                except Exception as e:
+                                    LOG.debug(f"  Candidate {candidate} failed: {e}")
+                                    continue
+                            
+                            return articles[:max_articles]
+                            
+                        except Exception as e:
+                            LOG.error(f"Generic scraper failed for {base_url}: {e}")
+                            return []
+                    
+                    task_func = generic_recent_scraper
+            
+            # Create task with parameters
+            task_config = config.copy()
+            base_url = task_config.pop('base_url', '')
+            max_per_site = task_config.pop('max_articles', max_articles)
+            
+            if task_func == scrape_nuc_recent:
+                task = asyncio.create_task(
+                    scrape_nuc_recent(base_url=base_url, max_articles=max_per_site)
+                )
+            elif task_func == scrape_myschool_recent:
+                task = asyncio.create_task(
+                    scrape_myschool_recent(base_url=base_url, max_articles=max_per_site)
+                )
+            elif task_func == scrape_punch_recent:
+                task = asyncio.create_task(
+                    scrape_punch_recent(base_url=base_url, max_articles=max_per_site)
+                )
+            else:
+                # Generic function
+                task = asyncio.create_task(
+                    task_func(base_url=base_url, max_articles=max_per_site)
+                )
+            
+            tasks.append(task)
+            site_names.append(site_name)
+        
+        # Execute all tasks concurrently
+        LOG.info("\n🚀 Starting concurrent scraping of all sites...")
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        
+        # Process results
+        successful_sites = 0
+        
+        for site_name, result in zip(site_names, results):
+            if isinstance(result, Exception):
+                LOG.error(f"❌ Failed to scrape {site_name}: {result}")
+                continue
+            
+            articles = result
+            if articles:
+                LOG.info(f"✅ {site_name}: {len(articles)} articles found")
+                all_articles.extend(articles)
+                successful_sites += 1
+            else:
+                LOG.info(f"⚠️  {site_name}: No articles found")
+        
+        LOG.info(f"\n📊 Concurrent scraping complete: {successful_sites}/{len(site_configs)} sites successful")
+    
+    else:
+        LOG.error(f"❌ Invalid input type: {type(urls)}. Expected list or dict.")
+        return []
+    
+    # ============================================================
+    # POST-PROCESSING: Filtering and formatting
+    # ============================================================
+    
+    # Sort all articles by date (newest first)
+    all_articles.sort(key=lambda x: x.get('date_obj', datetime.min), reverse=True)
+    
+    # Filter for recent articles and valid content
+    recent_articles = []
     for article in all_articles:
-        title = article.get('title', '')
+        date_obj = article.get('date_obj')
+        has_keywords = article.get('has_keywords', False)
         snippet = article.get('snippet', '')
         
-        # Check if article has school keywords
-        title_has_keywords = bool(_SCHOOL_KEYWORDS_RE.search(title)) if title else False
-        snippet_has_keywords = bool(_SCHOOL_KEYWORDS_RE.search(snippet)) if snippet else False
+        # Check criteria
+        date_ok = date_obj and is_recent_date(date_obj)
+        content_ok = (article.get('title') and 
+                     snippet and 
+                     len(snippet) > 30 and
+                     has_keywords)
         
-        # Keep articles with keywords or if we couldn't check
-        if title_has_keywords or snippet_has_keywords or not _SCHOOL_KEYWORDS_RE:
-            article['has_keywords'] = True
-            filtered_articles.append(article)
+        if date_ok and content_ok:
+            recent_articles.append(article)
         else:
-            LOG.debug(f"Filtered out: {title[:50]}... (no school keywords)")
+            LOG.debug(f"Filtered out article: {article.get('title', 'Untitled')[:50]}...")
+            LOG.debug(f"  Date OK: {date_ok}, Content OK: {content_ok}")
     
-    LOG.info(f"\n📊 Results: {len(all_articles)} total → {len(filtered_articles)} with keywords")
-    
-    # Format for output
-    formatted_results = []
-    for article in filtered_articles[:max_articles * 3]:
-        formatted_results.append({
+    # Format final results
+    formatted_articles = []
+    for article in recent_articles:
+        formatted_articles.append({
             'title': article.get('title', 'Untitled'),
             'snippet': article.get('snippet', ''),
             'date': article.get('date', ''),
@@ -2532,10 +3094,16 @@ async def scrape_school_news(
             'has_keywords': article.get('has_keywords', True)
         })
     
-    # Sort by date (newest first)
-    formatted_results.sort(key=lambda x: (
+    # Final sort and limit
+    formatted_articles.sort(key=lambda x: (
         x.get('date_obj') is None,
         -(x.get('date_obj', datetime.now()).timestamp() if x.get('date_obj') else 0)
     ))
     
-    return formatted_results[:max_articles * 2]  # Return reasonable number
+    LOG.info(f"\n📊 FINAL RESULTS")
+    LOG.info(f"{'─'*40}")
+    LOG.info(f"Total articles found: {len(all_articles)}")
+    LOG.info(f"Recent articles (last {MAX_ARTICLE_AGE_DAYS} days): {len(recent_articles)}")
+    LOG.info(f"Returning: {len(formatted_articles[:max_articles * 2])}")
+    
+    return formatted_articles[:max_articles * 2]
