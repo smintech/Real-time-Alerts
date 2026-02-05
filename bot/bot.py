@@ -909,7 +909,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                     fetch_full_content=False, 
                     max_articles=config.get('max_articles', 10)
                 ),
-                timeout=120.0
+                timeout=250.0
             )
             
             item_count = len(items) if items else 0
