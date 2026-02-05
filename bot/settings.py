@@ -108,7 +108,7 @@ DEFAULT_SCHOOL_SOURCES = {
     ],
     # --- Reliable Education News Aggregators (Best for "Daily" updates) ---
     "MySchool.ng": [
-        "https://myschool.NG/news/latest"
+        "https://myschool.ng"
     ],
     "Punch Education": [
         "https://punchng.com/topics/education/"
