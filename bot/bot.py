@@ -44,7 +44,8 @@ from Utils.utils import (
     scrape_fuel_prices,
     scrape_lpg_prices,
     scrape_school_news,
-    safe_send,  # Import from utils
+    safe_send,
+    get_domain_from_url,
 )
 
 from bot.persistence import (
@@ -838,8 +839,38 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(TIMEZONE)
     
     LOG.info(f"📋 DEFAULT_SCHOOL_SOURCES loaded: {len(DEFAULT_SCHOOL_SOURCES)} source(s)")
+    
+    # Convert DEFAULT_SCHOOL_SOURCES to site_configs format for the unified scraper
+    site_configs = {}
     for src_name, urls in DEFAULT_SCHOOL_SOURCES.items():
-        LOG.info(f"  📌 {src_name}: {urls[0][:60]}...")
+        if not urls:
+            LOG.warning(f"⚠️  No URLs for {src_name}, skipping")
+            continue
+            
+        base_url = urls[0]  # Take the first URL as base URL
+        domain = get_domain_from_url(base_url)
+        
+        # Determine site type based on domain
+        if 'myschool.ng' in domain:
+            site_type = 'myschool'
+        elif 'punchng.com' in domain:
+            site_type = 'punch'
+        elif 'nuc.edu.ng' in domain:
+            site_type = 'nuc'
+        else:
+            site_type = 'generic'
+        
+        site_configs[src_name] = {
+            'base_url': base_url,
+            'type': site_type,
+            'max_articles': 10  # Default max articles per source
+        }
+        
+        LOG.info(f"  📌 {src_name}: {base_url[:60]}... ({site_type})")
+    
+    if not site_configs:
+        LOG.error("❌ No valid site configurations — aborting")
+        return
     
     # ═══════════════════════════════════════════════════════════════════════
     # PROCESSING LOOP
@@ -847,14 +878,14 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     processed_count = 0
     error_count = 0
     skipped_count = 0
-    source_list = list(DEFAULT_SCHOOL_SOURCES.items())
+    source_list = list(site_configs.items())
     total_sources = len(source_list)
     
     LOG.info(f"🔄 Beginning processing loop for {total_sources} sources...")
     
     idx = 0
     while idx < total_sources:
-        source_name, urls = source_list[idx]
+        source_name, config = source_list[idx]
         processed_count += 1
         
         LOG.info(f"\n{'─' * 70}")
@@ -866,9 +897,18 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
         try:
             LOG.info(f"🌐 Calling scrape_school_news for {source_name}...")
             
+            # Create site config for this specific source
+            single_site_config = {
+                source_name: config
+            }
+            
             # Timeout wrapper to prevent hanging
             items = await asyncio.wait_for(
-                scrape_school_news(urls, fetch_full_content=False, max_articles=10),
+                scrape_school_news(
+                    single_site_config, 
+                    fetch_full_content=False, 
+                    max_articles=config.get('max_articles', 10)
+                ),
                 timeout=120.0
             )
             
@@ -886,10 +926,8 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             
             # Sort items by date (newest first)
             items.sort(key=lambda x: (
-                x.get('date') is None,
-                -(datetime.strptime(x['date'], '%d %B, %Y').timestamp() 
-                  if x.get('date') and re.search(r'\d{4}', x.get('date', '')) 
-                  else 0)
+                x.get('date_obj') is None,
+                -(x.get('date_obj', datetime.now()).timestamp() if x.get('date_obj') else 0)
             ))
             
             # Build formatted message
@@ -932,13 +970,13 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                     continue
 
             # Add footer with source link
-            source_url = urls[0] if urls else ""
+            source_url = config.get('base_url', '')
             report_lines.extend([
                 f"<i>💡 Tip: Click any link above to read the full article</i>",
                 "",
                 f"🔗 <a href=\"{source_url}\">Visit {source_name}</a>",
                 "",
-                f"<i>#EducationUpdates #{source_name.replace(' ', '')}</i>"
+                f"<i>#EducationUpdates #{source_name.replace(' ', '').replace('(', '').replace(')', '')}</i>"
             ])
 
             report_text = "\n".join(report_lines)
@@ -1098,7 +1136,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             emoji_map = {
                 'MySchool.ng': '📚',
                 'Punch Education': '📰',
-                'NUC Updates': '🎓'
+                'NUC (Universities)': '🎓'
             }
             emoji = emoji_map.get(source_name, '📢')
             
