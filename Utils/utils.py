@@ -319,6 +319,7 @@ class SharedPlaywrightManager:
                         java_script_enabled=True,
                         bypass_csp=True
                     )
+                    # Default timeouts (can be overridden per call)
                     self.context.set_default_timeout(45000)
                     self.context.set_default_navigation_timeout(45000)
                     self._initialized = True
@@ -342,7 +343,7 @@ class SharedPlaywrightManager:
                 window.chrome = {runtime: {}};
             """)
             
-            # Block unnecessary resources (40% faster loading)
+            # Block unnecessary resources
             await page.route("**/*.{gif,webp,svg}", lambda route: route.abort())
             await page.route("**/*.css", lambda route: route.abort())
             await page.route("**/*.woff*", lambda route: route.abort())
@@ -352,44 +353,64 @@ class SharedPlaywrightManager:
             LOG.error(f"Failed to create page from shared context: {e}")
             return None
     
-    async def fetch_html(self, url: str, wait_for_selector: str = None, 
-                        scroll_to_load: bool = False) -> str:
-        """Fetch HTML using shared Playwright context."""
+    async def fetch_html(
+        self,
+        url: str,
+        wait_for_selector: Optional[str] = None,
+        scroll_to_load: bool = False,
+        timeout: Optional[int] = None  # Added optional timeout to prevent kwarg errors
+    ) -> str:
+        """Enhanced fetch_html with aggressive scrolling and MySchool-specific handling."""
         page = None
         try:
             page = await self.get_page(url)
             if not page:
                 return ""
             
-            # Navigate with appropriate wait strategy
-            wait_until = "networkidle" if scroll_to_load else "domcontentloaded"
+            # Detect MySchool for special handling
+            is_myschool = 'myschool.ng' in url.lower()
+            
+            # Determine wait strategy
+            wait_until = "networkidle"
+            if not (scroll_to_load or is_myschool):
+                wait_until = "domcontentloaded"
+                
+            # Use custom timeout if provided, else context default
+            goto_timeout = timeout or 45000
+            
             try:
-                await page.goto(url, wait_until=wait_until, timeout=45000)
+                await page.goto(url, wait_until=wait_until, timeout=goto_timeout)
             except Exception as nav_error:
-                LOG.warning(f"Navigation timeout: {str(nav_error)[:60]}")
+                LOG.warning(f"Navigation timeout for {url}: {nav_error}. Falling back to 'load'")
                 await page.goto(url, wait_until="load", timeout=20000)
             
-            # Scroll to trigger lazy loading if needed
-            if scroll_to_load:
-                for i in range(3):
-                    await page.evaluate(f"window.scrollBy(0, document.body.scrollHeight * {(i + 1) / 3})")
-                    await asyncio.sleep(0.5)
+            # Aggressive scrolling for lazy loading (especially MySchool)
+            if scroll_to_load or is_myschool:
+                LOG.debug(f"[Scroll] Aggressive scrolling enabled for {url}")
+                for i in range(5 if is_myschool else 3):  # More scrolls for MySchool
+                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                    await page.wait_for_timeout(1500 if is_myschool else 1000)
+                # Final full scroll + settle
+                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+                await page.wait_for_timeout(2000)
             
-            # Wait for selector if specified
+            # Wait for specific selector if requested
             if wait_for_selector:
                 try:
                     await page.wait_for_selector(wait_for_selector, timeout=10000)
                 except Exception:
-                    pass
+                    LOG.debug(f"Selector '{wait_for_selector}' not found within 10s")
             
-            await asyncio.sleep(1)
+            # Extra settle time
+            await page.wait_for_timeout(1000)
             
             html = await page.content()
+            LOG.debug(f"[Fetch] Success: {len(html)} bytes from {url}")
             return html
             
         except Exception as e:
             LOG.error(f"Shared context fetch failed for {url}: {e}")
-            raise
+            return ""
         finally:
             if page:
                 try:
@@ -412,7 +433,6 @@ class SharedPlaywrightManager:
                     LOG.info("✅ Shared Playwright manager cleaned up")
                 except Exception as e:
                     LOG.error(f"Error cleaning up Playwright: {e}")
-
 # Global shared instance
 shared_playwright = SharedPlaywrightManager()
 
@@ -2070,74 +2090,70 @@ async def scrape_lpg_prices() -> Dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════════════════
 async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news") -> List[str]:
     """
-    Get recent MySchool article URLs - FIXED based on analysis.
-    MySchool articles are on the homepage in card containers.
+    Robust MySchool article URL extraction.
+    - Tries /news/latest first (dedicated latest page if it exists)
+    - Falls back to homepage /news (which shows recent articles in cards)
+    - Aggressive lazy-load handling via scroll_to_load=True
+    - Multiple fallback selectors for reliability
+    - Deduplicates and limits to 25 candidates
     """
-    try:
-        # FIXED: Use homepage as listing page
-        listing_html = await shared_playwright.fetch_html(
-            base_url,  # Homepage has all articles
-            wait_for_selector='.card, .col-sm-6',
-            scroll_to_load=True,
-            timeout=30000
+    # Candidate listing pages: /news/latest (if exists) → /news → root homepage
+    root = base_url.rstrip("/").rsplit("/", 1)[0] if "/" in base_url else base_url
+    urls_to_try = [
+        f"{base_url.rstrip('/')}/latest",   # e.g., https://myschool.ng/news/latest
+        base_url.rstrip("/"),               # e.g., https://myschool.ng/news
+        root,                               # e.g., https://myschool.ng (homepage often shows news)
+    ]
+
+    for listing_url in urls_to_try:
+        LOG.info(f"[MySchool] Trying listing page: {listing_url}")
+        
+        html = await shared_playwright.fetch_html(
+            listing_url,
+            wait_for_selector='.card, .col-sm-6, .col-lg-4, .blog-header-title',
+            scroll_to_load=True,   # Triggers aggressive scrolling in fetch_html
         )
         
-        if not listing_html:
-            LOG.warning(f"No HTML content for {base_url}")
-            return []
-        
-        soup = BeautifulSoup(listing_html, 'lxml')
-        article_urls = []
-        
-        # FIXED: Strategy 1 - Look for article cards (from analysis)
-        # Articles are in: col-sm-6 col-lg-4 col-xl-4 mb-4 > .card
-        for card_container in soup.select('.col-sm-6.col-lg-4.col-xl-4.mb-4'):
-            card = card_container.select_one('.card')
-            if not card:
-                continue
-            
-            # Find article link inside card
-            link = card.select_one('a[href*="/news/"]')
-            if link:
-                href = link.get('href', '')
-                if href and '/news/' in href and not any(x in href for x in ['category', 'tag', 'author', '#']):
-                    full_url = urljoin(base_url, href)
-                    if full_url not in article_urls:
-                        article_urls.append(full_url)
-        
-        # FIXED: Strategy 2 - Direct card elements
-        for card in soup.select('.card'):
-            link = card.select_one('a[href*="/news/"]')
-            if link:
-                href = link.get('href', '')
+        if not html:
+            LOG.warning(f"[MySchool] Empty HTML from {listing_url}")
+            continue
+
+        soup = BeautifulSoup(html, 'lxml')
+        article_urls: Set[str] = set()
+
+        # Multiple robust selector strategies (prioritized from most specific to broad)
+        selectors = [
+            '.card a[href*="/news/"]',
+            '.col-sm-6 a[href*="/news/"]',
+            '.col-lg-4 a[href*="/news/"]',
+            '.col-xl-4 a[href*="/news/"]',
+            'a[href*="/news/"]:not([href*="category"]):not([href*="tag"]):not([href*="author"])'
+        ]
+
+        for selector in selectors:
+            for a in soup.select(selector):
+                href = a.get('href', '')
                 if href and '/news/' in href:
-                    full_url = urljoin(base_url, href)
-                    if full_url not in article_urls:
-                        article_urls.append(full_url)
-        
-        # Strategy 3 - Direct news links as fallback
+                    # Filter out non-article paths
+                    if any(bad in href for bad in ['category', 'tag', 'author', 'page', '#', '?']):
+                        continue
+                    full_url = urljoin("https://myschool.ng", href)  # Base is always myschool.ng
+                    article_urls.add(full_url)
+
+        # Final broad fallback: any /news/ link
         if not article_urls:
             for a in soup.select('a[href*="/news/"]'):
                 href = a.get('href', '')
-                if href and '/news/' in href and not any(x in href for x in ['category', 'tag', 'author', '#']):
-                    full_url = urljoin(base_url, href)
-                    if full_url not in article_urls:
-                        article_urls.append(full_url)
-        
-        # Deduplicate
-        unique_urls = []
-        seen = set()
-        for url in article_urls:
-            if url not in seen:
-                seen.add(url)
-                unique_urls.append(url)
-        
-        LOG.info(f"[MySchool] Found {len(unique_urls)} article URLs from homepage")
-        return unique_urls[:20]  # Limit to 20 most recent
-        
-    except Exception as e:
-        LOG.error(f"Failed to fetch MySchool listing: {e}")
-        return []
+                if '/news/' in href and not any(bad in href for bad in ['category', 'tag', 'author', 'page', '#']):
+                    full_url = urljoin("https://myschool.ng", href)
+                    article_urls.add(full_url)
+
+        if article_urls:
+            LOG.info(f"[MySchool] Successfully extracted {len(article_urls)} article URLs from {listing_url}")
+            return list(article_urls)[:25]  # Limit early to newest candidates
+
+    LOG.warning("[MySchool] Failed to extract any article URLs from all listing pages")
+    return []
 
 # Update the other news site functions to also use shared context consistently
 async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> List[str]:
