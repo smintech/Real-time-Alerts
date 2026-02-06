@@ -2426,7 +2426,7 @@ def extract_clean_content_v5(html: str, url: str, site_type: str = '') -> Dict[s
     title = ""
     title_selectors = {
         'nuc': ['h1.entry-title', 'h1', '.entry-title'],
-        'punch': ['h1.post-title', 'h1', '.post-title', '.entry-title']
+        'punch': ['h1.post-title', 'h1', '.post-title', '.entry-title']
     }
     selectors = title_selectors.get(site_type, ['h1', 'h2', 'h3', '.title', '.entry-title'])
     for sel in selectors:
