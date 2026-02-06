@@ -2249,7 +2249,7 @@ def extract_myschool_content(html: str, url: str) -> Dict[str, Any]:
     
     # Fallback title selectors
     if not title:
-        for selector in ['h3.page-title.blog-header-title', 'h3.blog-header-title', '.post-title']:
+        for selector in ['h3.page-title.blog-header-title', 'h3.blog-header-title', '.post-title']:
             elem = soup.select_one(selector)
             if elem:
                 title_text = elem.get_text(strip=True)
