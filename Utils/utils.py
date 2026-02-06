@@ -2875,7 +2875,7 @@ async def scrape_punch_recent(base_url: str = "https://punchng.com", max_article
             for url in batch:
                 task = shared_playwright.fetch_html(
                     url,
-                    wait_for_selector='h1.post-title', 'h1', '.post-title', '.entry-title',
+                    wait_for_selector='h1.post-title, h1, .post-title, .entry-title',
                     scroll_to_load=True
                 )
                 tasks.append(task)
