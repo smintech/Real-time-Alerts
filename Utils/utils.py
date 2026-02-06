@@ -371,9 +371,9 @@ class SharedPlaywrightManager:
             is_myschool = 'myschool.ng' in url.lower()
             
             # Determine wait strategy
-            wait_until = "networkidle"
-            if not (scroll_to_load or is_myschool):
-                wait_until = "domcontentloaded"
+            wait_until = "domcontentloaded"
+            #if not (scroll_to_load):
+                #wait_until = "domcontentloaded"
                 
             # Use custom timeout if provided, else context default
             goto_timeout = timeout or 45000
@@ -2161,7 +2161,7 @@ async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> Li
     try:
         listing_html = await shared_playwright.fetch_html(
             f"{base_url}/topics/education/",
-            wait_for_selector='article',
+            wait_for_selector=None
             scroll_to_load=False
         )
         
@@ -2249,7 +2249,7 @@ def extract_myschool_content(html: str, url: str) -> Dict[str, Any]:
     
     # Fallback title selectors
     if not title:
-        for selector in ['h1', 'h2', '.entry-title', '.post-title', 'title']:
+        for selector in ['h3.page-title.blog-header-title', 'h3.blog-header-title', '.post-title']:
             elem = soup.select_one(selector)
             if elem:
                 title_text = elem.get_text(strip=True)
@@ -2426,7 +2426,7 @@ def extract_clean_content_v5(html: str, url: str, site_type: str = '') -> Dict[s
     title = ""
     title_selectors = {
         'nuc': ['h1.entry-title', 'h1', '.entry-title'],
-        'punch': ['h1.post-title', 'h1', '.post-title', '.entry-title']
+        'punch': ['h1.post-title', 'h1', '.post-title', '.entry-title']
     }
     selectors = title_selectors.get(site_type, ['h1', 'h2', 'h3', '.title', '.entry-title'])
     for sel in selectors:
