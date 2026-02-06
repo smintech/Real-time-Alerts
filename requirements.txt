@@ -14,3 +14,4 @@ nest-asyncio
 cloudscraper
 lxml
 playwright==1.57.0
+aiohttp
