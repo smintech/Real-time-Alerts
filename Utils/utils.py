@@ -3342,7 +3342,7 @@ async def scrape_school_news(
             if key in domain:
                 return policy
         # default fallback: prefer HTTP first but allow Playwright fallback
-        return {"use_http_first": True, "allow_playwright": True}
+        return {"use_http_first": True, "allow_playwright": False}
 
     def _fetch_kwargs(wait_for_selector=None, scroll=False):
         return {
