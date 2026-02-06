@@ -20,9 +20,10 @@ from bs4 import BeautifulSoup, Tag
 import cloudscraper
 from requests.exceptions import RequestException
 from typing import Dict, Optional, Any, Tuple, Callable, List, Set, Union,Iterable
-from collections import Counter
+from collections import Counter, deque
 from playwright._impl._errors import TargetClosedError
 import aiohttp
+import importlib
 # Settings / thresholds
 from bot.settings import (
     SUPPORTED_SITES,
@@ -279,21 +280,27 @@ async def get_visible_text_playwright(page) -> str:
 # ═══════════════════════════════════════════════════════════════════════════
 # SHARED PLAYWRIGHT MANAGER (New Class) - WITH IMPORT FIXES
 # ═══════════════════════════════════════════════════════════════════════════
+_cloudscraper_spec = importlib.util.find_spec("cloudscraper")
+if _cloudscraper_spec is not None:
+    import cloudscraper
+else:
+    cloudscraper = None
+
 class SharedPlaywrightManager:
     """
-    Shared Playwright manager with a global semaphore for concurrency control.
-
-    Key features:
-    - Single shared Playwright browser/context
-    - Global asyncio.Semaphore to limit concurrent fetches
-    - fetch_with_semaphore wrapper with retry/backoff
-    - run_concurrent helper to run many fetches
+    Playwright manager with:
+      - HTTP-first (cloudscraper -> aiohttp) smart_fetch
+      - Semaphore concurrency control
+      - Page pool (max_open_pages) for reusing pages
+      - Browser recycling after max pages created
+      - Synchronous recycle (await) to avoid overlapping browser instances
     """
 
     _instance = None
     _lock = asyncio.Lock()
 
     DEFAULTS = {
+        # Playwright/browser options
         "headless": True,
         "args": [
             "--no-sandbox",
@@ -304,6 +311,7 @@ class SharedPlaywrightManager:
             "--disable-gpu",
             "--single-process",
             "--disable-software-rasterizer",
+            # Render tip: consider adding more conservative flags if needed
         ],
         "viewport": {"width": 1366, "height": 768},
         "locale": "en-US",
@@ -311,7 +319,10 @@ class SharedPlaywrightManager:
         "default_timeout": 45000,
         "myschool_timeout": 90000,
         "user_agent_list": _USER_AGENTS,
-        "max_concurrency": 6,  # <-- default semaphore size
+        # Concurrency & pooling
+        "max_concurrency": 2,          # semaphore concurrency
+        "max_open_pages": 6,           # hard cap on simultaneously open pages (pool size)
+        "max_pages_before_reset": 10,  # recreate browser/context after this many created pages
     }
 
     def __new__(cls):
@@ -321,7 +332,7 @@ class SharedPlaywrightManager:
         return cls._instance
 
     async def initialize(self, **kwargs):
-        """Initialize Playwright and the concurrency semaphore (idempotent)."""
+        """Initialize Playwright, browser and context, and the page pool."""
         async with self._lock:
             if self._initialized:
                 return
@@ -329,10 +340,18 @@ class SharedPlaywrightManager:
             self._cfg = dict(self.DEFAULTS)
             self._cfg.update(kwargs)
 
+            # runtime fields
             self.playwright: Optional[Playwright] = None
             self.browser: Optional[Browser] = None
             self.context: Optional[BrowserContext] = None
+
+            # concurrency controls
             self._sem: asyncio.Semaphore = asyncio.Semaphore(self._cfg["max_concurrency"])
+
+            # page pool and counters
+            self._page_pool: deque = deque()  # stores Page objects ready to reuse
+            self._open_pages = 0              # currently "checked out" or pooled pages count
+            self._pages_created = 0          # total pages created since last recycle
 
             try:
                 LOG.info("Initializing shared Playwright...")
@@ -342,6 +361,7 @@ class SharedPlaywrightManager:
                     args=self._cfg["args"],
                     timeout=60000
                 )
+
                 ua = random.choice(self._cfg["user_agent_list"]) if self._cfg["user_agent_list"] else None
                 self.context = await self.browser.new_context(
                     user_agent=ua,
@@ -351,12 +371,14 @@ class SharedPlaywrightManager:
                     java_script_enabled=True,
                     bypass_csp=True
                 )
-                # default timeouts
+
+                # timeouts applied to context
                 self.context.set_default_timeout(self._cfg["default_timeout"])
                 self.context.set_default_navigation_timeout(self._cfg["default_timeout"])
 
                 self._initialized = True
-                LOG.info("✅ Shared Playwright manager initialized (max_concurrency=%s)", self._cfg["max_concurrency"])
+                LOG.info("✅ Shared Playwright manager initialized (max_concurrency=%s max_open_pages=%s)",
+                         self._cfg["max_concurrency"], self._cfg["max_open_pages"])
             except Exception as e:
                 LOG.error("Failed to initialize Playwright: %s", e)
                 # best-effort teardown
@@ -371,6 +393,184 @@ class SharedPlaywrightManager:
                     pass
                 raise
 
+    # ---------------------------
+    # Internal helpers
+    # ---------------------------
+    async def _setup_page(self, page: Page) -> None:
+        """Apply anti-detection scripts & resource blocking to a freshly-created page."""
+        try:
+            # init script to reduce webdriver fingerprinting
+            await page.add_init_script(
+                """
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+                window.chrome = window.chrome || { runtime: {} };
+                try { Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 4 }); } catch(e){}
+                """
+            )
+        except Exception:
+            LOG.debug("Failed to add init script for page (may still be fine)")
+
+        # Block heavy resources to reduce memory/network
+        async def _abort(route):
+            try:
+                await route.abort()
+            except Exception:
+                try:
+                    await route.continue_()
+                except Exception:
+                    pass
+
+        patterns = [
+            "**/*.{png,jpg,jpeg,gif,webp,svg,ico}",
+            "**/*.css",
+            "**/*.woff",
+            "**/*.woff2",
+            "**/*.ttf",
+            "**/*.otf",
+            "**/*analytics*",
+            "**/*doubleclick*",
+            "**/*google-analytics*",
+            "**/*.mp4",
+            "**/*.webm"
+        ]
+        for p in patterns:
+            try:
+                await page.route(p, _abort)
+            except Exception:
+                # route may fail depending on Playwright version or state; keep going
+                LOG.debug("route setup failed for pattern: %s", p)
+
+    # ---------------------------
+    # Page pool: get_page / release_page
+    # ---------------------------
+    async def get_page(self, url: str = "", wait_for_slot: bool = True) -> Optional[Page]:
+        """
+        Acquire a page from the pool (reuse) or create a new one if under max_open_pages.
+        If at capacity, optionally wait until a page is released (wait_for_slot=True) otherwise return None.
+        """
+        if not self._initialized:
+            await self.initialize()
+
+        # quick recycle check: if pages created exceeded threshold, recycle synchronously
+        if self._pages_created >= self._cfg["max_pages_before_reset"]:
+            LOG.warning("♻️ max_pages_before_reset reached (%s). Recycling browser now.", self._cfg["max_pages_before_reset"])
+            await self._recycle_browser()
+
+        # If pool has pages, reuse one
+        try:
+            page = None
+            if self._page_pool:
+                page = self._page_pool.popleft()
+                LOG.debug("Reusing page from pool (pool size now %d)", len(self._page_pool))
+                return page
+
+            # no pooled page - ensure we are under cap before creating
+            if self._open_pages < self._cfg["max_open_pages"]:
+                page = await self.context.new_page()
+                await self._setup_page(page)
+                self._open_pages += 1
+                self._pages_created += 1
+                LOG.debug("Created new page (open_pages=%d pages_created=%d)", self._open_pages, self._pages_created)
+                return page
+
+            # at capacity
+            if not wait_for_slot:
+                LOG.debug("At max_open_pages and wait_for_slot=False - returning None")
+                return None
+
+            # wait loop until a page is released (simple sleep-wait)
+            LOG.warning("🧠 max_open_pages reached (%s). Waiting for a free page slot...", self._cfg["max_open_pages"])
+            while self._open_pages >= self._cfg["max_open_pages"]:
+                await asyncio.sleep(0.2)
+                # if pool gained an item, return it
+                if self._page_pool:
+                    page = self._page_pool.popleft()
+                    LOG.debug("Reusing page from pool after wait (pool size now %d)", len(self._page_pool))
+                    return page
+            # Safety fallback: try create again
+            if self._open_pages < self._cfg["max_open_pages"]:
+                page = await self.context.new_page()
+                await self._setup_page(page)
+                self._open_pages += 1
+                self._pages_created += 1
+                LOG.debug("Created new page after wait (open_pages=%d)", self._open_pages)
+                return page
+        except Exception as e:
+            LOG.error("Failed to acquire page: %s", e)
+            return None
+
+    async def release_page(self, page: Page) -> None:
+        """
+        Return a page to the pool for reuse. If recycling is in progress or pool is full, close the page.
+        """
+        if not page:
+            return
+
+        # If page is already closed, decrement counters safely
+        try:
+            if page.is_closed():
+                self._open_pages = max(0, self._open_pages - 1)
+                return
+        except Exception:
+            pass
+
+        # If we are past threshold and recycle is imminent, close page to let recycle work cleanly
+        if self._pages_created >= self._cfg["max_pages_before_reset"]:
+            try:
+                await page.close()
+            except Exception:
+                pass
+            self._open_pages = max(0, self._open_pages - 1)
+            LOG.debug("Closed page during recycle window (open_pages=%d)", self._open_pages)
+            return
+
+        # Otherwise, return to pool (but do not exceed pool capacity)
+        pool_capacity = max(0, self._cfg["max_open_pages"])
+        if len(self._page_pool) < pool_capacity:
+            try:
+                # clear listeners that might hold memory; keep routes and init scripts intact
+                try:
+                    await page.evaluate("() => { window.stop && window.stop(); }")
+                except Exception:
+                    pass
+                self._page_pool.append(page)
+                LOG.debug("Returned page to pool (pool size=%d)", len(self._page_pool))
+            except Exception:
+                # fallback: close if we fail to return to pool
+                try:
+                    await page.close()
+                except Exception:
+                    pass
+                self._open_pages = max(0, self._open_pages - 1)
+        else:
+            try:
+                await page.close()
+            except Exception:
+                pass
+            self._open_pages = max(0, self._open_pages - 1)
+
+    # ---------------------------
+    # HTTP helpers (cloudscraper optional + aiohttp)
+    # ---------------------------
+    async def _cloudscraper_fetch(self, url: str, timeout: int = 20) -> str:
+        """Synchronous cloudscraper wrapper executed in default executor (if cloudscraper installed)."""
+        if cloudscraper is None:
+            return ""
+        try:
+            loop = asyncio.get_running_loop()
+            def _sync_get():
+                s = cloudscraper.create_scraper()
+                r = s.get(url, timeout=timeout)
+                if r.status_code == 200:
+                    return r.text
+                return ""
+            return await loop.run_in_executor(None, _sync_get)
+        except Exception as e:
+            LOG.debug("cloudscraper fetch failed for %s: %s", url, e)
+            return ""
+
     async def _aiohttp_fetch(self, url: str, timeout: int = 20) -> str:
         headers = {"User-Agent": "Mozilla/5.0 (compatible; aiohttp)"}
         try:
@@ -379,61 +579,79 @@ class SharedPlaywrightManager:
                     if resp.status == 200:
                         return await resp.text()
         except Exception as e:
-            LOG.debug("aiohttp fallback failed for %s: %s", url, e)
+            LOG.debug("aiohttp fetch failed for %s: %s", url, e)
         return ""
 
-    async def get_page(self, url: str = "") -> Optional[Page]:
-        """Create a new page and set anti-detection + resource blocking."""
-        if not self._initialized:
-            await self.initialize()
+    # ---------------------------
+    # Smart fetch: cloudscraper -> aiohttp -> playwright
+    # ---------------------------
+    async def smart_fetch(
+        self,
+        url: str,
+        *,
+        prefer_http: bool = True,
+        allow_playwright: bool = True,
+        http_timeout: int = 12,
+        play_timeout: Optional[int] = None,
+        wait_for_selector: Optional[str] = None,
+        scroll_to_load: bool = False,
+        partial_on_timeout: bool = True,
+        min_http_length: int = 800
+    ) -> str:
+        """
+        Try HTTP methods first (cloudscraper -> aiohttp), falling back to Playwright.fetch_html only if needed.
+        """
+        parsed = urlparse(url)
+        hostname = (parsed.hostname or "").lower()
 
+        # Force Playwright for known JS-heavy domains
+        if not prefer_http or ("myschool.ng" in hostname and allow_playwright):
+            return await self.fetch_html(
+                url,
+                wait_for_selector=wait_for_selector,
+                scroll_to_load=scroll_to_load,
+                timeout=play_timeout,
+                partial_on_timeout=partial_on_timeout
+            )
+
+        # 1) cloudscraper (if installed)
+        if cloudscraper is not None:
+            try:
+                html = await self._cloudscraper_fetch(url, timeout=http_timeout)
+                if html and len(html) >= min_http_length:
+                    LOG.debug("smart_fetch: cloudscraper succeeded for %s (%d bytes)", url, len(html))
+                    return html
+            except Exception as e:
+                LOG.debug("smart_fetch: cloudscraper raised for %s: %s", url, e)
+
+        # 2) aiohttp
         try:
-            page = await self.context.new_page()
-
-            # anti-detection
-            await page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
-                window.chrome = window.chrome || { runtime: {} };
-                try { Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 }); } catch(e){}
-            """)
-
-            async def _abort(route):
-                try:
-                    await route.abort()
-                except Exception:
-                    try:
-                        await route.continue_()
-                    except Exception:
-                        pass
-
-            patterns = [
-                "**/*.{png,jpg,jpeg,gif,webp,svg,ico}",
-                "**/*.css",
-                "**/*.woff",
-                "**/*.woff2",
-                "**/*.ttf",
-                "**/*.otf",
-                "**/*analytics*",
-                "**/*doubleclick*",
-                "**/*google-analytics*",
-                "**/*.mp4",
-                "**/*.webm"
-            ]
-            for p in patterns:
-                try:
-                    await page.route(p, _abort)
-                except Exception:
-                    LOG.debug("route setup failed for %s", p)
-
-            return page
+            html = await self._aiohttp_fetch(url, timeout=http_timeout)
+            if html and len(html) >= min_http_length:
+                LOG.debug("smart_fetch: aiohttp succeeded for %s (%d bytes)", url, len(html))
+                return html
         except Exception as e:
-            LOG.error("Failed to create page: %s", e)
-            return None
+            LOG.debug("smart_fetch: aiohttp raised for %s: %s", url, e)
+
+        # 3) Small HTTP body might still be useful; optionally return it (commented out)
+        # if html:
+        #     return html
+
+        # 4) fallback to Playwright if allowed
+        if allow_playwright:
+            LOG.debug("smart_fetch: falling back to Playwright for %s", url)
+            return await self.fetch_html(
+                url,
+                wait_for_selector=wait_for_selector,
+                scroll_to_load=scroll_to_load,
+                timeout=play_timeout,
+                partial_on_timeout=partial_on_timeout
+            )
+
+        return ""
 
     # ---------------------------
-    # Core fetch_html (unchanged logic, partial-on-timeout etc.)
+    # Core Playwright fetching (uses page pool)
     # ---------------------------
     async def fetch_html(
         self,
@@ -447,10 +665,9 @@ class SharedPlaywrightManager:
         partial_wait_ms: int = 1200
     ) -> str:
         """
-        Fetch HTML with partial-on-timeout behaviour.
-        Returns HTML string or empty string on failure.
+        Use Playwright to fetch HTML. Uses page pool and attempts to return partial content on timeouts.
         """
-        page = None
+        page: Optional[Page] = None
         main_document_body = None
 
         def _response_matches_url(response, target_url):
@@ -465,14 +682,16 @@ class SharedPlaywrightManager:
             if not self._initialized:
                 await self.initialize()
 
-            page = await self.get_page(url)
+            # Acquire page from pool (wait if necessary)
+            page = await self.get_page(url, wait_for_slot=True)
             if not page:
+                LOG.error("Could not acquire Playwright page for %s", url)
                 return ""
 
+            # capture main document response early
             async def _on_response(response):
                 nonlocal main_document_body
                 try:
-                    # prefer document or exact url match
                     if response.request.resource_type == "document" or _response_matches_url(response, url):
                         if main_document_body is None:
                             try:
@@ -495,21 +714,21 @@ class SharedPlaywrightManager:
             except PlaywrightTimeoutError as nav_error:
                 LOG.warning("Navigation timeout for %s: %s", url, nav_error)
 
-                # 1) Use captured document body if we have it
+                # 1) Use captured document body if present
                 if main_document_body:
-                    LOG.debug("Using captured document response body for %s", url)
+                    LOG.debug("Using captured main document body for %s", url)
                     return main_document_body
 
                 # 2) short wait for scripts
                 await page.wait_for_timeout(partial_wait_ms)
 
-                # 3) readyState
+                # 3) readyState check
                 try:
                     ready = await page.evaluate("() => document.readyState")
                 except Exception:
                     ready = None
 
-                # 4) partial content
+                # 4) partial HTML
                 try:
                     partial_html = await page.content()
                 except Exception:
@@ -520,7 +739,7 @@ class SharedPlaywrightManager:
                         LOG.debug("Returning partial HTML for %s (bytes=%d, ready=%s)", url, len(partial_html), ready)
                         return partial_html
 
-                    # 5) lighter fallback navigation
+                    # 5) try lighter fallback navigation
                     try:
                         await page.goto(url, wait_until="load", timeout=15000)
                         html_after = await page.content()
@@ -536,15 +755,15 @@ class SharedPlaywrightManager:
                     LOG.debug("Returning aiohttp fallback HTML for %s", url)
                     return fallback_html
 
-                # last-resort: small partial if present
+                # 7) last resort: small partial
                 if partial_html:
-                    LOG.debug("Returning small partial HTML for %s as last resort", url)
+                    LOG.debug("Returning small partial HTML as last resort for %s", url)
                     return partial_html
 
-                LOG.debug("No usable content after timeout for %s", url)
+                LOG.debug("No usable content after goto timeout for %s", url)
                 return ""
 
-            # If goto succeeded:
+            # If goto succeeded, optionally aggressively scroll for lazy-loaded content
             await page.wait_for_timeout(500)
 
             if scroll_to_load or is_myschool:
@@ -564,8 +783,15 @@ class SharedPlaywrightManager:
                 except Exception:
                     LOG.debug("Selector '%s' not found within 10s for %s", wait_for_selector, url)
 
+            # Stop further JS activity to limit memory growth before grabbing content
+            try:
+                await page.evaluate("() => { try { window.stop(); } catch(e) {} }")
+            except Exception:
+                pass
+
             html = await page.content()
 
+            # prefer server response if it was captured and bigger than rendered html
             if main_document_body and len(main_document_body) > len(html):
                 LOG.debug("Using captured document response body over page.content() for %s", url)
                 return main_document_body
@@ -580,19 +806,24 @@ class SharedPlaywrightManager:
                 return fallback
             return ""
         finally:
-            # remove listener and close page
+            # cleanup: remove listener then return page to pool
             try:
                 page.off("response", _on_response)
             except Exception:
                 pass
             if page:
                 try:
-                    await page.close()
+                    await self.release_page(page)
                 except Exception:
-                    pass
+                    # if release fails, ensure page closed and counters fixed
+                    try:
+                        await page.close()
+                    except Exception:
+                        pass
+                    self._open_pages = max(0, self._open_pages - 1)
 
     # ---------------------------
-    # Semaphore wrapper + retry
+    # Semaphore wrapper + retries (calls smart_fetch by default)
     # ---------------------------
     async def fetch_with_semaphore(
         self,
@@ -600,13 +831,13 @@ class SharedPlaywrightManager:
         *,
         retries: int = 2,
         backoff_factor: float = 0.5,
+        use_http_first: bool = True,
+        allow_playwright: bool = True,
         **fetch_kwargs
     ) -> str:
         """
-        Acquire semaphore and run fetch with simple retry/backoff.
-        Returns HTML string (or empty string on persistent failure).
+        Acquire semaphore and run smart_fetch with retries/backoff. Returns HTML string or empty string.
         """
-        # ensure initialized
         if not self._initialized:
             await self.initialize()
 
@@ -616,11 +847,14 @@ class SharedPlaywrightManager:
             while attempt <= retries:
                 try:
                     attempt += 1
-                    html = await self.fetch_html(url, **fetch_kwargs)
-                    # consider success if non-empty; you can tighten this condition
+                    html = await self.smart_fetch(
+                        url,
+                        prefer_http=use_http_first,
+                        allow_playwright=allow_playwright,
+                        **fetch_kwargs
+                    )
                     if html:
                         return html
-                    # if empty, raise to trigger retry/backoff
                     raise RuntimeError("Empty HTML returned")
                 except Exception as exc:
                     last_exc = exc
@@ -630,7 +864,6 @@ class SharedPlaywrightManager:
                     sleep_for = backoff_factor * (2 ** (attempt - 1))
                     LOG.debug("Attempt %d failed for %s (%s). Backing off %.2fs and retrying.", attempt, url, exc, sleep_for)
                     await asyncio.sleep(sleep_for)
-            # all attempts failed
             LOG.warning("All attempts failed for %s: %s", url, last_exc)
             return ""
 
@@ -640,31 +873,115 @@ class SharedPlaywrightManager:
         *,
         retries: int = 2,
         backoff_factor: float = 0.5,
+        use_http_first: bool = True,
+        allow_playwright: bool = True,
         fetch_kwargs: Optional[dict] = None,
     ) -> List[Tuple[str, str]]:
         """
-        Run concurrent fetches for a list of URLs respecting the semaphore.
-        Returns list of (url, html) tuples in the same order as provided.
+        Run concurrent fetches for a list of URLs with semaphore protection.
+        Returns list of (url, html) in the same order.
         """
         if fetch_kwargs is None:
             fetch_kwargs = {}
 
-        # wrap each url into a coroutine
         tasks = []
         for u in urls:
-            coro = self.fetch_with_semaphore(u, retries=retries, backoff_factor=backoff_factor, **fetch_kwargs)
+            coro = self.fetch_with_semaphore(
+                u,
+                retries=retries,
+                backoff_factor=backoff_factor,
+                use_http_first=use_http_first,
+                allow_playwright=allow_playwright,
+                **fetch_kwargs
+            )
             tasks.append(asyncio.create_task(coro))
 
-        # gather preserving order
         results = await asyncio.gather(*tasks, return_exceptions=False)
         return list(zip(list(urls), results))
 
+    # ---------------------------
+    # Browser recycle (synchronous / awaited)
+    # ---------------------------
+    async def _recycle_browser(self):
+        """
+        Synchronously recycle browser/context to reclaim memory.
+        This closes the context and browser and recreates them (keeping playwright running).
+        """
+        async with self._lock:
+            if not getattr(self, "_initialized", False):
+                return
+
+            LOG.warning("♻️ Recycling Playwright browser/context to reclaim memory...")
+
+            # Close and drop pooled pages
+            try:
+                while self._page_pool:
+                    p = self._page_pool.popleft()
+                    try:
+                        await p.close()
+                    except Exception:
+                        pass
+                # adjust open pages counter
+                self._open_pages = 0
+            except Exception as e:
+                LOG.debug("Error closing pooled pages during recycle: %s", e)
+
+            # Close context & browser
+            try:
+                if getattr(self, "context", None):
+                    await self.context.close()
+            except Exception as e:
+                LOG.debug("Error closing context: %s", e)
+
+            try:
+                if getattr(self, "browser", None):
+                    await self.browser.close()
+            except Exception as e:
+                LOG.debug("Error closing browser: %s", e)
+
+            # Recreate browser & context
+            try:
+                self.browser = await self.playwright.chromium.launch(
+                    headless=self._cfg["headless"],
+                    args=self._cfg["args"],
+                    timeout=60000
+                )
+                ua = random.choice(self._cfg["user_agent_list"]) if self._cfg["user_agent_list"] else None
+                self.context = await self.browser.new_context(
+                    user_agent=ua,
+                    viewport=self._cfg["viewport"],
+                    locale=self._cfg["locale"],
+                    timezone_id=self._cfg["timezone_id"],
+                    java_script_enabled=True,
+                    bypass_csp=True
+                )
+                self.context.set_default_timeout(self._cfg["default_timeout"])
+                self.context.set_default_navigation_timeout(self._cfg["default_timeout"])
+                # Reset counters
+                self._pages_created = 0
+                LOG.warning("✅ Browser recycled successfully")
+            except Exception as e:
+                LOG.error("Failed to recreate browser/context during recycle: %s", e)
+                # If recreate fails, mark uninitialized
+                self._initialized = False
+                raise
+
+    # ---------------------------
+    # Cleanup everything
+    # ---------------------------
     async def cleanup(self):
-        """Close context/browser/playwright."""
+        """Close context/browser/playwright and clear pool."""
         async with self._lock:
             if not getattr(self, "_initialized", False):
                 return
             try:
+                # close pool pages
+                while self._page_pool:
+                    p = self._page_pool.popleft()
+                    try:
+                        await p.close()
+                    except Exception:
+                        pass
                 if getattr(self, "context", None):
                     await self.context.close()
                 if getattr(self, "browser", None):
@@ -2984,35 +3301,49 @@ async def scrape_school_news(
     urls: Union[List[str], Dict[str, Dict[str, Any]]],
     fetch_full_content: bool = False,
     max_articles: int = 5,
-    # new tunables (optional)
+    # runtime tunables
     semaphore_retries: int = 2,
     semaphore_backoff: float = 0.5,
     partial_on_timeout: bool = True,
     max_concurrency: Optional[int] = None
 ) -> List[Dict[str, Any]]:
     """
-    Unified function to scrape school news (updated to use shared_playwright semaphore-backed fetchers).
-    See docstring in your original function for args description.
+    Unified scraper (domain-aware fetch policy).
+    - Punch / NUC: HTTP-first (no Playwright for listings/article pages unless fallback required)
+    - MySchool: Playwright-first (JS heavy)
     """
     LOG.info(f"\n{'='*70}")
-    LOG.info("📰 UNIFIED SCHOOL NEWS SCRAPER")
+    LOG.info("📰 UNIFIED SCHOOL NEWS SCRAPER (Domain-aware HTTP-first policy)")
     LOG.info(f"{'='*70}")
 
     if not urls:
         LOG.warning("No URLs or site configs provided")
         return []
 
-    # Ensure shared_playwright initialized (optionally update concurrency)
+    # Domain policy (edit to add more domains)
+    DOMAIN_POLICY = {
+        "punchng.com": {"use_http_first": True, "allow_playwright": False},
+        "nuc.edu.ng": {"use_http_first": True, "allow_playwright": False},
+        "myschool.ng": {"use_http_first": False, "allow_playwright": True},
+    }
+
+    # Initialize shared_playwright (optionally override concurrency)
     if not shared_playwright._initialized:
         init_kwargs = {}
         if max_concurrency:
-            init_kwargs['max_concurrency'] = max_concurrency
+            init_kwargs["max_concurrency"] = max_concurrency
         LOG.info("Initializing shared Playwright context...")
         await shared_playwright.initialize(**init_kwargs)
 
-    all_articles = []
+    all_articles: List[Dict[str, Any]] = []
 
-    # Helper to produce fetch kwargs consistently
+    def _domain_policy_for(domain: str):
+        for key, policy in DOMAIN_POLICY.items():
+            if key in domain:
+                return policy
+        # default fallback: prefer HTTP first but allow Playwright fallback
+        return {"use_http_first": True, "allow_playwright": True}
+
     def _fetch_kwargs(wait_for_selector=None, scroll=False):
         return {
             "wait_for_selector": wait_for_selector,
@@ -3026,7 +3357,7 @@ async def scrape_school_news(
     if isinstance(urls, list):
         LOG.info(f"📋 Processing {len(urls)} specific article URLs")
 
-        # Group URLs by domain for batching
+        # Group URLs by domain
         url_groups = {}
         for url in urls:
             domain = get_domain_from_url(url)
@@ -3037,74 +3368,82 @@ async def scrape_school_news(
         for domain, domain_urls in url_groups.items():
             LOG.info(f"\n🌐 Processing domain: {domain} (urls={len(domain_urls)})")
 
-            # Choose site-specific selectors and batch sizes
-            if 'myschool.ng' in domain:
-                selector = '.card, .col-sm-6'
+            # pick sensible selector + batch_size by domain
+            if "myschool.ng" in domain:
+                selector = ".card, .col-sm-6"
                 batch_size = 3
-            elif 'punchng.com' in domain:
-                selector = 'article'
+            elif "punchng.com" in domain:
+                selector = "article"
                 batch_size = 3
-            elif 'nuc.edu.ng' in domain:
-                selector = 'h1.entry-title'
+            elif "nuc.edu.ng" in domain:
+                selector = "h1.entry-title"
                 batch_size = 3
             else:
-                selector = 'h1, h2, article, main'
-                batch_size = 2
+                selector = "h1, h2, article, main"
+                batch_size = 3
 
-            # Process in batches but use run_concurrent which respects the shared semaphore
+            # determine domain fetch policy
+            policy = _domain_policy_for(domain)
+            use_http_first = policy["use_http_first"]
+            allow_playwright = policy["allow_playwright"]
+
+            # Process in batches; run_concurrent will respect the global semaphore and retries
             for i in range(0, len(domain_urls), batch_size):
-                batch = domain_urls[i:i + batch_size]
+                batch = domain_urls[i : i + batch_size]
                 try:
                     results = await shared_playwright.run_concurrent(
                         batch,
                         retries=semaphore_retries,
                         backoff_factor=semaphore_backoff,
+                        use_http_first=use_http_first,
+                        allow_playwright=allow_playwright,
                         fetch_kwargs=_fetch_kwargs(wait_for_selector=selector, scroll=True)
                     )
-                    # run_concurrent returns list of (url, html)
-                    for (u, html) in results:
-                        if not html:
-                            LOG.debug(f"  ✗ Failed to fetch {u}")
-                            continue
-
-                        try:
-                            # Site-specific extraction
-                            if 'myschool.ng' in domain:
-                                data = extract_myschool_content(html, u)
-                                source = 'myschool'
-                            elif 'punchng.com' in domain:
-                                data = extract_clean_content_v5(html, u, 'punch')
-                                source = 'punch'
-                            elif 'nuc.edu.ng' in domain:
-                                data = extract_clean_content_v5(html, u, 'nuc')
-                                source = 'nuc'
-                            else:
-                                # generic extraction attempt
-                                site_type = 'generic'
-                                if 'punch' in domain:
-                                    site_type = 'punch'
-                                elif 'nuc' in domain:
-                                    site_type = 'nuc'
-                                elif 'myschool' in domain:
-                                    site_type = 'myschool'
-                                data = extract_clean_content_v5(html, u, site_type)
-                                source = domain
-
-                            if data and data.get('success'):
-                                all_articles.append({
-                                    'title': data['title'],
-                                    'date': data['date_str'],
-                                    'snippet': data['snippet'],
-                                    'url': u,
-                                    'source': source,
-                                    'pdf': False,
-                                    'date_obj': data.get('date_obj'),
-                                    'has_keywords': data.get('has_keywords', True)
-                                })
-                        except Exception as e:
-                            LOG.debug(f"  Error extracting {u}: {e}")
                 except Exception as e:
-                    LOG.error(f"Batch fetch failed for domain {domain} (batch starting at {i}): {e}")
+                    LOG.error(f"Batch run_concurrent failed for domain {domain}: {e}")
+                    continue
+
+                # results is list of (url, html)
+                for (u, html) in results:
+                    if not html:
+                        LOG.debug(f"  ✗ Failed to fetch {u}")
+                        continue
+
+                    try:
+                        if "myschool.ng" in domain:
+                            data = extract_myschool_content(html, u)
+                            src = "myschool"
+                        elif "punchng.com" in domain:
+                            data = extract_clean_content_v5(html, u, "punch")
+                            src = "punch"
+                        elif "nuc.edu.ng" in domain:
+                            data = extract_clean_content_v5(html, u, "nuc")
+                            src = "nuc"
+                        else:
+                            # generic extraction
+                            site_type = "generic"
+                            if "punch" in domain:
+                                site_type = "punch"
+                            elif "nuc" in domain:
+                                site_type = "nuc"
+                            elif "myschool" in domain:
+                                site_type = "myschool"
+                            data = extract_clean_content_v5(html, u, site_type)
+                            src = domain
+
+                        if data and data.get("success"):
+                            all_articles.append({
+                                "title": data["title"],
+                                "date": data["date_str"],
+                                "snippet": data["snippet"],
+                                "url": u,
+                                "source": src,
+                                "pdf": False,
+                                "date_obj": data.get("date_obj"),
+                                "has_keywords": data.get("has_keywords", True)
+                            })
+                    except Exception as e:
+                        LOG.debug(f"  Error extracting {u}: {e}")
 
     # ============================================================
     # CASE 2: Dict of site configurations for recent articles
@@ -3113,9 +3452,9 @@ async def scrape_school_news(
         LOG.info(f"📋 Processing {len(urls)} site configurations for recent articles")
 
         site_configs = urls or {
-            'nuc': {'task': scrape_nuc_recent, 'max_articles': 8, 'base_url': 'https://www.nuc.edu.ng', 'type': 'nuc'},
-            'myschool': {'task': scrape_myschool_recent, 'max_articles': 10, 'base_url': 'https://myschool.ng', 'type': 'myschool'},
-            'punch': {'task': scrape_punch_recent, 'max_articles': 10, 'base_url': 'https://punchng.com', 'type': 'punch'}
+            "nuc": {"task": scrape_nuc_recent, "max_articles": 8, "base_url": "https://www.nuc.edu.ng", "type": "nuc"},
+            "myschool": {"task": scrape_myschool_recent, "max_articles": 10, "base_url": "https://myschool.ng", "type": "myschool"},
+            "punch": {"task": scrape_punch_recent, "max_articles": 10, "base_url": "https://punchng.com", "type": "punch"}
         }
 
         tasks = []
@@ -3123,84 +3462,94 @@ async def scrape_school_news(
 
         for site_name, config in site_configs.items():
             LOG.info(f"\n🎯 Setting up {site_name}")
-            task_func = config.get('task')
-            site_type = config.get('type', 'generic')
-            base_url = config.get('base_url', '')
-            max_per_site = config.get('max_articles', max_articles)
 
-            # If no explicit task, pick defaults or create generic wrapper
-            if not task_func:
-                if site_type == 'nuc' or 'nuc.edu.ng' in base_url:
-                    task_func = scrape_nuc_recent
-                elif site_type == 'myschool' or 'myschool.ng' in base_url:
-                    task_func = scrape_myschool_recent
-                elif site_type == 'punch' or 'punchng.com' in base_url:
-                    task_func = scrape_punch_recent
-                else:
-                    # create generic_recent_scraper closure that uses shared_playwright.fetch_with_semaphore internally
-                    async def generic_recent_scraper(base_url: str, max_articles: int = 10):
-                        LOG.info(f"  🔍 Attempting generic scrape of {base_url}")
-                        candidate_urls = candidate_listing_urls(base_url)
-                        articles = []
-                        for candidate in candidate_urls[:3]:
-                            try:
-                                html = await shared_playwright.fetch_with_semaphore(
-                                    candidate,
+            task_func = config.get("task")
+            site_type = config.get("type", "generic")
+            base_url = config.get("base_url", "")
+            max_per_site = config.get("max_articles", max_articles)
+
+            # determine domain policy
+            domain = get_domain_from_url(base_url) if base_url else site_name
+            policy = _domain_policy_for(domain)
+            use_http_first = policy["use_http_first"]
+            allow_playwright = policy["allow_playwright"]
+
+            # If a built-in task is provided, call it (it should internally use fetch_with_semaphore or similar)
+            if task_func:
+                # assume task_func returns list of article dicts
+                try:
+                    t = asyncio.create_task(task_func(base_url=base_url, max_articles=max_per_site))
+                    tasks.append(t)
+                    site_names.append(site_name)
+                except Exception as e:
+                    LOG.error(f"Failed to schedule task for {site_name}: {e}")
+            else:
+                # build a generic_recent_scraper that uses shared_playwright.fetch_with_semaphore with domain policy
+                async def generic_recent_scraper(base_url: str, max_articles: int = 10, _use_http_first=use_http_first, _allow_playwright=allow_playwright):
+                    LOG.info(f"  🔍 Attempting generic scrape of {base_url}")
+                    candidate_urls = candidate_listing_urls(base_url)
+                    articles = []
+                    for candidate in candidate_urls[:3]:
+                        try:
+                            html = await shared_playwright.fetch_with_semaphore(
+                                candidate,
+                                retries=semaphore_retries,
+                                backoff_factor=semaphore_backoff,
+                                use_http_first=_use_http_first,
+                                allow_playwright=_allow_playwright,
+                                **_fetch_kwargs(wait_for_selector="article, .post, .news-item, h1, h2", scroll=True)
+                            )
+                            if not html:
+                                continue
+                            soup = BeautifulSoup(html, "lxml")
+                            article_links = []
+                            for a in soup.select('a[href*="/"]'):
+                                href = a.get("href", "")
+                                if not href:
+                                    continue
+                                if any(x in href.lower() for x in [".pdf", ".jpg", ".png", ".css", ".js"]):
+                                    continue
+                                full_url = urljoin(base_url, href)
+                                if len(href) > 20 and not any(x in href for x in ["category", "tag", "author", "page=", "?"]):
+                                    article_links.append(full_url)
+                            # Scrape discovered article links
+                            for article_url in article_links[:5]:
+                                article_html = await shared_playwright.fetch_with_semaphore(
+                                    article_url,
                                     retries=semaphore_retries,
                                     backoff_factor=semaphore_backoff,
-                                    **_fetch_kwargs(wait_for_selector='article, .post, .news-item, h1, h2', scroll=True)
+                                    use_http_first=_use_http_first,
+                                    allow_playwright=_allow_playwright,
+                                    **_fetch_kwargs(wait_for_selector="h1, article, main", scroll=False)
                                 )
-                                if not html:
+                                if not article_html:
                                     continue
-                                soup = BeautifulSoup(html, 'lxml')
-                                article_links = []
-                                for a in soup.select('a[href*="/"]'):
-                                    href = a.get('href', '')
-                                    if not href or any(x in href.lower() for x in ['.pdf', '.jpg', '.png', '.css', '.js']):
-                                        continue
-                                    full_url = urljoin(base_url, href)
-                                    if len(href) > 20 and not any(x in href for x in ['category', 'tag', 'author', 'page=', '?']):
-                                        article_links.append(full_url)
-                                # scrape discovered article links
-                                for article_url in article_links[:5]:
-                                    article_html = await shared_playwright.fetch_with_semaphore(
-                                        article_url,
-                                        retries=semaphore_retries,
-                                        backoff_factor=semaphore_backoff,
-                                        **_fetch_kwargs(wait_for_selector='h1, article, main', scroll_to_load=False)
-                                    )
-                                    if not article_html:
-                                        continue
-                                    data = extract_clean_content_v5(article_html, article_url, 'generic')
-                                    if data.get('success'):
-                                        articles.append({
-                                            'title': data['title'],
-                                            'date': data['date_str'],
-                                            'snippet': data['snippet'],
-                                            'url': article_url,
-                                            'source': get_domain_from_url(base_url),
-                                            'pdf': False,
-                                            'date_obj': data.get('date_obj'),
-                                            'has_keywords': data.get('has_keywords', True)
-                                        })
-                                if articles:
-                                    break
-                            except Exception as e:
-                                LOG.debug(f"  Candidate {candidate} failed: {e}")
-                                continue
-                        return articles[:max_articles]
-                    task_func = generic_recent_scraper
+                                data = extract_clean_content_v5(article_html, article_url, "generic")
+                                if data.get("success"):
+                                    articles.append({
+                                        "title": data["title"],
+                                        "date": data["date_str"],
+                                        "snippet": data["snippet"],
+                                        "url": article_url,
+                                        "source": get_domain_from_url(base_url),
+                                        "pdf": False,
+                                        "date_obj": data.get("date_obj"),
+                                        "has_keywords": data.get("has_keywords", True)
+                                    })
+                            if articles:
+                                break
+                        except Exception as e:
+                            LOG.debug(f"  Candidate {candidate} failed: {e}")
+                            continue
+                    return articles[:max_articles]
 
-            # Schedule the site-specific recent scraper
-            try:
-                if task_func in (scrape_nuc_recent, scrape_myschool_recent, scrape_punch_recent):
-                    task = asyncio.create_task(task_func(base_url=base_url, max_articles=max_per_site))
-                else:
-                    task = asyncio.create_task(task_func(base_url=base_url, max_articles=max_per_site))
-                tasks.append(task)
-                site_names.append(site_name)
-            except Exception as e:
-                LOG.error(f"Failed to create task for {site_name}: {e}")
+                # schedule generic task
+                try:
+                    t = asyncio.create_task(generic_recent_scraper(base_url=base_url, max_articles=max_per_site))
+                    tasks.append(t)
+                    site_names.append(site_name)
+                except Exception as e:
+                    LOG.error(f"Failed to schedule generic scraper for {site_name}: {e}")
 
         LOG.info("\n🚀 Starting concurrent scraping of all sites...")
         results = await asyncio.gather(*tasks, return_exceptions=True)
@@ -3217,7 +3566,6 @@ async def scrape_school_news(
                 successful_sites += 1
             else:
                 LOG.info(f"⚠️  {site_name}: No articles found")
-
         LOG.info(f"\n📊 Concurrent scraping complete: {successful_sites}/{len(site_configs)} sites successful")
 
     else:
@@ -3225,18 +3573,19 @@ async def scrape_school_news(
         return []
 
     # ============================================================
-    # POST-PROCESSING: Filtering and formatting (unchanged)
+    # POST-PROCESSING: Filtering and formatting
     # ============================================================
-    all_articles.sort(key=lambda x: x.get('date_obj', datetime.min), reverse=True)
+    # sort and filter by recency (assumes is_recent_date exists)
+    all_articles.sort(key=lambda x: x.get("date_obj", datetime.min), reverse=True)
 
     recent_articles = []
     for article in all_articles:
-        date_obj = article.get('date_obj')
-        has_keywords = article.get('has_keywords', False)
-        snippet = article.get('snippet', '')
+        date_obj = article.get("date_obj")
+        has_keywords = article.get("has_keywords", False)
+        snippet = article.get("snippet", "")
 
         date_ok = date_obj and is_recent_date(date_obj)
-        content_ok = (article.get('title') and snippet and len(snippet) > 30 and has_keywords)
+        content_ok = (article.get("title") and snippet and len(snippet) > 30 and has_keywords)
 
         if date_ok and content_ok:
             recent_articles.append(article)
@@ -3247,19 +3596,19 @@ async def scrape_school_news(
     formatted_articles = []
     for article in recent_articles:
         formatted_articles.append({
-            'title': article.get('title', 'Untitled'),
-            'snippet': article.get('snippet', ''),
-            'date': article.get('date', ''),
-            'link': article.get('url', ''),
-            'source': article.get('source', 'unknown'),
-            'pdf': article.get('pdf', False),
-            'date_obj': article.get('date_obj'),
-            'has_keywords': article.get('has_keywords', True)
+            "title": article.get("title", "Untitled"),
+            "snippet": article.get("snippet", ""),
+            "date": article.get("date", ""),
+            "link": article.get("url", ""),
+            "source": article.get("source", "unknown"),
+            "pdf": article.get("pdf", False),
+            "date_obj": article.get("date_obj"),
+            "has_keywords": article.get("has_keywords", True)
         })
 
     formatted_articles.sort(key=lambda x: (
-        x.get('date_obj') is None,
-        -(x.get('date_obj', datetime.now()).timestamp() if x.get('date_obj') else 0)
+        x.get("date_obj") is None,
+        -(x.get("date_obj", datetime.now()).timestamp() if x.get("date_obj") else 0)
     ))
 
     LOG.info(f"\n📊 FINAL RESULTS")
