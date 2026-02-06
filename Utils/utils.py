@@ -1,7 +1,7 @@
 from telegram.error import TelegramError
 from telegram import Bot
 import os
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Playwright, Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError
 import time
 import logging
 import json
@@ -19,9 +19,10 @@ from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup, Tag
 import cloudscraper
 from requests.exceptions import RequestException
-from typing import Dict, Optional, Any, Tuple, Callable, List, Set, Union
+from typing import Dict, Optional, Any, Tuple, Callable, List, Set, Union,Iterable
 from collections import Counter
 from playwright._impl._errors import TargetClosedError
+import aiohttp
 # Settings / thresholds
 from bot.settings import (
     SUPPORTED_SITES,
@@ -279,161 +280,404 @@ async def get_visible_text_playwright(page) -> str:
 # SHARED PLAYWRIGHT MANAGER (New Class) - WITH IMPORT FIXES
 # ═══════════════════════════════════════════════════════════════════════════
 class SharedPlaywrightManager:
-    """Manages a single shared Playwright browser instance for all scrapers."""
-    
+    """
+    Shared Playwright manager with a global semaphore for concurrency control.
+
+    Key features:
+    - Single shared Playwright browser/context
+    - Global asyncio.Semaphore to limit concurrent fetches
+    - fetch_with_semaphore wrapper with retry/backoff
+    - run_concurrent helper to run many fetches
+    """
+
     _instance = None
     _lock = asyncio.Lock()
-    
+
+    DEFAULTS = {
+        "headless": True,
+        "args": [
+            "--no-sandbox",
+            "--disable-setuid-sandbox",
+            "--disable-dev-shm-usage",
+            "--disable-blink-features=AutomationControlled",
+            "--disable-web-security",
+            "--disable-gpu",
+            "--single-process",
+            "--disable-software-rasterizer",
+        ],
+        "viewport": {"width": 1366, "height": 768},
+        "locale": "en-US",
+        "timezone_id": "Africa/Lagos",
+        "default_timeout": 45000,
+        "myschool_timeout": 90000,
+        "user_agent_list": _USER_AGENTS,
+        "max_concurrency": 6,  # <-- default semaphore size
+    }
+
     def __new__(cls):
         if cls._instance is None:
-            cls._instance = super(SharedPlaywrightManager, cls).__new__(cls)
+            cls._instance = super().__new__(cls)
             cls._instance._initialized = False
         return cls._instance
-    
-    async def initialize(self):
-        """Initialize the shared Playwright instance."""
+
+    async def initialize(self, **kwargs):
+        """Initialize Playwright and the concurrency semaphore (idempotent)."""
         async with self._lock:
-            if not self._initialized:
+            if self._initialized:
+                return
+
+            self._cfg = dict(self.DEFAULTS)
+            self._cfg.update(kwargs)
+
+            self.playwright: Optional[Playwright] = None
+            self.browser: Optional[Browser] = None
+            self.context: Optional[BrowserContext] = None
+            self._sem: asyncio.Semaphore = asyncio.Semaphore(self._cfg["max_concurrency"])
+
+            try:
+                LOG.info("Initializing shared Playwright...")
+                self.playwright = await async_playwright().start()
+                self.browser = await self.playwright.chromium.launch(
+                    headless=self._cfg["headless"],
+                    args=self._cfg["args"],
+                    timeout=60000
+                )
+                ua = random.choice(self._cfg["user_agent_list"]) if self._cfg["user_agent_list"] else None
+                self.context = await self.browser.new_context(
+                    user_agent=ua,
+                    viewport=self._cfg["viewport"],
+                    locale=self._cfg["locale"],
+                    timezone_id=self._cfg["timezone_id"],
+                    java_script_enabled=True,
+                    bypass_csp=True
+                )
+                # default timeouts
+                self.context.set_default_timeout(self._cfg["default_timeout"])
+                self.context.set_default_navigation_timeout(self._cfg["default_timeout"])
+
+                self._initialized = True
+                LOG.info("✅ Shared Playwright manager initialized (max_concurrency=%s)", self._cfg["max_concurrency"])
+            except Exception as e:
+                LOG.error("Failed to initialize Playwright: %s", e)
+                # best-effort teardown
                 try:
-                    self.playwright = await async_playwright().start()
-                    self.browser = await self.playwright.chromium.launch(
-                        headless=True,
-                        args=[
-                            '--no-sandbox',
-                            '--no-zygote',
-                            '--disable-blink-features=AutomationControlled',
-                            '--disable-dev-shm-usage',
-                            '--disable-web-security',
-                            '--disable-setuid-sandbox',
-                            '--single-process',
-                            '--disable-gpu',
-                            '--disable-software-rasterizer',
-                        ],
-                        timeout=60000
-                    )
-                    self.context = await self.browser.new_context(
-                        user_agent=random.choice(_USER_AGENTS),
-                        viewport={'width': 1366, 'height': 768},
-                        locale='en-US',
-                        timezone_id='Africa/Lagos',
-                        java_script_enabled=True,
-                        bypass_csp=True
-                    )
-                    # Default timeouts (can be overridden per call)
-                    self.context.set_default_timeout(45000)
-                    self.context.set_default_navigation_timeout(45000)
-                    self._initialized = True
-                    LOG.info("✅ Shared Playwright manager initialized")
-                except Exception as e:
-                    LOG.error(f"❌ Failed to initialize shared Playwright: {e}")
-                    raise
-    
-    async def get_page(self, url: str = "") -> Optional[Any]:
-        """Get a new page from the shared context."""
+                    if getattr(self, "context", None):
+                        await self.context.close()
+                    if getattr(self, "browser", None):
+                        await self.browser.close()
+                    if getattr(self, "playwright", None):
+                        await self.playwright.stop()
+                except Exception:
+                    pass
+                raise
+
+    async def _aiohttp_fetch(self, url: str, timeout: int = 20) -> str:
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; aiohttp)"}
+        try:
+            async with aiohttp.ClientSession(headers=headers) as session:
+                async with session.get(url, timeout=timeout) as resp:
+                    if resp.status == 200:
+                        return await resp.text()
+        except Exception as e:
+            LOG.debug("aiohttp fallback failed for %s: %s", url, e)
+        return ""
+
+    async def get_page(self, url: str = "") -> Optional[Page]:
+        """Create a new page and set anti-detection + resource blocking."""
         if not self._initialized:
             await self.initialize()
-        
+
         try:
             page = await self.context.new_page()
-            
-            # Anti-detection
+
+            # anti-detection
             await page.add_init_script("""
-                Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
-                Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
-                window.chrome = {runtime: {}};
+                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
+                Object.defineProperty(navigator, 'plugins', { get: () => [1,2,3,4,5] });
+                window.chrome = window.chrome || { runtime: {} };
+                try { Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 }); } catch(e){}
             """)
-            
-            # Block unnecessary resources
-            await page.route("**/*.{gif,webp,svg}", lambda route: route.abort())
-            await page.route("**/*.css", lambda route: route.abort())
-            await page.route("**/*.woff*", lambda route: route.abort())
-            
+
+            async def _abort(route):
+                try:
+                    await route.abort()
+                except Exception:
+                    try:
+                        await route.continue_()
+                    except Exception:
+                        pass
+
+            patterns = [
+                "**/*.{png,jpg,jpeg,gif,webp,svg,ico}",
+                "**/*.css",
+                "**/*.woff",
+                "**/*.woff2",
+                "**/*.ttf",
+                "**/*.otf",
+                "**/*analytics*",
+                "**/*doubleclick*",
+                "**/*google-analytics*",
+                "**/*.mp4",
+                "**/*.webm"
+            ]
+            for p in patterns:
+                try:
+                    await page.route(p, _abort)
+                except Exception:
+                    LOG.debug("route setup failed for %s", p)
+
             return page
         except Exception as e:
-            LOG.error(f"Failed to create page from shared context: {e}")
+            LOG.error("Failed to create page: %s", e)
             return None
-    
+
+    # ---------------------------
+    # Core fetch_html (unchanged logic, partial-on-timeout etc.)
+    # ---------------------------
     async def fetch_html(
         self,
         url: str,
         wait_for_selector: Optional[str] = None,
         scroll_to_load: bool = False,
-        timeout: Optional[int] = None  # Added optional timeout to prevent kwarg errors
+        timeout: Optional[int] = None,
+        force_networkidle_for: Optional[list] = None,
+        partial_on_timeout: bool = True,
+        partial_min_bytes: int = 800,
+        partial_wait_ms: int = 1200
     ) -> str:
-        """Enhanced fetch_html with aggressive scrolling and MySchool-specific handling."""
+        """
+        Fetch HTML with partial-on-timeout behaviour.
+        Returns HTML string or empty string on failure.
+        """
         page = None
+        main_document_body = None
+
+        def _response_matches_url(response, target_url):
+            try:
+                rurl = response.url.rstrip("/")
+                turl = target_url.rstrip("/")
+                return rurl == turl
+            except Exception:
+                return False
+
         try:
+            if not self._initialized:
+                await self.initialize()
+
             page = await self.get_page(url)
             if not page:
                 return ""
-            
-            # Detect MySchool for special handling
-            is_myschool = 'myschool.ng' in url.lower()
-            
-            # Determine wait strategy
-            wait_until = "domcontentloaded"
-            #if not (scroll_to_load):
-                #wait_until = "domcontentloaded"
-                
-            # Use custom timeout if provided, else context default
-            goto_timeout = timeout or 45000
-            
+
+            async def _on_response(response):
+                nonlocal main_document_body
+                try:
+                    # prefer document or exact url match
+                    if response.request.resource_type == "document" or _response_matches_url(response, url):
+                        if main_document_body is None:
+                            try:
+                                main_document_body = await response.text()
+                            except Exception:
+                                main_document_body = None
+                except Exception:
+                    pass
+
+            page.on("response", _on_response)
+
+            parsed = urlparse(url.lower())
+            hostname = parsed.hostname or ""
+            is_myschool = "myschool.ng" in hostname or (force_networkidle_for and any(h in hostname for h in (force_networkidle_for or [])))
+            wait_until = "networkidle" if is_myschool else "domcontentloaded"
+            goto_timeout = timeout or (self._cfg.get("myschool_timeout") if is_myschool else self._cfg.get("default_timeout"))
+
             try:
                 await page.goto(url, wait_until=wait_until, timeout=goto_timeout)
-            except Exception as nav_error:
-                LOG.warning(f"Navigation timeout for {url}: {nav_error}. Falling back to 'load'")
-                await page.goto(url, wait_until="load", timeout=20000)
-            
-            # Aggressive scrolling for lazy loading (especially MySchool)
+            except PlaywrightTimeoutError as nav_error:
+                LOG.warning("Navigation timeout for %s: %s", url, nav_error)
+
+                # 1) Use captured document body if we have it
+                if main_document_body:
+                    LOG.debug("Using captured document response body for %s", url)
+                    return main_document_body
+
+                # 2) short wait for scripts
+                await page.wait_for_timeout(partial_wait_ms)
+
+                # 3) readyState
+                try:
+                    ready = await page.evaluate("() => document.readyState")
+                except Exception:
+                    ready = None
+
+                # 4) partial content
+                try:
+                    partial_html = await page.content()
+                except Exception:
+                    partial_html = ""
+
+                if partial_on_timeout:
+                    if (partial_html and len(partial_html) >= partial_min_bytes) or (ready in ("interactive", "complete")):
+                        LOG.debug("Returning partial HTML for %s (bytes=%d, ready=%s)", url, len(partial_html), ready)
+                        return partial_html
+
+                    # 5) lighter fallback navigation
+                    try:
+                        await page.goto(url, wait_until="load", timeout=15000)
+                        html_after = await page.content()
+                        if html_after and len(html_after) > len(partial_html):
+                            LOG.debug("Returning HTML after 'load' fallback for %s", url)
+                            return html_after
+                    except Exception:
+                        LOG.debug("Short 'load' fallback failed for %s", url)
+
+                # 6) aiohttp fallback
+                fallback_html = await self._aiohttp_fetch(url, timeout=15)
+                if fallback_html:
+                    LOG.debug("Returning aiohttp fallback HTML for %s", url)
+                    return fallback_html
+
+                # last-resort: small partial if present
+                if partial_html:
+                    LOG.debug("Returning small partial HTML for %s as last resort", url)
+                    return partial_html
+
+                LOG.debug("No usable content after timeout for %s", url)
+                return ""
+
+            # If goto succeeded:
+            await page.wait_for_timeout(500)
+
             if scroll_to_load or is_myschool:
-                LOG.debug(f"[Scroll] Aggressive scrolling enabled for {url}")
-                for i in range(5 if is_myschool else 3):  # More scrolls for MySchool
-                    await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                    await page.wait_for_timeout(1500 if is_myschool else 1000)
-                # Final full scroll + settle
-                await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-                await page.wait_for_timeout(2000)
-            
-            # Wait for specific selector if requested
+                loops = 5 if is_myschool else 3
+                per_wait = 1500 if is_myschool else 1000
+                for _ in range(loops):
+                    try:
+                        await page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
+                        await page.wait_for_timeout(per_wait)
+                    except Exception:
+                        break
+                await page.wait_for_timeout(800)
+
             if wait_for_selector:
                 try:
                     await page.wait_for_selector(wait_for_selector, timeout=10000)
                 except Exception:
-                    LOG.debug(f"Selector '{wait_for_selector}' not found within 10s")
-            
-            # Extra settle time
-            await page.wait_for_timeout(1000)
-            
+                    LOG.debug("Selector '%s' not found within 10s for %s", wait_for_selector, url)
+
             html = await page.content()
-            LOG.debug(f"[Fetch] Success: {len(html)} bytes from {url}")
+
+            if main_document_body and len(main_document_body) > len(html):
+                LOG.debug("Using captured document response body over page.content() for %s", url)
+                return main_document_body
+
+            LOG.debug("[Fetch] Success: %d bytes from %s", len(html), url)
             return html
-            
+
         except Exception as e:
-            LOG.error(f"Shared context fetch failed for {url}: {e}")
+            LOG.error("Shared context fetch failed for %s: %s", url, e)
+            fallback = await self._aiohttp_fetch(url, timeout=15)
+            if fallback:
+                return fallback
             return ""
         finally:
+            # remove listener and close page
+            try:
+                page.off("response", _on_response)
+            except Exception:
+                pass
             if page:
                 try:
                     await page.close()
                 except Exception:
                     pass
-    
-    async def cleanup(self):
-        """Clean up shared Playwright resources."""
-        async with self._lock:
-            if self._initialized:
+
+    # ---------------------------
+    # Semaphore wrapper + retry
+    # ---------------------------
+    async def fetch_with_semaphore(
+        self,
+        url: str,
+        *,
+        retries: int = 2,
+        backoff_factor: float = 0.5,
+        **fetch_kwargs
+    ) -> str:
+        """
+        Acquire semaphore and run fetch with simple retry/backoff.
+        Returns HTML string (or empty string on persistent failure).
+        """
+        # ensure initialized
+        if not self._initialized:
+            await self.initialize()
+
+        attempt = 0
+        last_exc = None
+        async with self._sem:
+            while attempt <= retries:
                 try:
-                    if self.context:
-                        await self.context.close()
-                    if self.browser:
-                        await self.browser.close()
-                    if self.playwright:
-                        await self.playwright.stop()
-                    self._initialized = False
-                    LOG.info("✅ Shared Playwright manager cleaned up")
-                except Exception as e:
-                    LOG.error(f"Error cleaning up Playwright: {e}")
-# Global shared instance
+                    attempt += 1
+                    html = await self.fetch_html(url, **fetch_kwargs)
+                    # consider success if non-empty; you can tighten this condition
+                    if html:
+                        return html
+                    # if empty, raise to trigger retry/backoff
+                    raise RuntimeError("Empty HTML returned")
+                except Exception as exc:
+                    last_exc = exc
+                    if attempt > retries:
+                        LOG.debug("Final failure for %s after %d attempts: %s", url, attempt, exc)
+                        break
+                    sleep_for = backoff_factor * (2 ** (attempt - 1))
+                    LOG.debug("Attempt %d failed for %s (%s). Backing off %.2fs and retrying.", attempt, url, exc, sleep_for)
+                    await asyncio.sleep(sleep_for)
+            # all attempts failed
+            LOG.warning("All attempts failed for %s: %s", url, last_exc)
+            return ""
+
+    async def run_concurrent(
+        self,
+        urls: Iterable[str],
+        *,
+        retries: int = 2,
+        backoff_factor: float = 0.5,
+        fetch_kwargs: Optional[dict] = None,
+    ) -> List[Tuple[str, str]]:
+        """
+        Run concurrent fetches for a list of URLs respecting the semaphore.
+        Returns list of (url, html) tuples in the same order as provided.
+        """
+        if fetch_kwargs is None:
+            fetch_kwargs = {}
+
+        # wrap each url into a coroutine
+        tasks = []
+        for u in urls:
+            coro = self.fetch_with_semaphore(u, retries=retries, backoff_factor=backoff_factor, **fetch_kwargs)
+            tasks.append(asyncio.create_task(coro))
+
+        # gather preserving order
+        results = await asyncio.gather(*tasks, return_exceptions=False)
+        return list(zip(list(urls), results))
+
+    async def cleanup(self):
+        """Close context/browser/playwright."""
+        async with self._lock:
+            if not getattr(self, "_initialized", False):
+                return
+            try:
+                if getattr(self, "context", None):
+                    await self.context.close()
+                if getattr(self, "browser", None):
+                    await self.browser.close()
+                if getattr(self, "playwright", None):
+                    await self.playwright.stop()
+                self._initialized = False
+                LOG.info("✅ Shared Playwright manager cleaned up")
+            except Exception as e:
+                LOG.error("Error cleaning up Playwright: %s", e)
+
+
+# global shared instance
 shared_playwright = SharedPlaywrightManager()
 
 async def fetch_with_playwright_aggressive(
