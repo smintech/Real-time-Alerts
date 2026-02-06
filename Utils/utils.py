@@ -2161,7 +2161,7 @@ async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> Li
     try:
         listing_html = await shared_playwright.fetch_html(
             f"{base_url}/topics/education/",
-            wait_for_selector=None
+            wait_for_selector=None,
             scroll_to_load=False
         )
         
