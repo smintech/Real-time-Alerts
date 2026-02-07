@@ -2578,7 +2578,7 @@ async def scrape_lpg_prices() -> Dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════════════════
 
 async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news") -> List[str]:
-    """Get recent article URLs from MySchool listing pages - ENHANCED LOGGING"""
+    """Get recent article URLs from MySchool - FORCE PLAYWRIGHT (JavaScript required)"""
     LOG.info(f"[MySchool Listing] 🔍 Starting extraction from {base_url}")
     
     root = base_url.rstrip("/").rsplit("/", 1)[0] if "/" in base_url else base_url
@@ -2594,12 +2594,13 @@ async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news
         LOG.info(f"[MySchool Listing] 🌐 [{idx}/{len(urls_to_try)}] Fetching: {listing_url}")
         
         try:
-            html = await shared_playwright.smart_fetch(
+            # ✅ FIX: Use fetch_html directly to FORCE Playwright (no HTTP fallback)
+            html = await shared_playwright.fetch_html(
                 listing_url,
-                prefer_http=True,
-                allow_playwright=True,
                 wait_for_selector='.card, .col-sm-6, .col-lg-4, .blog-header-title',
                 scroll_to_load=True,
+                timeout=90000,  # MySchool is slow
+                partial_on_timeout=False  # ✅ Don't accept partial HTML
             )
             
             LOG.info(f"[MySchool Listing] 📄 HTML length: {len(html) if html else 0} bytes")
@@ -2644,6 +2645,14 @@ async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news
                 return final_urls
             else:
                 LOG.warning(f"[MySchool Listing] ⚠️ No article URLs found in {listing_url}")
+                # ✅ ADD: Save HTML to debug
+                debug_path = f"/tmp/myschool_debug_{idx}.html"
+                try:
+                    with open(debug_path, 'w', encoding='utf-8') as f:
+                        f.write(html)
+                    LOG.warning(f"[MySchool Listing] 💾 Saved debug HTML to {debug_path}")
+                except:
+                    pass
                 
         except Exception as e:
             LOG.exception(f"[MySchool Listing] ❌ Exception while processing {listing_url}: {e}")
@@ -2653,7 +2662,6 @@ async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news
 
     LOG.error("[MySchool Listing] ❌ All listing URLs failed - returning empty list")
     return []
-
 
 async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> List[str]:
     """Get recent Punch education articles - ENHANCED LOGGING"""
