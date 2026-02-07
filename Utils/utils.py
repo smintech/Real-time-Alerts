@@ -2599,7 +2599,7 @@ async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news
                 listing_url,
                 wait_for_selector='a[href*="/news/',
                 scroll_to_load=True,
-                timeout=120000,  # MySchool is slow
+                timeout=100000,  # MySchool is slow
                 partial_on_timeout=False,
                 partial_min_bytes=5000,
                 partial_wait_ms=2000,
