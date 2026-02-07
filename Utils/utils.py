@@ -2583,8 +2583,8 @@ async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news
     
     root = base_url.rstrip("/").rsplit("/", 1)[0] if "/" in base_url else base_url
     urls_to_try = [
-        f"{base_url.rstrip('/')}/latest",
-        #base_url.rstrip("/"),
+        #f"{base_url.rstrip('/')}/latest",
+        base_url.rstrip("/"),
         #root,
     ]
     
