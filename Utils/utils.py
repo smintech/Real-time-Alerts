@@ -3648,13 +3648,13 @@ async def scrape_school_news(
         if test_myschool_urls:
             LOG.info(f"🧪 Sample: {test_myschool_urls[0]}")
         
-        LOG.info("🧪 Testing Punch listing extraction...")
-        test_punch_urls = await get_punch_recent_articles()
-        LOG.info(f"🧪 Punch RESULT: {len(test_punch_urls)} URLs")
+        #LOG.info("🧪 Testing Punch listing extraction...")
+        #test_punch_urls = await get_punch_recent_articles()
+        #LOG.info(f"🧪 Punch RESULT: {len(test_punch_urls)} URLs")
         
-        LOG.info("🧪 Testing NUC listing extraction...")
-        test_nuc_urls = await get_nuc_recent_articles()
-        LOG.info(f"🧪 NUC RESULT: {len(test_nuc_urls)} URLs")
+        #LOG.info("🧪 Testing NUC listing extraction...")
+        #test_nuc_urls = await get_nuc_recent_articles()
+        #LOG.info(f"🧪 NUC RESULT: {len(test_nuc_urls)} URLs")
         
         LOG.info("🧪 DIAGNOSTIC COMPLETE ✅")
         
