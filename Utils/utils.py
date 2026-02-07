@@ -2600,7 +2600,9 @@ async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news
                 wait_for_selector='.card, .col-sm-6, .col-lg-4, .blog-header-title',
                 scroll_to_load=True,
                 timeout=90000,  # MySchool is slow
-                partial_on_timeout=False  # ✅ Don't accept partial HTML
+                partial_on_timeout=True,
+                partial_min_bytes=5000,
+                partial_wait_ms=2000,
             )
             
             LOG.info(f"[MySchool Listing] 📄 HTML length: {len(html) if html else 0} bytes")
@@ -3706,30 +3708,52 @@ async def scrape_school_news(
     if isinstance(urls, dict):
         LOG.info(f"📋 Processing {len(urls)} site configurations for recent articles")
 
-        site_configs = urls or {
-            "nuc": {"task": scrape_nuc_recent, "max_articles": 8, "base_url": "https://www.nuc.edu.ng", "type": "nuc"},
-            "myschool": {"task": scrape_myschool_recent, "max_articles": 10, "base_url": "https://myschool.ng", "type": "myschool"},
-            "punch": {"task": scrape_punch_recent, "max_articles": 10, "base_url": "https://punchng.com", "type": "punch"}
+        # Map friendly names to scraper functions
+        SITE_MAPPING = {
+            "nuc": {"task": scrape_nuc_recent, "max_articles": 8, "type": "nuc"},
+            "myschool": {"task": scrape_myschool_recent, "max_articles": 10, "type": "myschool"},
+            "punch": {"task": scrape_punch_recent, "max_articles": 10, "type": "punch"},
+            # Handle the bot's friendly names too
+            "nuc (universities)": {"task": scrape_nuc_recent, "max_articles": 8, "type": "nuc"},
+            "myschool.ng": {"task": scrape_myschool_recent, "max_articles": 10, "type": "myschool"},
+            "punch education": {"task": scrape_punch_recent, "max_articles": 10, "type": "punch"},
         }
 
         tasks = []
         site_names = []
 
-        for site_name, config in site_configs.items():
-            LOG.info(f"\n🎯 Setting up {site_name}")
+        for site_name, config in urls.items():
+            site_key = site_name.lower().strip()
+            mapped_config = SITE_MAPPING.get(site_key)
+            
+            if not mapped_config:
+                LOG.warning(f"⚠️ Unknown site '{site_name}', skipping")
+                continue
 
-            task_func = config.get("task")
-            base_url = config.get("base_url", "")
-            max_per_site = config.get("max_articles", max_articles)
+            # Extract base_url from the list format
+            base_url = ""
+            if isinstance(config, list) and len(config) > 0:
+                base_url = config[0]
+            elif isinstance(config, dict):
+                base_url = config.get("base_url", "")
+            elif isinstance(config, str):
+                base_url = config
 
-            if task_func:
-                try:
-                    LOG.info(f"  Creating task for {site_name} (base_url={base_url}, max={max_per_site})")
-                    t = asyncio.create_task(task_func(base_url=base_url, max_articles=max_per_site))
-                    tasks.append(t)
-                    site_names.append(site_name)
-                except Exception as e:
-                    LOG.exception(f"  ❌ Failed to schedule task for {site_name}: {e}")
+            if not base_url:
+                LOG.warning(f"⚠️ No base_url for '{site_name}', skipping")
+                continue
+
+            task_func = mapped_config["task"]
+            max_per_site = mapped_config.get("max_articles", max_articles)
+
+            try:
+                LOG.info(f"\n🎯 Setting up {site_name} (mapped to {mapped_config['type']})")
+                LOG.info(f"  Creating task for {site_name} (base_url={base_url}, max={max_per_site})")
+                t = asyncio.create_task(task_func(base_url=base_url, max_articles=max_per_site))
+                tasks.append(t)
+                site_names.append(site_name)
+            except Exception as e:
+                LOG.exception(f"  ❌ Failed to schedule task for {site_name}: {e}")
 
         LOG.info(f"\n🚀 Starting concurrent scraping of all sites... ({len(tasks)} tasks)")
         
