@@ -3785,7 +3785,7 @@ async def scrape_school_news(
             else:
                 LOG.warning(f"⚠️  {site_name}: No articles found (returned empty list)")
                 
-        LOG.info(f"\n📊 Concurrent scraping complete: {successful_sites}/{len(site_configs)} sites successful")
+        LOG.info(f"\n📊 Concurrent scraping complete: {successful_sites}/{len(SITE_MAPPING)} sites successful")
 
     # ═══════════════════════════════════════════════════════════════════════
     # CASE 1: List of specific URLs (less common)
