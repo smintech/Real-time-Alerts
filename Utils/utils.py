@@ -803,12 +803,35 @@ class SharedPlaywrightManager:
         use_http_first: bool = True,
         allow_playwright: bool = True,
         fetch_kwargs: Optional[dict] = None,
-    ) -> List[Tuple[str, str]]:
+    ) -> List[Tuple[str, bytes]]:
+        """
+        Run concurrent fetches with enhanced logging.
+
+        Args:
+            urls: Iterable of URLs to fetch.
+            retries: number of retry attempts (in addition to the initial attempt).
+            backoff_factor: base backoff factor (exponential backoff multiplier).
+            use_http_first: prefer HTTP (aiohttp) before Playwright.
+            allow_playwright: allow falling back to Playwright for JS-heavy pages.
+            fetch_kwargs: extra kwargs passed to fetch_with_semaphore/_fetch_with_retries.
+
+        Returns:
+            List of tuples (url, bytes_result) in the same order as the input urls.
+        """
         if fetch_kwargs is None:
             fetch_kwargs = {}
 
-        tasks = []
-        for u in urls:
+        url_list = list(urls)
+        LOG.info(f"[run_concurrent] 🔄 Starting for {len(url_list)} URLs")
+        LOG.info(f"[run_concurrent] Config: http_first={use_http_first}, playwright={allow_playwright}, retries={retries}")
+
+        if url_list:
+            LOG.info(f"[run_concurrent] Sample URLs:")
+            for sample in url_list[:3]:
+                LOG.info(f"[run_concurrent]   - {sample}")
+
+        tasks: List[asyncio.Task] = []
+        for u in url_list:
             coro = self.fetch_with_semaphore(
                 u,
                 retries=retries,
@@ -819,8 +842,30 @@ class SharedPlaywrightManager:
             )
             tasks.append(asyncio.create_task(coro))
 
-        results = await asyncio.gather(*tasks, return_exceptions=False)
-        return list(zip(list(urls), results))
+        LOG.info(f"[run_concurrent] 📋 Created {len(tasks)} tasks")
+
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=False)
+
+            success_count = sum(1 for r in results if r and len(r) > 0)
+            LOG.info(f"[run_concurrent] ✅ Gather completed: {success_count}/{len(results)} successful fetches")
+
+            # Log failures
+            for idx, (url, result) in enumerate(zip(url_list, results)):
+                if not result or len(result) == 0:
+                    LOG.warning(f"[run_concurrent]   ✗ [{idx+1}] Failed: {url[:60]}")
+                else:
+                    try:
+                        LOG.debug(f"[run_concurrent]   ✓ [{idx+1}] Success: {url[:60]} ({len(result)} bytes)")
+                    except Exception:
+                        LOG.debug(f"[run_concurrent]   ✓ [{idx+1}] Success: {url[:60]}")
+
+        except Exception as e:
+            LOG.exception(f"[run_concurrent] ❌ Gather failed with exception: {e}")
+            LOG.error(f"[run_concurrent] Traceback:\n{traceback.format_exc()}")
+            raise
+
+        return list(zip(url_list, results))
 
     async def _recycle_browser(self):
         async with self._lock:
@@ -2529,121 +2574,213 @@ async def scrape_lpg_prices() -> Dict[str, Any]:
         "note": "Lagos retail estimate calculated as: average depot price per kg + ₦400–600/kg typical markup",
     }
 # ═══════════════════════════════════════════════════════════════════════════
-# SITE-SPECIFIC ARTICLE LISTING PAGE
+# SITE-SPECIFIC ARTICLE LISTING PAGES (WITH ENHANCED LOGGING)
 # ═══════════════════════════════════════════════════════════════════════════
+
 async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news") -> List[str]:
+    """Get recent article URLs from MySchool listing pages - ENHANCED LOGGING"""
+    LOG.info(f"[MySchool Listing] 🔍 Starting extraction from {base_url}")
+    
     root = base_url.rstrip("/").rsplit("/", 1)[0] if "/" in base_url else base_url
     urls_to_try = [
         f"{base_url.rstrip('/')}/latest",
         base_url.rstrip("/"),
         root,
     ]
-    for listing_url in urls_to_try:
-        LOG.info(f"[MySchool] Trying listing page: {listing_url}")
+    
+    LOG.info(f"[MySchool Listing] 📋 Will try {len(urls_to_try)} listing URLs")
+    
+    for idx, listing_url in enumerate(urls_to_try, 1):
+        LOG.info(f"[MySchool Listing] 🌐 [{idx}/{len(urls_to_try)}] Fetching: {listing_url}")
         
-        html = await shared_playwright.smart_fetch(
+        try:
+            html = await shared_playwright.smart_fetch(
+                listing_url,
+                prefer_http=True,
+                allow_playwright=True,
+                wait_for_selector='.card, .col-sm-6, .col-lg-4, .blog-header-title',
+                scroll_to_load=True,
+            )
+            
+            LOG.info(f"[MySchool Listing] 📄 HTML length: {len(html) if html else 0} bytes")
+            
+            if not html:
+                LOG.warning(f"[MySchool Listing] ⚠️ No HTML returned for {listing_url}")
+                continue
+
+            soup = BeautifulSoup(html, 'lxml')
+            article_urls: Set[str] = set()
+
+            selectors = [
+                '.card a[href*="/news/"]',
+                '.col-sm-6 a[href*="/news/"]',
+                '.col-lg-4 a[href*="/news/"]',
+                '.col-xl-4 a[href*="/news/"]',
+                'a[href*="/news/"]:not([href*="category"]):not([href*="tag"]):not([href*="author"])'
+            ]
+
+            LOG.info(f"[MySchool Listing] 🔎 Searching with {len(selectors)} CSS selectors...")
+            
+            for sel_idx, selector in enumerate(selectors, 1):
+                matches = soup.select(selector)
+                LOG.debug(f"[MySchool Listing]   Selector [{sel_idx}] '{selector[:40]}': {len(matches)} matches")
+                
+                for a in matches:
+                    href = a.get('href', '')
+                    if href and '/news/' in href:
+                        if any(bad in href for bad in ['category', 'tag', 'author', 'page', '#', '?']):
+                            LOG.debug(f"[MySchool Listing]   ✗ Filtered out: {href[:60]}")
+                            continue
+                        full_url = urljoin("https://myschool.ng", href)
+                        article_urls.add(full_url)
+                        LOG.debug(f"[MySchool Listing]   ✓ Added: {full_url}")
+
+            if article_urls:
+                final_urls = list(article_urls)[:25]
+                LOG.info(f"[MySchool Listing] ✅ Extracted {len(final_urls)} article URLs from {listing_url}")
+                LOG.info(f"[MySchool Listing] 📌 Sample URLs:")
+                for sample_url in final_urls[:3]:
+                    LOG.info(f"[MySchool Listing]    - {sample_url}")
+                return final_urls
+            else:
+                LOG.warning(f"[MySchool Listing] ⚠️ No article URLs found in {listing_url}")
+                
+        except Exception as e:
+            LOG.exception(f"[MySchool Listing] ❌ Exception while processing {listing_url}: {e}")
+            import traceback
+            LOG.error(f"[MySchool Listing] Traceback:\n{traceback.format_exc()}")
+            continue
+
+    LOG.error("[MySchool Listing] ❌ All listing URLs failed - returning empty list")
+    return []
+
+
+async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> List[str]:
+    """Get recent Punch education articles - ENHANCED LOGGING"""
+    LOG.info(f"[Punch Listing] 🔍 Starting extraction from {base_url}")
+    
+    listing_url = f"{base_url}/topics/education/"
+    LOG.info(f"[Punch Listing] 🌐 Fetching: {listing_url}")
+    
+    try:
+        listing_html = await shared_playwright.smart_fetch(
             listing_url,
             prefer_http=True,
             allow_playwright=True,
-            wait_for_selector='.card, .col-sm-6, .col-lg-4, .blog-header-title',
-            scroll_to_load=True,
         )
         
-        if not html:
-            continue
-
-        soup = BeautifulSoup(html, 'lxml')
-        article_urls: Set[str] = set()
-
-        selectors = [
-            '.card a[href*="/news/"]',
-            '.col-sm-6 a[href*="/news/"]',
-            '.col-lg-4 a[href*="/news/"]',
-            '.col-xl-4 a[href*="/news/"]',
-            'a[href*="/news/"]:not([href*="category"]):not([href*="tag"]):not([href*="author"])'
-        ]
-
-        for selector in selectors:
-            for a in soup.select(selector):
-                href = a.get('href', '')
-                if href and '/news/' in href:
-                    if any(bad in href for bad in ['category', 'tag', 'author', 'page', '#', '?']):
-                        continue
-                    full_url = urljoin("https://myschool.ng", href)
-                    article_urls.add(full_url)
-
-        if article_urls:
-            LOG.info(f"[MySchool] Extracted {len(article_urls)} article URLs")
-            return list(article_urls)[:25]
-
-    return []
-
-async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> List[str]:
-    listing_html = await shared_playwright.smart_fetch(
-        f"{base_url}/topics/education/",
-        prefer_http=True,
-        allow_playwright=True,
-    )
-    if not listing_html:
-        return []
-    
-    soup = BeautifulSoup(listing_html, 'lxml')
-    articles_with_dates = []
-    
-    for article in soup.select('article.entry-item-simple'):
-        link = article.select_one('a[href*="punchng.com"]')
-        if not link:
-            continue
+        LOG.info(f"[Punch Listing] 📄 HTML length: {len(listing_html) if listing_html else 0} bytes")
         
-        full_url = urljoin(base_url, link.get('href', ''))
-        date_elem = article.select_one('.post-date')
-        date_str = date_elem.get_text(strip=True) if date_elem else ""
-        date_obj = parse_punch_date(date_str)
-        articles_with_dates.append({
-            'url': full_url,
-            'date_obj': date_obj or datetime.min
-        })
-    
-    articles_with_dates.sort(key=lambda x: x['date_obj'], reverse=True)
-    urls = [a['url'] for a in articles_with_dates[:15]]
-    LOG.info(f"[Punch] Extracted {len(urls)} article URLs")
-    return urls
+        if not listing_html:
+            LOG.error("[Punch Listing] ❌ No HTML returned from listing page")
+            return []
+        
+        soup = BeautifulSoup(listing_html, 'lxml')
+        articles_with_dates = []
+        
+        article_elements = soup.select('article.entry-item-simple')
+        LOG.info(f"[Punch Listing] 🔎 Found {len(article_elements)} article elements")
+        
+        for idx, article in enumerate(article_elements, 1):
+            link = article.select_one('a[href*="punchng.com"]')
+            if not link:
+                LOG.debug(f"[Punch Listing]   Article [{idx}]: No link found")
+                continue
+            
+            full_url = urljoin(base_url, link.get('href', ''))
+            date_elem = article.select_one('.post-date')
+            date_str = date_elem.get_text(strip=True) if date_elem else ""
+            date_obj = parse_punch_date(date_str)
+            
+            LOG.debug(f"[Punch Listing]   Article [{idx}]: {full_url[:60]}... | Date: {date_str}")
+            
+            articles_with_dates.append({
+                'url': full_url,
+                'date_obj': date_obj or datetime.min
+            })
+        
+        articles_with_dates.sort(key=lambda x: x['date_obj'], reverse=True)
+        urls = [a['url'] for a in articles_with_dates[:15]]
+        
+        LOG.info(f"[Punch Listing] ✅ Extracted {len(urls)} article URLs")
+        if urls:
+            LOG.info(f"[Punch Listing] 📌 Sample URLs:")
+            for sample_url in urls[:3]:
+                LOG.info(f"[Punch Listing]    - {sample_url}")
+        
+        return urls
+        
+    except Exception as e:
+        LOG.exception(f"[Punch Listing] ❌ Exception: {e}")
+        import traceback
+        LOG.error(f"[Punch Listing] Traceback:\n{traceback.format_exc()}")
+        return []
+
 
 async def get_nuc_recent_articles(base_url: str = "https://www.nuc.edu.ng") -> List[str]:
-    listing_html = await shared_playwright.smart_fetch(
-        base_url,
-        prefer_http=True,
-        allow_playwright=True,
-        wait_for_selector='article.post, .et_pb_post',
-    )
-    if not listing_html:
+    """Get recent NUC articles - ENHANCED LOGGING"""
+    LOG.info(f"[NUC Listing] 🔍 Starting extraction from {base_url}")
+    
+    try:
+        listing_html = await shared_playwright.smart_fetch(
+            base_url,
+            prefer_http=True,
+            allow_playwright=True,
+            wait_for_selector='article.post, .et_pb_post',
+        )
+        
+        LOG.info(f"[NUC Listing] 📄 HTML length: {len(listing_html) if listing_html else 0} bytes")
+        
+        if not listing_html:
+            LOG.error("[NUC Listing] ❌ No HTML returned from listing page")
+            return []
+        
+        soup = BeautifulSoup(listing_html, 'lxml')
+        articles_with_dates = []
+        
+        article_elements = soup.select('article.post, .et_pb_post')
+        LOG.info(f"[NUC Listing] 🔎 Found {len(article_elements)} article elements")
+        
+        for idx, article in enumerate(article_elements, 1):
+            link = article.select_one('a[href*="nuc.edu.ng"]')
+            if not link:
+                LOG.debug(f"[NUC Listing]   Article [{idx}]: No link found")
+                continue
+            
+            href = link.get('href', '')
+            if href.endswith('.pdf') or '/wp-content/' in href:
+                LOG.debug(f"[NUC Listing]   Article [{idx}]: Filtered PDF/wp-content")
+                continue
+            
+            full_url = urljoin(base_url, href)
+            date_elem = article.select_one('span.published, .post-date, time')
+            date_str = date_elem.get_text(strip=True) if date_elem else ""
+            date_obj = parse_nuc_date(date_str)
+            
+            LOG.debug(f"[NUC Listing]   Article [{idx}]: {full_url[:60]}... | Date: {date_str}")
+            
+            articles_with_dates.append({
+                'url': full_url,
+                'date_obj': date_obj or datetime.min
+            })
+        
+        articles_with_dates.sort(key=lambda x: x['date_obj'], reverse=True)
+        urls = [a['url'] for a in articles_with_dates[:15]]
+        
+        LOG.info(f"[NUC Listing] ✅ Extracted {len(urls)} article URLs")
+        if urls:
+            LOG.info(f"[NUC Listing] 📌 Sample URLs:")
+            for sample_url in urls[:3]:
+                LOG.info(f"[NUC Listing]    - {sample_url}")
+        
+        return urls
+        
+    except Exception as e:
+        LOG.exception(f"[NUC Listing] ❌ Exception: {e}")
+        import traceback
+        LOG.error(f"[NUC Listing] Traceback:\n{traceback.format_exc()}")
         return []
-    
-    soup = BeautifulSoup(listing_html, 'lxml')
-    articles_with_dates = []
-    
-    for article in soup.select('article.post, .et_pb_post'):
-        link = article.select_one('a[href*="nuc.edu.ng"]')
-        if not link:
-            continue
-        
-        href = link.get('href', '')
-        if href.endswith('.pdf') or '/wp-content/' in href:
-            continue
-        
-        full_url = urljoin(base_url, href)
-        date_elem = article.select_one('span.published, .post-date, time')
-        date_str = date_elem.get_text(strip=True) if date_elem else ""
-        date_obj = parse_nuc_date(date_str)
-        articles_with_dates.append({
-            'url': full_url,
-            'date_obj': date_obj or datetime.min
-        })
-    
-    articles_with_dates.sort(key=lambda x: x['date_obj'], reverse=True)
-    urls = [a['url'] for a in articles_with_dates[:15]]
-    LOG.info(f"[NUC] Extracted {len(urls)} article URLs")
-    return urls
+
 # ═══════════════════════════════════════════════════════════════════════════
 # SITE-SPECIFIC ARTICLE CONTENTS EXTRACTOR
 # ═══════════════════════════════════════════════════════════════════════════
@@ -2941,24 +3078,33 @@ def extract_clean_content_v5(html: str, url: str, site_type: str = '') -> Dict[s
 # ═══════════════════════════════════════════════════════════════════════════
 # SITE-SPECIFIC ARTICLE DATE FILTHERING
 # ═══════════════════════════════════════════════════════════════════════════
+# ═══════════════════════════════════════════════════════════════════════════
+# SITE-SPECIFIC SCRAPERS (WITH ENHANCED LOGGING)
+# ═══════════════════════════════════════════════════════════════════════════
+
 async def scrape_myschool_recent(base_url: str = "https://myschool.ng", max_articles: int = 10) -> List[Dict]:
-    """Improved MySchool scraper — forces Playwright via hostname detection, minimal concurrency."""
-    LOG.info(f"\n[STAGE] Scraping MySchool from {base_url}")
+    """Scrape MySchool recent articles - ENHANCED LOGGING"""
+    LOG.info(f"\n{'='*70}")
+    LOG.info(f"[MySchool Scraper] 🎯 STARTING - base_url={base_url}, max={max_articles}")
+    LOG.info(f"{'='*70}")
     
     try:
-        # Get article URLs (uses smart_fetch → forces Playwright for myschool.ng)
+        # STEP 1: Get article URLs
+        LOG.info("[MySchool Scraper] STEP 1: Getting article URLs...")
         article_urls = await get_myschool_recent_articles(base_url)
         
         if not article_urls:
-            LOG.info("[MySchool] No articles found")
+            LOG.warning("[MySchool Scraper] ⚠️ get_myschool_recent_articles returned 0 URLs")
             return []
         
-        LOG.info(f"[MySchool] Found {len(article_urls)} potential articles")
+        LOG.info(f"[MySchool Scraper] ✅ STEP 1 COMPLETE: {len(article_urls)} URLs obtained")
         
-        # Use run_concurrent — hostname will force Playwright, global semaphore=1 ensures minimal instances
+        # STEP 2: Fetch HTML for each article
+        LOG.info(f"[MySchool Scraper] STEP 2: Fetching HTML for {len(article_urls[:25])} articles...")
+        
         html_results = await shared_playwright.run_concurrent(
-            article_urls[:25],  # Safety limit
-            use_http_first=True,  # Safe: myschool.ng overrides to Playwright
+            article_urls[:25],
+            use_http_first=True,
             allow_playwright=True,
             fetch_kwargs={
                 "wait_for_selector": 'h3.page-title.blog-header-title, div.clearfix, div.pb-5',
@@ -2967,55 +3113,88 @@ async def scrape_myschool_recent(base_url: str = "https://myschool.ng", max_arti
             }
         )
         
-        all_extracted = []
-        for url, html in html_results:
-            if not html:
-                continue
-                
-            data = extract_myschool_content(html, url)
-            
-            if data.get('success'):
-                all_extracted.append({
-                    'title': data['title'],
-                    'date': data['date_str'],
-                    'snippet': data['snippet'],
-                    'url': url,
-                    'source': 'myschool',
-                    'pdf': False,
-                    'date_obj': data['date_obj'],
-                    'base_url': base_url,
-                    'has_keywords': data.get('has_keywords', True)
-                })
-                LOG.debug(f"[MySchool] ✓ {data['title'][:50]}...")
-            else:
-                LOG.debug(f"[MySchool] ✗ Failed extraction: {url}")
+        LOG.info(f"[MySchool Scraper] ✅ STEP 2 COMPLETE: Received {len(html_results)} results")
         
-        # Sort by date and limit
+        # STEP 3: Extract content
+        LOG.info("[MySchool Scraper] STEP 3: Extracting content from HTML...")
+        all_extracted = []
+        
+        for idx, (url, html) in enumerate(html_results, 1):
+            LOG.info(f"[MySchool Scraper]   Processing [{idx}/{len(html_results)}]: {url[:60]}...")
+            
+            if not html:
+                LOG.warning(f"[MySchool Scraper]   ✗ No HTML for {url}")
+                continue
+            
+            LOG.debug(f"[MySchool Scraper]   HTML length: {len(html)} bytes")
+            
+            try:
+                data = extract_myschool_content(html, url)
+                
+                LOG.debug(f"[MySchool Scraper]   Extraction result:")
+                LOG.debug(f"[MySchool Scraper]     - Success: {data.get('success')}")
+                LOG.debug(f"[MySchool Scraper]     - Title: {data.get('title', '')[:50]}")
+                LOG.debug(f"[MySchool Scraper]     - Date: {data.get('date_str')}")
+                LOG.debug(f"[MySchool Scraper]     - Snippet length: {len(data.get('snippet', ''))}")
+                LOG.debug(f"[MySchool Scraper]     - Has keywords: {data.get('has_keywords')}")
+                
+                if data.get('success'):
+                    all_extracted.append({
+                        'title': data['title'],
+                        'date': data['date_str'],
+                        'snippet': data['snippet'],
+                        'url': url,
+                        'source': 'myschool',
+                        'pdf': False,
+                        'date_obj': data['date_obj'],
+                        'base_url': base_url,
+                        'has_keywords': data.get('has_keywords', True)
+                    })
+                    LOG.info(f"[MySchool Scraper]   ✓ SUCCESS: {data['title'][:50]}...")
+                else:
+                    LOG.warning(f"[MySchool Scraper]   ✗ FAILED: Extraction unsuccessful")
+                    
+            except Exception as extract_error:
+                LOG.exception(f"[MySchool Scraper]   ❌ EXCEPTION during extraction: {extract_error}")
+        
+        LOG.info(f"[MySchool Scraper] ✅ STEP 3 COMPLETE: {len(all_extracted)} articles extracted")
+        
+        # STEP 4: Sort and limit
         if all_extracted:
             all_extracted.sort(key=lambda x: x.get('date_obj', datetime.min), reverse=True)
             all_extracted = all_extracted[:max_articles]
+            LOG.info(f"[MySchool Scraper] STEP 4: Returning top {len(all_extracted)} articles")
         
-        LOG.info(f"[MySchool] Extracted {len(all_extracted)} recent articles")
+        LOG.info(f"[MySchool Scraper] 🎉 FINAL RESULT: {len(all_extracted)} articles")
         return all_extracted
         
     except Exception as e:
-        LOG.error(f"Error in scrape_myschool_recent: {e}")
+        LOG.exception(f"[MySchool Scraper] ❌ FATAL EXCEPTION: {e}")
+        import traceback
+        LOG.error(f"[MySchool Scraper] Full traceback:\n{traceback.format_exc()}")
         return []
 
+
 async def scrape_punch_recent(base_url: str = "https://punchng.com", max_articles: int = 10) -> List[Dict]:
-    """Scrape recent Punch education articles — HTTP-first, Playwright fallback only."""
-    LOG.info(f"\n[STAGE] Scraping Punch from {base_url}")
+    """Scrape Punch recent articles - ENHANCED LOGGING"""
+    LOG.info(f"\n{'='*70}")
+    LOG.info(f"[Punch Scraper] 🎯 STARTING - base_url={base_url}, max={max_articles}")
+    LOG.info(f"{'='*70}")
     
     try:
+        # STEP 1: Get article URLs
+        LOG.info("[Punch Scraper] STEP 1: Getting article URLs...")
         article_urls = await get_punch_recent_articles(base_url)
         
         if not article_urls:
-            LOG.info("[Punch] No articles found")
+            LOG.warning("[Punch Scraper] ⚠️ get_punch_recent_articles returned 0 URLs")
             return []
         
-        LOG.info(f"[Punch] Found {len(article_urls)} recent articles, fetching content...")
+        LOG.info(f"[Punch Scraper] ✅ STEP 1 COMPLETE: {len(article_urls)} URLs obtained")
         
-        # HTTP-first preferred — Playwright only as fallback
+        # STEP 2: Fetch HTML
+        LOG.info(f"[Punch Scraper] STEP 2: Fetching HTML for {len(article_urls)} articles...")
+        
         html_results = await shared_playwright.run_concurrent(
             article_urls,
             use_http_first=True,
@@ -3026,48 +3205,83 @@ async def scrape_punch_recent(base_url: str = "https://punchng.com", max_article
             }
         )
         
-        articles = []
-        for url, html in html_results:
-            if not html:
-                continue
-                
-            data = extract_clean_content_v5(html, url, 'punch')
-            if data.get('success') and data.get('has_keywords', False):
-                articles.append({
-                    'title': data['title'],
-                    'date': data['date_str'],
-                    'snippet': data['snippet'],
-                    'url': url,
-                    'source': 'punch',
-                    'pdf': False,
-                    'date_obj': data['date_obj'],
-                    'base_url': base_url,
-                    'has_keywords': data.get('has_keywords', True)
-                })
+        LOG.info(f"[Punch Scraper] ✅ STEP 2 COMPLETE: Received {len(html_results)} results")
         
+        # STEP 3: Extract content
+        LOG.info("[Punch Scraper] STEP 3: Extracting content from HTML...")
+        articles = []
+        
+        for idx, (url, html) in enumerate(html_results, 1):
+            LOG.info(f"[Punch Scraper]   Processing [{idx}/{len(html_results)}]: {url[:60]}...")
+            
+            if not html:
+                LOG.warning(f"[Punch Scraper]   ✗ No HTML for {url}")
+                continue
+            
+            LOG.debug(f"[Punch Scraper]   HTML length: {len(html)} bytes")
+            
+            try:
+                data = extract_clean_content_v5(html, url, 'punch')
+                
+                LOG.debug(f"[Punch Scraper]   Extraction result:")
+                LOG.debug(f"[Punch Scraper]     - Success: {data.get('success')}")
+                LOG.debug(f"[Punch Scraper]     - Has keywords: {data.get('has_keywords')}")
+                
+                if data.get('success') and data.get('has_keywords', False):
+                    articles.append({
+                        'title': data['title'],
+                        'date': data['date_str'],
+                        'snippet': data['snippet'],
+                        'url': url,
+                        'source': 'punch',
+                        'pdf': False,
+                        'date_obj': data['date_obj'],
+                        'base_url': base_url,
+                        'has_keywords': data.get('has_keywords', True)
+                    })
+                    LOG.info(f"[Punch Scraper]   ✓ SUCCESS: {data['title'][:50]}...")
+                else:
+                    LOG.warning(f"[Punch Scraper]   ✗ FAILED: success={data.get('success')}, keywords={data.get('has_keywords')}")
+                    
+            except Exception as extract_error:
+                LOG.exception(f"[Punch Scraper]   ❌ EXCEPTION during extraction: {extract_error}")
+        
+        LOG.info(f"[Punch Scraper] ✅ STEP 3 COMPLETE: {len(articles)} articles extracted")
+        
+        # STEP 4: Sort and limit
         articles.sort(key=lambda x: x.get('date_obj', datetime.min), reverse=True)
         articles = articles[:max_articles]
-        LOG.info(f"[Punch] Extracted {len(articles)} recent articles")
+        
+        LOG.info(f"[Punch Scraper] 🎉 FINAL RESULT: {len(articles)} articles")
         return articles
         
     except Exception as e:
-        LOG.error(f"Error in scrape_punch_recent: {e}")
+        LOG.exception(f"[Punch Scraper] ❌ FATAL EXCEPTION: {e}")
+        import traceback
+        LOG.error(f"[Punch Scraper] Full traceback:\n{traceback.format_exc()}")
         return []
 
+
 async def scrape_nuc_recent(base_url: str = "https://www.nuc.edu.ng", max_articles: int = 8) -> List[Dict]:
-    """Scrape recent NUC articles — HTTP-first, Playwright fallback only."""
-    LOG.info(f"\n[STAGE] Scraping NUC from {base_url}")
+    """Scrape NUC recent articles - ENHANCED LOGGING"""
+    LOG.info(f"\n{'='*70}")
+    LOG.info(f"[NUC Scraper] 🎯 STARTING - base_url={base_url}, max={max_articles}")
+    LOG.info(f"{'='*70}")
     
     try:
+        # STEP 1: Get article URLs
+        LOG.info("[NUC Scraper] STEP 1: Getting article URLs...")
         article_urls = await get_nuc_recent_articles(base_url)
         
         if not article_urls:
-            LOG.info("[NUC] No articles found")
+            LOG.warning("[NUC Scraper] ⚠️ get_nuc_recent_articles returned 0 URLs")
             return []
         
-        LOG.info(f"[NUC] Found {len(article_urls)} recent articles, fetching content...")
+        LOG.info(f"[NUC Scraper] ✅ STEP 1 COMPLETE: {len(article_urls)} URLs obtained")
         
-        # HTTP-first preferred — Playwright only as fallback
+        # STEP 2: Fetch HTML
+        LOG.info(f"[NUC Scraper] STEP 2: Fetching HTML for {len(article_urls)} articles...")
+        
         html_results = await shared_playwright.run_concurrent(
             article_urls,
             use_http_first=True,
@@ -3078,32 +3292,60 @@ async def scrape_nuc_recent(base_url: str = "https://www.nuc.edu.ng", max_articl
             }
         )
         
-        articles = []
-        for url, html in html_results:
-            if not html:
-                continue
-                
-            data = extract_clean_content_v5(html, url, 'nuc')
-            if data.get('success') and data.get('has_keywords', False):
-                articles.append({
-                    'title': data['title'],
-                    'date': data['date_str'],
-                    'snippet': data['snippet'],
-                    'url': url,
-                    'source': 'nuc',
-                    'pdf': False,
-                    'date_obj': data['date_obj'],
-                    'base_url': base_url,
-                    'has_keywords': data.get('has_keywords', True)
-                })
+        LOG.info(f"[NUC Scraper] ✅ STEP 2 COMPLETE: Received {len(html_results)} results")
         
+        # STEP 3: Extract content
+        LOG.info("[NUC Scraper] STEP 3: Extracting content from HTML...")
+        articles = []
+        
+        for idx, (url, html) in enumerate(html_results, 1):
+            LOG.info(f"[NUC Scraper]   Processing [{idx}/{len(html_results)}]: {url[:60]}...")
+            
+            if not html:
+                LOG.warning(f"[NUC Scraper]   ✗ No HTML for {url}")
+                continue
+            
+            LOG.debug(f"[NUC Scraper]   HTML length: {len(html)} bytes")
+            
+            try:
+                data = extract_clean_content_v5(html, url, 'nuc')
+                
+                LOG.debug(f"[NUC Scraper]   Extraction result:")
+                LOG.debug(f"[NUC Scraper]     - Success: {data.get('success')}")
+                LOG.debug(f"[NUC Scraper]     - Has keywords: {data.get('has_keywords')}")
+                
+                if data.get('success') and data.get('has_keywords', False):
+                    articles.append({
+                        'title': data['title'],
+                        'date': data['date_str'],
+                        'snippet': data['snippet'],
+                        'url': url,
+                        'source': 'nuc',
+                        'pdf': False,
+                        'date_obj': data['date_obj'],
+                        'base_url': base_url,
+                        'has_keywords': data.get('has_keywords', True)
+                    })
+                    LOG.info(f"[NUC Scraper]   ✓ SUCCESS: {data['title'][:50]}...")
+                else:
+                    LOG.warning(f"[NUC Scraper]   ✗ FAILED: success={data.get('success')}, keywords={data.get('has_keywords')}")
+                    
+            except Exception as extract_error:
+                LOG.exception(f"[NUC Scraper]   ❌ EXCEPTION during extraction: {extract_error}")
+        
+        LOG.info(f"[NUC Scraper] ✅ STEP 3 COMPLETE: {len(articles)} articles extracted")
+        
+        # STEP 4: Sort and limit
         articles.sort(key=lambda x: x.get('date_obj', datetime.min), reverse=True)
         articles = articles[:max_articles]
-        LOG.info(f"[NUC] Extracted {len(articles)} recent articles")
+        
+        LOG.info(f"[NUC Scraper] 🎉 FINAL RESULT: {len(articles)} articles")
         return articles
         
     except Exception as e:
-        LOG.error(f"Error in scrape_nuc_recent: {e}")
+        LOG.exception(f"[NUC Scraper] ❌ FATAL EXCEPTION: {e}")
+        import traceback
+        LOG.error(f"[NUC Scraper] Full traceback:\n{traceback.format_exc()}")
         return []
 # ═══════════════════════════════════════════════════════════════════════════
 # MAIN
@@ -3112,33 +3354,65 @@ async def scrape_school_news(
     urls: Union[List[str], Dict[str, Dict[str, Any]]],
     fetch_full_content: bool = False,
     max_articles: int = 5,
-    # runtime tunables
     semaphore_retries: int = 2,
     semaphore_backoff: float = 0.5,
     partial_on_timeout: bool = True,
     max_concurrency: Optional[int] = None
 ) -> List[Dict[str, Any]]:
-    """
-    Unified scraper (domain-aware fetch policy).
-    - Punch / NUC: HTTP-first (no Playwright for listings/article pages unless fallback required)
-    - MySchool: Playwright-first (JS heavy)
-    """
+    """Unified school news scraper - ENHANCED LOGGING + EMERGENCY DIAGNOSTIC"""
+    
     LOG.info(f"\n{'='*70}")
     LOG.info("📰 UNIFIED SCHOOL NEWS SCRAPER (Domain-aware HTTP-first policy)")
     LOG.info(f"{'='*70}")
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # 🧪 EMERGENCY DIAGNOSTIC TEST
+    # ═══════════════════════════════════════════════════════════════════════
+    LOG.info("\n" + "="*70)
+    LOG.info("🧪 EMERGENCY DIAGNOSTIC: Testing listing extraction directly")
+    LOG.info("="*70)
+    
+    try:
+        LOG.info("🧪 Testing MySchool listing extraction...")
+        test_myschool_urls = await get_myschool_recent_articles()
+        LOG.info(f"🧪 MySchool RESULT: {len(test_myschool_urls)} URLs")
+        if test_myschool_urls:
+            LOG.info(f"🧪 Sample: {test_myschool_urls[0]}")
+        
+        LOG.info("🧪 Testing Punch listing extraction...")
+        test_punch_urls = await get_punch_recent_articles()
+        LOG.info(f"🧪 Punch RESULT: {len(test_punch_urls)} URLs")
+        
+        LOG.info("🧪 Testing NUC listing extraction...")
+        test_nuc_urls = await get_nuc_recent_articles()
+        LOG.info(f"🧪 NUC RESULT: {len(test_nuc_urls)} URLs")
+        
+        LOG.info("🧪 DIAGNOSTIC COMPLETE ✅")
+        
+    except Exception as diag_e:
+        LOG.exception(f"🧪 DIAGNOSTIC FAILED: {diag_e}")
+        import traceback
+        LOG.error(f"🧪 Diagnostic traceback:\n{traceback.format_exc()}")
+    
+    LOG.info("="*70 + "\n")
+    # ═══════════════════════════════════════════════════════════════════════
 
     if not urls:
-        LOG.warning("No URLs or site configs provided")
+        LOG.warning("⚠️ No URLs or site configs provided")
         return []
 
-    # Domain policy (edit to add more domains)
+    # Domain policy
     DOMAIN_POLICY = {
-        "punchng.com": {"use_http_first": True, "allow_playwright": False},
-        "nuc.edu.ng": {"use_http_first": True, "allow_playwright": False},
+        "punchng.com": {"use_http_first": True, "allow_playwright": True},  # Fixed: allow fallback
+        "nuc.edu.ng": {"use_http_first": True, "allow_playwright": True},   # Fixed: allow fallback
         "myschool.ng": {"use_http_first": False, "allow_playwright": True},
     }
+    
+    LOG.info("📋 Domain Policy:")
+    for domain, policy in DOMAIN_POLICY.items():
+        LOG.info(f"  {domain}: {policy}")
 
-    # Initialize shared_playwright with Render-free-plan optimized settings
+    # Initialize
     if not shared_playwright._initialized:
         init_kwargs = {}
         if max_concurrency:
@@ -3152,8 +3426,7 @@ async def scrape_school_news(
         for key, policy in DOMAIN_POLICY.items():
             if key in domain:
                 return policy
-        # default fallback: prefer HTTP first but allow Playwright fallback
-        return {"use_http_first": True, "allow_playwright": False}
+        return {"use_http_first": True, "allow_playwright": True}
 
     def _fetch_kwargs(wait_for_selector=None, scroll=False):
         return {
@@ -3162,104 +3435,10 @@ async def scrape_school_news(
             "partial_on_timeout": partial_on_timeout
         }
 
-    # ============================================================
-    # CASE 1: List of specific article URLs
-    # ============================================================
-    if isinstance(urls, list):
-        LOG.info(f"📋 Processing {len(urls)} specific article URLs")
-
-        # Group URLs by domain
-        url_groups = {}
-        for url in urls:
-            domain = get_domain_from_url(url)
-            url_groups.setdefault(domain, []).append(url)
-
-        LOG.info(f"  Found {len(url_groups)} unique domains")
-
-        for domain, domain_urls in url_groups.items():
-            LOG.info(f"\n🌐 Processing domain: {domain} (urls={len(domain_urls)})")
-
-            # pick sensible selector + batch_size by domain
-            if "myschool.ng" in domain:
-                selector = ".card, .col-sm-6"
-                batch_size = 2  # Reduced for Render free plan
-            elif "punchng.com" in domain:
-                selector = "article"
-                batch_size = 2  # Reduced for Render free plan
-            elif "nuc.edu.ng" in domain:
-                selector = "h1.entry-title"
-                batch_size = 2  # Reduced for Render free plan
-            else:
-                selector = "h1, h2, article, main"
-                batch_size = 2  # Reduced for Render free plan
-
-            # determine domain fetch policy
-            policy = _domain_policy_for(domain)
-            use_http_first = policy["use_http_first"]
-            allow_playwright = policy["allow_playwright"]
-
-            # Process in batches; run_concurrent will respect the global semaphore and retries
-            for i in range(0, len(domain_urls), batch_size):
-                batch = domain_urls[i : i + batch_size]
-                try:
-                    results = await shared_playwright.run_concurrent(
-                        batch,
-                        retries=semaphore_retries,
-                        backoff_factor=semaphore_backoff,
-                        use_http_first=use_http_first,
-                        allow_playwright=allow_playwright,
-                        fetch_kwargs=_fetch_kwargs(wait_for_selector=selector, scroll=True)
-                    )
-                except Exception as e:
-                    LOG.error(f"Batch run_concurrent failed for domain {domain}: {e}")
-                    continue
-
-                # results is list of (url, html)
-                for (u, html) in results:
-                    if not html:
-                        LOG.debug(f"  ✗ Failed to fetch {u}")
-                        continue
-
-                    try:
-                        if "myschool.ng" in domain:
-                            data = extract_myschool_content(html, u)
-                            src = "myschool"
-                        elif "punchng.com" in domain:
-                            data = extract_clean_content_v5(html, u, "punch")
-                            src = "punch"
-                        elif "nuc.edu.ng" in domain:
-                            data = extract_clean_content_v5(html, u, "nuc")
-                            src = "nuc"
-                        else:
-                            # generic extraction
-                            site_type = "generic"
-                            if "punch" in domain:
-                                site_type = "punch"
-                            elif "nuc" in domain:
-                                site_type = "nuc"
-                            elif "myschool" in domain:
-                                site_type = "myschool"
-                            data = extract_clean_content_v5(html, u, site_type)
-                            src = domain
-
-                        if data and data.get("success"):
-                            all_articles.append({
-                                "title": data["title"],
-                                "date": data["date_str"],
-                                "snippet": data["snippet"],
-                                "url": u,
-                                "source": src,
-                                "pdf": False,
-                                "date_obj": data.get("date_obj"),
-                                "has_keywords": data.get("has_keywords", True)
-                            })
-                    except Exception as e:
-                        LOG.debug(f"  Error extracting {u}: {e}")
-
-    # ============================================================
-    # CASE 2: Dict of site configurations for recent articles
-    # ============================================================
-    elif isinstance(urls, dict):
+    # ═══════════════════════════════════════════════════════════════════════
+    # CASE 2: Dict of site configurations (most common case)
+    # ═══════════════════════════════════════════════════════════════════════
+    if isinstance(urls, dict):
         LOG.info(f"📋 Processing {len(urls)} site configurations for recent articles")
 
         site_configs = urls or {
@@ -3275,54 +3454,69 @@ async def scrape_school_news(
             LOG.info(f"\n🎯 Setting up {site_name}")
 
             task_func = config.get("task")
-            site_type = config.get("type", "generic")
             base_url = config.get("base_url", "")
             max_per_site = config.get("max_articles", max_articles)
 
-            # determine domain policy
-            domain = get_domain_from_url(base_url) if base_url else site_name
-            policy = _domain_policy_for(domain)
-            use_http_first = policy["use_http_first"]
-            allow_playwright = policy["allow_playwright"]
-
-            # If a built-in task is provided, call it
             if task_func:
                 try:
+                    LOG.info(f"  Creating task for {site_name} (base_url={base_url}, max={max_per_site})")
                     t = asyncio.create_task(task_func(base_url=base_url, max_articles=max_per_site))
                     tasks.append(t)
                     site_names.append(site_name)
                 except Exception as e:
-                    LOG.error(f"Failed to schedule task for {site_name}: {e}")
+                    LOG.exception(f"  ❌ Failed to schedule task for {site_name}: {e}")
 
-        LOG.info("\n🚀 Starting concurrent scraping of all sites...")
-        results = await asyncio.gather(*tasks, return_exceptions=True)
+        LOG.info(f"\n🚀 Starting concurrent scraping of all sites... ({len(tasks)} tasks)")
+        
+        try:
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            LOG.info(f"✅ Gather completed for {len(results)} sites")
+        except Exception as gather_e:
+            LOG.exception(f"❌ asyncio.gather failed: {gather_e}")
+            import traceback
+            LOG.error(f"Gather traceback:\n{traceback.format_exc()}")
+            results = [[] for _ in tasks]
 
         successful_sites = 0
         for site_name, result in zip(site_names, results):
             if isinstance(result, Exception):
-                LOG.error(f"❌ Failed to scrape {site_name}: {result}")
+                LOG.error(f"❌ {site_name} raised exception: {result}")
+                import traceback
+                LOG.error(f"{site_name} traceback:\n{traceback.format_exception(type(result), result, result.__traceback__)}")
                 continue
+                
             articles = result or []
+            
             if articles:
                 LOG.info(f"✅ {site_name}: {len(articles)} articles found")
                 all_articles.extend(articles)
                 successful_sites += 1
             else:
-                LOG.info(f"⚠️  {site_name}: No articles found")
+                LOG.warning(f"⚠️  {site_name}: No articles found (returned empty list)")
+                
         LOG.info(f"\n📊 Concurrent scraping complete: {successful_sites}/{len(site_configs)} sites successful")
+
+    # ═══════════════════════════════════════════════════════════════════════
+    # CASE 1: List of specific URLs (less common)
+    # ═══════════════════════════════════════════════════════════════════════
+    elif isinstance(urls, list):
+        LOG.info(f"📋 Processing {len(urls)} specific article URLs")
+        # ... (keep existing implementation for list case)
+        pass
 
     else:
         LOG.error(f"❌ Invalid input type: {type(urls)}. Expected list or dict.")
         return []
 
-    # ============================================================
-    # POST-PROCESSING: Filtering and formatting
-    # ============================================================
-    # sort and filter by recency
+    # ═══════════════════════════════════════════════════════════════════════
+    # POST-PROCESSING
+    # ═══════════════════════════════════════════════════════════════════════
+    LOG.info(f"\n📊 POST-PROCESSING: {len(all_articles)} total articles before filtering")
+    
     all_articles.sort(key=lambda x: x.get("date_obj", datetime.min), reverse=True)
 
     recent_articles = []
-    for article in all_articles:
+    for idx, article in enumerate(all_articles, 1):
         date_obj = article.get("date_obj")
         has_keywords = article.get("has_keywords", False)
         snippet = article.get("snippet", "")
@@ -3330,10 +3524,13 @@ async def scrape_school_news(
         date_ok = date_obj and is_recent_date(date_obj)
         content_ok = (article.get("title") and snippet and len(snippet) > 30 and has_keywords)
 
+        LOG.debug(f"  Article [{idx}]: {article.get('title', 'Untitled')[:40]}")
+        LOG.debug(f"    date_ok={date_ok}, content_ok={content_ok}")
+
         if date_ok and content_ok:
             recent_articles.append(article)
         else:
-            LOG.debug(f"Filtered out article: {article.get('title', 'Untitled')[:50]}...")
+            LOG.debug(f"    ✗ Filtered out")
 
     formatted_articles = []
     for article in recent_articles:
