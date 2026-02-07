@@ -3371,13 +3371,15 @@ async def scrape_myschool_recent(base_url: str = "https://myschool.ng", max_arti
         LOG.info(f"[MySchool Scraper] STEP 2: Fetching HTML for {len(article_urls[:25])} articles...")
         
         html_results = await shared_playwright.run_concurrent(
-            article_urls[:10],
+            article_urls[:10],  # Limit to 10 to avoid overload
             use_http_first=True,
             allow_playwright=True,
             fetch_kwargs={
                 "wait_for_selector": 'h3.page-title.blog-header-title, div.clearfix, div.pb-5',
                 "scroll_to_load": False,
-                "timeout": 30000
+                "timeout": 30000,
+                "partial_on_timeout": True,  # ADD THIS
+                "partial_min_bytes": 3000,   # ADD THIS
             }
         )
         
