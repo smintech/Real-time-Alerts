@@ -2724,7 +2724,6 @@ async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> Li
         LOG.error(f"[Punch Listing] Traceback:\n{traceback.format_exc()}")
         return []
 
-
 async def get_nuc_recent_articles(base_url: str = "https://www.nuc.edu.ng") -> List[str]:
     """Get recent NUC articles - ENHANCED LOGGING"""
     LOG.info(f"[NUC Listing] 🔍 Starting extraction from {base_url}")
@@ -2792,304 +2791,563 @@ async def get_nuc_recent_articles(base_url: str = "https://www.nuc.edu.ng") -> L
 # ═══════════════════════════════════════════════════════════════════════════
 # SITE-SPECIFIC ARTICLE CONTENTS EXTRACTOR
 # ═══════════════════════════════════════════════════════════════════════════
-def extract_myschool_content(html: str, url: str) -> Dict[str, Any]:
-    """Improved extraction for MySchool articles based on analysis."""
-    if not html:
-        return {'success': False}
-    
-    soup = BeautifulSoup(html, 'lxml')
-    
-    # FIXED: Extract title - analysis shows h3.page-title.blog-header-title
-    title = ""
-    title_elem = soup.select_one('h3.page-title.blog-header-title')
-    if title_elem:
-        title = title_elem.get_text(strip=True)
-    
-    # Fallback title selectors
-    if not title:
-        for selector in ['h3.page-title.blog-header-title', 'h3.blog-header-title', '.post-title']:
+def _safe_get_text(elem) -> str:
+    try:
+        return elem.get_text(' ', strip=True) if elem else ""
+    except Exception:
+        LOG.debug("[Extractor] _safe_get_text failed", exc_info=True)
+        try:
+            return str(elem)
+        except Exception:
+            return ""
+
+def _first_matching_selector_text(soup: BeautifulSoup, selectors: List[str], min_len: int = 0) -> Optional[str]:
+    for selector in selectors:
+        try:
             elem = soup.select_one(selector)
-            if elem:
-                title_text = elem.get_text(strip=True)
-                if title_text and len(title_text) > 10:
-                    title = title_text
-                    break
-    
-    # FIXED: Extract date - pattern: "Posted by ... | 3rd February, 2026"
-    date_str = ""
-    date_obj = None
-    
-    # Look for the posted by pattern
-    all_text = soup.get_text()
-    
-    # Pattern 1: "Posted by Myschool Paul 3rd February, 2026 | 3 Comments"
-    posted_patterns = [
-        r'Posted by[^|]*\|[^|]*(\d{1,2}(?:st|nd|rd|th)?\s+\w+\s*,\s*\d{4})',
-        r'Posted by[^|]*(\d{1,2}(?:st|nd|rd|th)?\s+\w+\s*,\s*\d{4})',
-        r'(\d{1,2}(?:st|nd|rd|th)?\s+\w+\s*,\s*\d{4})\s*\|'
-    ]
-    
-    for pattern in posted_patterns:
-        match = re.search(pattern, all_text, re.IGNORECASE)
-        if match:
-            date_str = match.group(1).strip()
-            break
-    
-    # Pattern 2: Direct date in text
-    if not date_str:
-        date_patterns = [
-            r'(\d{1,2}(?:st|nd|rd|th)?\s+\w+\s*,\s*\d{4})',
-            r'(\d{1,2}\s+\w+\s+\d{4})',
-            r'(\d{4}-\d{2}-\d{2})'
-        ]
-        for pattern in date_patterns:
-            match = re.search(pattern, all_text[:2000])  # Search first 2000 chars
-            if match:
-                date_str = match.group(1)
-                break
-    
-    if date_str:
-        date_obj = parse_myschool_date(date_str)
-    
-    # FIXED: Extract content - analysis shows content in div.clearfix or div.pb-5
-    content = ""
-    
-    # Try containers from analysis
-    content_containers = [
-        soup.select_one('div.clearfix'),
-        soup.select_one('div.pb-5'),
-        soup.select_one('article'),
-        soup.select_one('div.entry-content'),
-        soup.select_one('main'),
-        soup.select_one('.content')
-    ]
-    
-    for container in content_containers:
-        if container:
-            # Remove unwanted elements
-            unwanted_selectors = [
-                'script', 'style', 'nav', 'header', 'footer', 
-                '.share', '.comments', '.ad', '.widget', 
-                '.related', 'iframe', '.sidebar', '.author-box',
-                '.social-share', '.post-meta', '.newsletter'
-            ]
-            
-            for selector in unwanted_selectors:
-                for elem in container.select(selector):
+        except Exception:
+            LOG.debug(f"[Extractor] invalid selector '{selector}'", exc_info=True)
+            continue
+        text = _safe_get_text(elem)
+        if text and len(text) > min_len:
+            LOG.debug(f"[Extractor] selector '{selector}' matched with length={len(text)}")
+            return text
+    return None
+
+def _clean_spaces(text: str) -> str:
+    return re.sub(r'\s+', ' ', text).strip() if text else text
+
+def _remove_unwanted(container, unwanted_selectors: List[str]):
+    try:
+        for unw_sel in unwanted_selectors:
+            for elem in container.select(unw_sel):
+                try:
                     elem.decompose()
-            
-            # Get text content
-            text = container.get_text(' ', strip=True)
+                except Exception:
+                    LOG.debug(f"[Extractor] failed to decompose element for selector '{unw_sel}'", exc_info=True)
+    except Exception:
+        LOG.debug("[Extractor] _remove_unwanted failed", exc_info=True)
+
+def _safe_parse_date(parse_fn, date_str: str):
+    if not date_str or not parse_fn:
+        return None
+    try:
+        return parse_fn(date_str)
+    except Exception:
+        LOG.debug(f"[Extractor] date parse failed for '{date_str}'", exc_info=True)
+        return None
+
+# ---------- MySchool extractor ----------
+def extract_myschool_content(html: str, url: str) -> Dict[str, Any]:
+    start = time.perf_counter()
+    result = {
+        'title': "",
+        'date_str': "",
+        'date_obj': None,
+        'snippet': "",
+        'url': url,
+        'success': False,
+        'has_keywords': False,
+        'error': None,
+        'elapsed': None
+    }
+
+    if not html or not isinstance(html, str):
+        result['error'] = "Empty or invalid HTML input"
+        LOG.warning(f"[MySchool Extract] {url[:80]} - {result['error']}")
+        result['elapsed'] = time.perf_counter() - start
+        return result
+
+    try:
+        soup = BeautifulSoup(html, 'lxml')
+
+        # Title
+        title_selectors = [
+            'h3.page-title.blog-header-title',
+            'h3.blog-header-title',
+            'h3.page-title',
+            '.post-title',
+            'h1'
+        ]
+        title = _first_matching_selector_text(soup, title_selectors, min_len=5) or ""
+        result['title'] = title[:200]
+
+        # Date: search patterns in page text
+        date_str = ""
+        all_text = soup.get_text(' ', strip=True)
+        posted_patterns = [
+            r'Posted by\s+[^\|]+\|\s*(\d{1,2}(?:st|nd|rd|th)?\s+\w+\s*,?\s*\d{4})',
+            r'Posted by\s+[^\d]*(\d{1,2}(?:st|nd|rd|th)?\s+\w+\s*,?\s*\d{4})',
+            r'(\d{1,2}(?:st|nd|rd|th)?\s+\w+\s*,?\s*\d{4})\s*\|\s*\d+\s*Comment',
+            r'(\d{1,2}(?:st|nd|rd|th)?\s+\w+\s*,?\s*\d{4})'
+        ]
+        for pattern in posted_patterns:
+            try:
+                m = re.search(pattern, all_text, re.IGNORECASE)
+            except re.error:
+                LOG.debug(f"[MySchool Extract] bad regex pattern '{pattern}'", exc_info=True)
+                m = None
+            if m:
+                date_str = m.group(1).strip()
+                LOG.debug(f"[MySchool Extract] Date found via regex: {date_str}")
+                break
+        result['date_str'] = date_str
+
+        # Safe parse date using provided parser (wrap errors)
+        result['date_obj'] = _safe_parse_date(parse_myschool_date, date_str)
+
+        # Content extraction
+        content_selectors = [
+            'div.clearfix',
+            'div.pb-5',
+            'article',
+            'div.entry-content',
+            'main',
+            '.content'
+        ]
+        content = ""
+        for selector in content_selectors:
+            try:
+                container = soup.select_one(selector)
+            except Exception:
+                container = None
+            if not container:
+                continue
+
+            # Work on a copy to avoid changing original soup
+            try:
+                container_copy = BeautifulSoup(str(container), 'lxml')
+            except Exception:
+                LOG.debug("[MySchool Extract] failed to copy container", exc_info=True)
+                container_copy = container
+
+            unwanted_selectors = [
+                'script', 'style', 'nav', 'header', 'footer',
+                '.share', '.comments', '.ad', '.widget', '.related', 'iframe',
+                '.sidebar', '.author-box', '.social-share', '.post-meta', '.newsletter',
+                '.event-date-thumb', '.caption-content-block'
+            ]
+            _remove_unwanted(container_copy, unwanted_selectors)
+
+            try:
+                text = _safe_get_text(container_copy)
+            except Exception:
+                text = ""
+            # Remove common "Posted by..." lines and extra whitespace
+            text = re.sub(r'Posted by\s+[^|]+\|[^|]+\|\s*\d+\s*Comments?', '', text, flags=re.I)
+            text = _clean_spaces(text)
+
             if len(text) > 200:
                 content = text
+                LOG.debug(f"[MySchool Extract] content length {len(content)} using selector '{selector}'")
                 break
-    
-    # If still no content, extract paragraphs
-    if not content or len(content) < 200:
-        paragraphs = []
-        for p in soup.select('p'):
-            p_text = p.get_text(strip=True)
-            # Skip short paragraphs and navigation text
-            if (len(p_text) > 50 and 
-                not re.match(r'^Posted by|^Comments|^Share|^Related|^Also read|^Read also|^Category|^Tags', p_text, re.I) and
-                not p_text.isdigit() and
-                '©' not in p_text and
-                'http' not in p_text.lower()):
-                paragraphs.append(p_text)
-        
-        if paragraphs:
-            content = ' '.join(paragraphs)
-    
-    # Create snippet
-    snippet = ""
-    if content:
-        # Clean content
-        content = re.sub(r'\s+', ' ', content)
-        
-        # Take first meaningful sentences
-        sentences = re.split(r'(?<=[.!?])\s+', content)
-        meaningful_sentences = []
-        
-        for sentence in sentences:
-            sentence = sentence.strip()
-            # Filter out short sentences and navigation text
-            if (len(sentence) > 30 and 
-                not re.match(r'^(Posted by|Comments|Share|Related|Also read|Read also|Category|Tags)', sentence, re.I) and
-                re.search(r'[A-Z]', sentence) and
-                '©' not in sentence and
-                'http' not in sentence.lower()):
-                
-                meaningful_sentences.append(sentence)
-                if len(' '.join(meaningful_sentences)) > 150:
-                    break
-        
-        if meaningful_sentences:
-            snippet = ' '.join(meaningful_sentences)
-            
-            # Truncate if needed
-            if len(snippet) > 250:
-                if '.' in snippet[:250]:
-                    last_period = snippet[:250].rfind('.')
-                    if last_period > 150:
-                        snippet = snippet[:last_period + 1]
+
+        # Fallback: paragraphs
+        if not content or len(content) < 200:
+            paragraphs = []
+            for p in soup.select('p'):
+                try:
+                    p_text = p.get_text(strip=True)
+                except Exception:
+                    p_text = ""
+                if (len(p_text) > 50 and
+                        not re.match(r'^Posted by|^Comments|^Share|^Related|^Also read|^Read also|^Category|^Tags', p_text, re.I) and
+                        not p_text.isdigit() and
+                        '©' not in p_text and
+                        'http' not in p_text.lower()):
+                    paragraphs.append(p_text)
+                    if len(paragraphs) >= 12:  # limit paragraphs processed
+                        break
+            if paragraphs:
+                content = ' '.join(paragraphs)
+                content = _clean_spaces(content)
+                LOG.debug(f"[MySchool Extract] fallback paragraphs used, length={len(content)}")
+
+        result['snippet'] = ""
+        if content:
+            sentences = re.split(r'(?<=[.!?])\s+', content)
+            meaningful_sentences = []
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if (len(sentence) > 30 and
+                        not re.match(r'^(Posted by|Comments|Share|Related|Also read|Read also|Category|Tags)', sentence, re.I) and
+                        re.search(r'[A-Z]', sentence) and
+                        '©' not in sentence and
+                        'http' not in sentence.lower()):
+                    meaningful_sentences.append(sentence)
+                    if len(' '.join(meaningful_sentences)) > 150:
+                        break
+
+            if meaningful_sentences:
+                snippet = ' '.join(meaningful_sentences)
+                if len(snippet) > 250:
+                    if '.' in snippet[:250]:
+                        last_period = snippet[:250].rfind('.')
+                        if last_period > 150:
+                            snippet = snippet[:last_period + 1]
+                        else:
+                            snippet = snippet[:247] + "..."
                     else:
                         snippet = snippet[:247] + "..."
-                else:
+            else:
+                snippet = content[:250]
+                if len(content) > 250:
                     snippet = snippet[:247] + "..."
-        else:
-            snippet = content[:250]
-            if len(content) > 250:
-                snippet = snippet[:247] + "..."
-    
-    # Clean snippet
-    if snippet:
-        snippet = re.sub(r'^\s*Comments?\s*', '', snippet, flags=re.I)
-        snippet = snippet.strip()
-    
-    # Check for school keywords
-    title_has_keywords = _SCHOOL_KEYWORDS_RE.search(title) if _SCHOOL_KEYWORDS_RE else True
-    snippet_has_keywords = _SCHOOL_KEYWORDS_RE.search(snippet) if _SCHOOL_KEYWORDS_RE else True
-    
-    # Check date recency
-    date_is_recent = is_recent_date(date_obj) if date_obj else False
-    
-    # Success criteria
-    success = bool(
-        title and 
-        len(snippet) > 50 and 
-        (title_has_keywords or snippet_has_keywords) and 
-        date_is_recent
-    )
-    
-    return {
-        'title': title[:200] if title else "",
-        'date_str': date_str,
-        'date_obj': date_obj,
-        'snippet': snippet,
+            result['snippet'] = _clean_spaces(snippet)
+
+        # Keyword checks (guard if _SCHOOL_KEYWORDS_RE is missing)
+        try:
+            title_has_keywords = _SCHOOL_KEYWORDS_RE.search(result['title']) if _SCHOOL_KEYWORDS_RE else True
+            snippet_has_keywords = _SCHOOL_KEYWORDS_RE.search(result['snippet']) if _SCHOOL_KEYWORDS_RE else True
+            result['has_keywords'] = bool(title_has_keywords or snippet_has_keywords)
+        except Exception:
+            LOG.debug("[MySchool Extract] keyword regex check failed", exc_info=True)
+            result['has_keywords'] = False
+
+        # Date recency check
+        try:
+            date_is_recent = is_recent_date(result['date_obj']) if result['date_obj'] else False
+        except Exception:
+            LOG.debug("[MySchool Extract] is_recent_date failed", exc_info=True)
+            date_is_recent = False
+
+        # Success criteria
+        success = bool(
+            result['title'] and
+            len(result['snippet'] or "") > 50 and
+            (result.get('has_keywords', False)) and
+            date_is_recent
+        )
+        result['success'] = success
+
+        LOG.info(f"[MySchool Extract] {url[:80]} success={success} title_len={len(result['title'])} snippet_len={len(result['snippet'])} date='{result['date_str']}'")
+    except Exception as exc:
+        LOG.exception(f"[MySchool Extract] failed for {url[:80]}: {exc}")
+        result['error'] = str(exc)
+    finally:
+        result['elapsed'] = time.perf_counter() - start
+        return result
+
+
+# ---------- Punch extractor ----------
+def extract_punch_content(html: str, url: str) -> Dict[str, Any]:
+    start = time.perf_counter()
+    result = {
+        'title': "",
+        'date_str': "",
+        'date_obj': None,
+        'snippet': "",
         'url': url,
-        'success': success,
-        'has_keywords': title_has_keywords or snippet_has_keywords
+        'success': False,
+        'has_keywords': False,
+        'error': None,
+        'elapsed': None
     }
 
-def extract_clean_content_v5(html: str, url: str, site_type: str = '') -> Dict[str, Any]:
-    """Main extraction function with site-specific handling and date filtering."""
-    if not html:
-        return {'success': False}
-    
-    # Use specialized extraction for MySchool
-    if site_type == 'myschool':
-        return extract_myschool_content(html, url)
-    
-    soup = BeautifulSoup(html, 'lxml')
-    title = ""
-    title_selectors = {
-        'nuc': ['h1.entry-title', 'h1', '.entry-title'],
-        'punch': ['h1.post-title', 'h1', '.post-title', '.entry-title']
-    }
-    selectors = title_selectors.get(site_type, ['h1', 'h2', 'h3', '.title', '.entry-title'])
-    for sel in selectors:
-        elem = soup.select_one(sel)
-        if elem:
-            title_text = elem.get_text(strip=True)
-            if title_text and len(title_text) > 10:
-                title = title_text
-                break
-    
-    date_str = ""
-    date_obj = None
-    
-    if site_type == 'punch':
-        date_elem = soup.select_one('span.post-date, p, time, .entry-date')
+    if not html or not isinstance(html, str):
+        result['error'] = "Empty or invalid HTML input"
+        LOG.warning(f"[Punch Extract] {url[:80]} - {result['error']}")
+        result['elapsed'] = time.perf_counter() - start
+        return result
+
+    try:
+        soup = BeautifulSoup(html, 'lxml')
+
+        title_selectors = [
+            'h1.post-title',
+            '.post-title',
+            'h1.entry-title',
+            'h1'
+        ]
+        title = _first_matching_selector_text(soup, title_selectors, min_len=10) or ""
+        result['title'] = title[:200]
+
+        # Date element
+        date_str = ""
+        date_elem = None
+        try:
+            date_elem = soup.select_one('span.post-date')
+        except Exception:
+            date_elem = None
         if date_elem:
-            date_str = date_elem.get_text(strip=True)
-            date_obj = parse_punch_date(date_str)
-    elif site_type == 'nuc':
-        date_elem = soup.select_one('span.published, time, .post-date')
-        if date_elem:
-            date_str = date_elem.get_text(strip=True)
-            date_obj = parse_nuc_date(date_str)
-    
-    content = ""
-    content_selectors = {
-        'nuc': ['div.entry-content', 'article .content', '.post-content'],
-        'punch': ['div.post-content', '.entry-content', '.article-content']
-    }
-    selectors = content_selectors.get(site_type, ['article', 'main', '.content'])
-    for sel in selectors:
-        elem = soup.select_one(sel)
-        if elem:
-            for bad in elem.select('script, style, nav, header, footer, .share, .comments, .ad, .widget, .related, iframe'):
-                bad.decompose()
-            content = elem.get_text(' ', strip=True)
-            if len(content) > 200:
+            date_str = _safe_get_text(date_elem)
+            result['date_obj'] = _safe_parse_date(parse_punch_date, date_str)
+            result['date_str'] = date_str
+
+        # Content extraction
+        content_selectors = [
+            'div.post-content',
+            '.entry-content',
+            'article',
+            'main'
+        ]
+        content = ""
+        for selector in content_selectors:
+            try:
+                container = soup.select_one(selector)
+            except Exception:
+                container = None
+            if not container:
+                continue
+
+            # remove unwanted bits
+            for bad in container.select('script, style, nav, header, footer, .share, .comments, .ad, .widget, .related, iframe'):
+                try:
+                    bad.decompose()
+                except Exception:
+                    LOG.debug("[Punch Extract] failed to decompose element", exc_info=True)
+
+            paragraphs = []
+            for p in container.select('p'):
+                try:
+                    p_text = p.get_text(strip=True)
+                except Exception:
+                    p_text = ""
+                if len(p_text) > 30:
+                    paragraphs.append(p_text)
+            if paragraphs:
+                content = ' '.join(paragraphs)
+                content = _clean_spaces(content)
+                LOG.debug(f"[Punch Extract] content length {len(content)} using selector '{selector}'")
                 break
-    
-    if content:
-        if title and content.lower().startswith(title.lower()):
-            content = content[len(title):].strip()
-        
-        if site_type == 'punch':
+
+        # Create snippet
+        snippet = ""
+        if content:
             content = re.sub(r'Kindly share this story.*?(?=[A-Z])', '', content, flags=re.I | re.DOTALL)
-        
-        content = re.sub(r'\s+', ' ', content).strip()
-    
-    snippet = ""
-    if content:
-        paragraphs = re.split(r'\.\s+', content)
-        meaningful_paragraphs = []
-        
-        for para in paragraphs:
-            para = para.strip()
-            if len(para) > 30:
-                meaningful_paragraphs.append(para)
-                if len(' '.join(meaningful_paragraphs)) > 100:
-                    break
-        
-        if meaningful_paragraphs:
-            snippet = ' '.join(meaningful_paragraphs)
-            
-            if len(snippet) > 250:
-                if '.' in snippet[:250]:
-                    last_period = snippet[:250].rfind('.')
-                    if last_period > 150:
-                        snippet = snippet[:last_period + 1]
+            content = _clean_spaces(content)
+
+            sentences = re.split(r'(?<=[.!?])\s+', content)
+            meaningful_sentences = []
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if len(sentence) > 30 and re.search(r'[A-Z]', sentence):
+                    meaningful_sentences.append(sentence)
+                    if len(' '.join(meaningful_sentences)) > 150:
+                        break
+
+            if meaningful_sentences:
+                snippet = ' '.join(meaningful_sentences)
+                if len(snippet) > 250:
+                    if '.' in snippet[:250]:
+                        last_period = snippet[:250].rfind('.')
+                        if last_period > 150:
+                            snippet = snippet[:last_period + 1]
+                        else:
+                            snippet = snippet[:247] + "..."
                     else:
                         snippet = snippet[:247] + "..."
-                else:
+            else:
+                snippet = content[:250]
+                if len(content) > 250:
                     snippet = snippet[:247] + "..."
-        else:
-            snippet = content[:250]
-            if len(content) > 250:
-                snippet = snippet[:247] + "..."
-    
-    # Check for school keywords
-    title_has_keywords = _SCHOOL_KEYWORDS_RE.search(title) if _SCHOOL_KEYWORDS_RE else True
-    snippet_has_keywords = _SCHOOL_KEYWORDS_RE.search(snippet) if _SCHOOL_KEYWORDS_RE else True
-    
-    # FIXED: Check date recency - timedelta is imported at the top
-    date_is_recent = is_recent_date(date_obj) if date_obj else False
-    
-    success = bool(title and date_obj and len(snippet) > 50 and 
-                  (title_has_keywords or snippet_has_keywords) and 
-                  date_is_recent)
-    
-    return {
-        'title': title[:200],
-        'date_str': date_str,
-        'date_obj': date_obj,
-        'snippet': snippet,
+            result['snippet'] = _clean_spaces(snippet)
+
+        # Keywords and recency checks
+        try:
+            title_has_keywords = _SCHOOL_KEYWORDS_RE.search(result['title']) if _SCHOOL_KEYWORDS_RE else True
+            snippet_has_keywords = _SCHOOL_KEYWORDS_RE.search(result['snippet']) if _SCHOOL_KEYWORDS_RE else True
+            result['has_keywords'] = bool(title_has_keywords or snippet_has_keywords)
+        except Exception:
+            LOG.debug("[Punch Extract] keyword regex check failed", exc_info=True)
+            result['has_keywords'] = False
+
+        try:
+            date_is_recent = is_recent_date(result['date_obj']) if result['date_obj'] else False
+        except Exception:
+            LOG.debug("[Punch Extract] is_recent_date failed", exc_info=True)
+            date_is_recent = False
+
+        success = bool(
+            result['title'] and
+            len(result['snippet'] or "") > 50 and
+            (result.get('has_keywords', False)) and
+            date_is_recent
+        )
+        result['success'] = success
+
+        LOG.info(f"[Punch Extract] {url[:80]} success={success} title_len={len(result['title'])} snippet_len={len(result['snippet'])} date='{result['date_str']}'")
+    except Exception as exc:
+        LOG.exception(f"[Punch Extract] failed for {url[:80]}: {exc}")
+        result['error'] = str(exc)
+    finally:
+        result['elapsed'] = time.perf_counter() - start
+        return result
+
+
+# ---------- NUC extractor ----------
+def extract_nuc_content(html: str, url: str) -> Dict[str, Any]:
+    start = time.perf_counter()
+    result = {
+        'title': "",
+        'date_str': "",
+        'date_obj': None,
+        'snippet': "",
         'url': url,
-        'success': success,
-        'has_keywords': title_has_keywords or snippet_has_keywords
+        'success': False,
+        'has_keywords': False,
+        'error': None,
+        'elapsed': None
     }
 
-# ═══════════════════════════════════════════════════════════════════════════
-# SITE-SPECIFIC ARTICLE DATE FILTHERING
-# ═══════════════════════════════════════════════════════════════════════════
+    if not html or not isinstance(html, str):
+        result['error'] = "Empty or invalid HTML input"
+        LOG.warning(f"[NUC Extract] {url[:80]} - {result['error']}")
+        result['elapsed'] = time.perf_counter() - start
+        return result
+
+    try:
+        soup = BeautifulSoup(html, 'lxml')
+
+        title_selectors = [
+            'h1.entry-title',
+            '.entry-title',
+            'h1'
+        ]
+        title = _first_matching_selector_text(soup, title_selectors, min_len=10) or ""
+        result['title'] = title[:200]
+
+        date_elem = None
+        try:
+            date_elem = soup.select_one('span.published')
+            if not date_elem:
+                date_elem = soup.select_one('.post-date, time')
+        except Exception:
+            date_elem = None
+
+        if date_elem:
+            date_str = _safe_get_text(date_elem)
+            result['date_str'] = date_str
+            result['date_obj'] = _safe_parse_date(parse_nuc_date, date_str)
+
+        content_selectors = [
+            'div.entry-content',
+            'article .content',
+            '.post-content',
+            'article'
+        ]
+        content = ""
+        for selector in content_selectors:
+            try:
+                container = soup.select_one(selector)
+            except Exception:
+                container = None
+            if not container:
+                continue
+
+            for bad in container.select('script, style, nav, header, footer, .share, .comments, .ad, .widget, .related, iframe'):
+                try:
+                    bad.decompose()
+                except Exception:
+                    LOG.debug("[NUC Extract] failed to decompose element", exc_info=True)
+
+            text = _safe_get_text(container)
+            if title and text.lower().startswith(title.lower()):
+                text = text[len(title):].strip()
+            text = _clean_spaces(text)
+
+            if len(text) > 200:
+                content = text
+                LOG.debug(f"[NUC Extract] content length {len(content)} using selector '{selector}'")
+                break
+
+        snippet = ""
+        if content:
+            sentences = re.split(r'(?<=[.!?])\s+', content)
+            meaningful_sentences = []
+            for sentence in sentences:
+                sentence = sentence.strip()
+                if len(sentence) > 30 and re.search(r'[A-Z]', sentence):
+                    meaningful_sentences.append(sentence)
+                    if len(' '.join(meaningful_sentences)) > 150:
+                        break
+
+            if meaningful_sentences:
+                snippet = ' '.join(meaningful_sentences)
+                if len(snippet) > 250:
+                    if '.' in snippet[:250]:
+                        last_period = snippet[:250].rfind('.')
+                        if last_period > 150:
+                            snippet = snippet[:last_period + 1]
+                        else:
+                            snippet = snippet[:247] + "..."
+                    else:
+                        snippet = snippet[:247] + "..."
+            else:
+                snippet = content[:250]
+                if len(content) > 250:
+                    snippet = snippet[:247] + "..."
+            result['snippet'] = _clean_spaces(snippet)
+
+        try:
+            title_has_keywords = _SCHOOL_KEYWORDS_RE.search(result['title']) if _SCHOOL_KEYWORDS_RE else True
+            snippet_has_keywords = _SCHOOL_KEYWORDS_RE.search(result['snippet']) if _SCHOOL_KEYWORDS_RE else True
+            result['has_keywords'] = bool(title_has_keywords or snippet_has_keywords)
+        except Exception:
+            LOG.debug("[NUC Extract] keyword regex check failed", exc_info=True)
+            result['has_keywords'] = False
+
+        try:
+            date_is_recent = is_recent_date(result['date_obj']) if result['date_obj'] else False
+        except Exception:
+            LOG.debug("[NUC Extract] is_recent_date failed", exc_info=True)
+            date_is_recent = False
+
+        success = bool(
+            result['title'] and
+            len(result['snippet'] or "") > 50 and
+            (result.get('has_keywords', False)) and
+            date_is_recent
+        )
+        result['success'] = success
+
+        LOG.info(f"[NUC Extract] {url[:80]} success={success} title_len={len(result['title'])} snippet_len={len(result['snippet'])} date='{result['date_str']}'")
+    except Exception as exc:
+        LOG.exception(f"[NUC Extract] failed for {url[:80]}: {exc}")
+        result['error'] = str(exc)
+    finally:
+        result['elapsed'] = time.perf_counter() - start
+        return result
+
+
+# ---------- Generic wrapper ----------
+def extract_clean_content_v5(html: str, url: str, site_type: str = '') -> Dict[str, Any]:
+    start = time.perf_counter()
+    if not html or not isinstance(html, str):
+        return {'success': False, 'error': 'Empty or invalid HTML', 'elapsed': time.perf_counter() - start, 'url': url}
+
+    try:
+        if site_type == 'myschool':
+            return extract_myschool_content(html, url)
+        elif site_type == 'punch':
+            return extract_punch_content(html, url)
+        elif site_type == 'nuc':
+            return extract_nuc_content(html, url)
+
+        LOG.warning(f"[Extract] No specific extractor for site_type='{site_type}', using generic fallback for {url[:80]}")
+
+        soup = BeautifulSoup(html, 'lxml')
+        title = _first_matching_selector_text(soup, ['h1'], min_len=1) or ""
+        content_elem = soup.select_one('article, main, .content, .entry-content')
+        content = _safe_get_text(content_elem) if content_elem else ""
+        snippet = content[:250] if len(content) > 250 else content
+
+        return {
+            'title': title[:200],
+            'date_str': "",
+            'date_obj': None,
+            'snippet': _clean_spaces(snippet),
+            'url': url,
+            'success': bool(title and len(snippet) > 50),
+            'has_keywords': True,
+            'elapsed': time.perf_counter() - start
+        }
+    except Exception as exc:
+        LOG.exception(f"[Extract] generic extractor failed for {url[:80]}: {exc}")
+        return {'success': False, 'error': str(exc), 'elapsed': time.perf_counter() - start, 'url': url}
 # ═══════════════════════════════════════════════════════════════════════════
 # SITE-SPECIFIC SCRAPERS (WITH ENHANCED LOGGING)
 # ═══════════════════════════════════════════════════════════════════════════
-
 async def scrape_myschool_recent(base_url: str = "https://myschool.ng", max_articles: int = 10) -> List[Dict]:
     """Scrape MySchool recent articles - ENHANCED LOGGING"""
     LOG.info(f"\n{'='*70}")
@@ -3111,7 +3369,7 @@ async def scrape_myschool_recent(base_url: str = "https://myschool.ng", max_arti
         LOG.info(f"[MySchool Scraper] STEP 2: Fetching HTML for {len(article_urls[:25])} articles...")
         
         html_results = await shared_playwright.run_concurrent(
-            article_urls[:25],
+            article_urls[:10],
             use_http_first=True,
             allow_playwright=True,
             fetch_kwargs={
@@ -3181,7 +3439,6 @@ async def scrape_myschool_recent(base_url: str = "https://myschool.ng", max_arti
         import traceback
         LOG.error(f"[MySchool Scraper] Full traceback:\n{traceback.format_exc()}")
         return []
-
 
 async def scrape_punch_recent(base_url: str = "https://punchng.com", max_articles: int = 10) -> List[Dict]:
     """Scrape Punch recent articles - ENHANCED LOGGING"""
