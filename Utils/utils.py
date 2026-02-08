@@ -3637,16 +3637,16 @@ async def scrape_school_news(
     # ═══════════════════════════════════════════════════════════════════════
     # 🧪 EMERGENCY DIAGNOSTIC TEST
     # ═══════════════════════════════════════════════════════════════════════
-    LOG.info("\n" + "="*70)
-    LOG.info("🧪 EMERGENCY DIAGNOSTIC: Testing listing extraction directly")
-    LOG.info("="*70)
+    #LOG.info("\n" + "="*70)
+    #LOG.info("🧪 EMERGENCY DIAGNOSTIC: Testing listing extraction directly")
+    #LOG.info("="*70)
     
-    try:
-        LOG.info("🧪 Testing MySchool listing extraction...")
-        test_myschool_urls = await get_myschool_recent_articles()
-        LOG.info(f"🧪 MySchool RESULT: {len(test_myschool_urls)} URLs")
-        if test_myschool_urls:
-            LOG.info(f"🧪 Sample: {test_myschool_urls[0]}")
+    #try:
+        #LOG.info("🧪 Testing MySchool listing extraction...")
+        #test_myschool_urls = await get_myschool_recent_articles()
+        #LOG.info(f"🧪 MySchool RESULT: {len(test_myschool_urls)} URLs")
+        #if test_myschool_urls:
+            #LOG.info(f"🧪 Sample: {test_myschool_urls[0]}")
         
         #LOG.info("🧪 Testing Punch listing extraction...")
         #test_punch_urls = await get_punch_recent_articles()
@@ -3656,12 +3656,12 @@ async def scrape_school_news(
         #test_nuc_urls = await get_nuc_recent_articles()
         #LOG.info(f"🧪 NUC RESULT: {len(test_nuc_urls)} URLs")
         
-        LOG.info("🧪 DIAGNOSTIC COMPLETE ✅")
+        #LOG.info("🧪 DIAGNOSTIC COMPLETE ✅")
         
-    except Exception as diag_e:
-        LOG.exception(f"🧪 DIAGNOSTIC FAILED: {diag_e}")
+    #except Exception as diag_e:
+        #LOG.exception(f"🧪 DIAGNOSTIC FAILED: {diag_e}")
         import traceback
-        LOG.error(f"🧪 Diagnostic traceback:\n{traceback.format_exc()}")
+        #LOG.error(f"🧪 Diagnostic traceback:\n{traceback.format_exc()}")
     
     LOG.info("="*70 + "\n")
     # ═══════════════════════════════════════════════════════════════════════
