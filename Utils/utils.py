@@ -287,45 +287,6 @@ if _cloudscraper_spec is not None:
 else:
     cloudscraper = None
 
-import asyncio
-import logging
-import random
-import time
-from collections import deque
-from typing import Any, Dict, List, Optional, Tuple, Iterable
-
-from playwright.async_api import Browser, BrowserContext, Page, Playwright, async_playwright
-from playwright.async_api import TimeoutError as PlaywrightTimeoutError
-
-try:
-    import cloudscraper
-except ImportError:
-    cloudscraper = None
-
-import aiohttp
-
-# User agents (from the code)
-_USER_AGENTS = [
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/128.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/16.0 Safari/605.1.15",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:116.0) Gecko/20100101 Firefox/116.0",
-    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; WOW64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36 Vivaldi/7.0",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/121.0.0.0 Safari/537.36 Edg/121.0.0.0",
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/144.0.0.0 Safari/537.36",
-    "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:122.0) Gecko/20100101 Firefox/122.0",
-    "Mozilla/5.0 (iPhone; CPU iPhone OS 17_2 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.2 Mobile/15E148 Safari/604.1",
-    "Mozilla/5.0 (Linux; Android 14; Pixel 8) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-]
-
-LOG = logging.getLogger(__name__)
-LOG.setLevel(logging.DEBUG)
-handler = logging.StreamHandler()
-formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-handler.setFormatter(formatter)
-LOG.addHandler(handler)
-
 class SharedPlaywrightManager:
     """
     Playwright manager with:
@@ -334,6 +295,7 @@ class SharedPlaywrightManager:
     - Page pool (max_open_pages) for reusing pages
     - Browser recycling after max pages created
     - Synchronous recycle (await) to avoid overlapping browser instances
+    - COMPREHENSIVE DIAGNOSTIC LOGGING
     """
     _instance = None
     _lock = asyncio.Lock()
@@ -359,8 +321,8 @@ class SharedPlaywrightManager:
         "user_agent_list": _USER_AGENTS,
         # Concurrency & pooling - updated for Render free plan (lower limits)
         "max_concurrency": 1,          # Reduced to 1 to minimize instances
-        "max_open_pages": 1,           # Reduced pool size
-        "max_pages_before_reset": 1,   # More frequent reset to reclaim memory
+        "max_open_pages": 4,           # Reduced pool size
+        "max_pages_before_reset": 5,   # More frequent reset to reclaim memory
     }
 
     def __new__(cls):
@@ -373,10 +335,14 @@ class SharedPlaywrightManager:
         """Initialize Playwright, browser and context, and the page pool."""
         async with self._lock:
             if self._initialized:
+                LOG.info("[INIT] Already initialized, skipping")
                 return
 
             self._cfg = dict(self.DEFAULTS)
             self._cfg.update(kwargs)
+
+            LOG.info("[INIT] 🚀 Starting initialization...")
+            LOG.info(f"[INIT] Config: {self._cfg}")
 
             # runtime fields
             self.playwright: Optional[Playwright] = None
@@ -385,6 +351,7 @@ class SharedPlaywrightManager:
 
             # concurrency controls
             self._sem: asyncio.Semaphore = asyncio.Semaphore(self._cfg["max_concurrency"])
+            LOG.info(f"[INIT] 🔒 Semaphore created with max_concurrency={self._cfg['max_concurrency']}")
 
             # page pool and counters
             self._page_pool: deque = deque()  # stores Page objects ready to reuse
@@ -392,15 +359,21 @@ class SharedPlaywrightManager:
             self._pages_created = 0           # total pages created since last recycle
 
             try:
-                LOG.info("Initializing shared Playwright...")
+                LOG.info("[INIT] 🎭 Starting Playwright...")
                 self.playwright = await async_playwright().start()
+                LOG.info("[INIT] ✅ Playwright started")
+
+                LOG.info("[INIT] 🌐 Launching browser...")
                 self.browser = await self.playwright.chromium.launch(
                     headless=self._cfg["headless"],
                     args=self._cfg["args"],
                     timeout=60000
                 )
+                LOG.info(f"[INIT] ✅ Browser launched (headless={self._cfg['headless']})")
 
                 ua = random.choice(self._cfg["user_agent_list"]) if self._cfg["user_agent_list"] else None
+                LOG.info(f"[INIT] 🔧 Creating context with UA: {ua[:50] if ua else 'default'}...")
+                
                 self.context = await self.browser.new_context(
                     user_agent=ua,
                     viewport=self._cfg["viewport"],
@@ -414,12 +387,19 @@ class SharedPlaywrightManager:
                 # timeouts applied to context
                 self.context.set_default_timeout(self._cfg["default_timeout"])
                 self.context.set_default_navigation_timeout(self._cfg["default_timeout"])
+                LOG.info(f"[INIT] ⏱️  Default timeout set to {self._cfg['default_timeout']}ms")
 
                 self._initialized = True
-                LOG.info("✅ Shared Playwright manager initialized (max_concurrency=%s max_open_pages=%s)",
-                         self._cfg["max_concurrency"], self._cfg["max_open_pages"])
+                LOG.info("[INIT] ✅ Shared Playwright manager initialized successfully")
+                LOG.info(f"[INIT]   max_concurrency: {self._cfg['max_concurrency']}")
+                LOG.info(f"[INIT]   max_open_pages: {self._cfg['max_open_pages']}")
+                LOG.info(f"[INIT]   max_pages_before_reset: {self._cfg['max_pages_before_reset']}")
+                
             except Exception as e:
-                LOG.error("Failed to initialize Playwright: %s", e)
+                LOG.error(f"[INIT] ❌ Failed to initialize Playwright: {e}")
+                import traceback
+                LOG.error(f"[INIT] Traceback:\n{traceback.format_exc()}")
+                
                 # best-effort teardown
                 try:
                     if getattr(self, "context", None):
@@ -428,13 +408,16 @@ class SharedPlaywrightManager:
                         await self.browser.close()
                     if getattr(self, "playwright", None):
                         await self.playwright.stop()
-                except Exception:
-                    pass
+                except Exception as cleanup_e:
+                    LOG.error(f"[INIT] ⚠️ Cleanup error: {cleanup_e}")
                 raise
 
     async def clear_site_data(self, domain: str = None):
         """Clear cookies and storage for a specific domain or all domains."""
+        LOG.info(f"[CLEAR_DATA] 🍪 Clearing data for domain: {domain or 'all'}")
+        
         if not self._initialized or not self.context:
+            LOG.warning("[CLEAR_DATA] ⚠️ Not initialized, skipping")
             return
         
         try:
@@ -444,25 +427,34 @@ class SharedPlaywrightManager:
                 domain_cookies = [c for c in cookies if domain in c.get('domain', '')]
                 if domain_cookies:
                     await self.context.clear_cookies(domain_cookies)
-                    LOG.debug(f"Cleared {len(domain_cookies)} cookies for {domain}")
+                    LOG.info(f"[CLEAR_DATA] ✅ Cleared {len(domain_cookies)} cookies for {domain}")
+                else:
+                    LOG.info(f"[CLEAR_DATA] ℹ️  No cookies found for {domain}")
             else:
                 # Clear all cookies
                 await self.context.clear_cookies()
-                LOG.debug("Cleared all cookies")
+                LOG.info("[CLEAR_DATA] ✅ Cleared all cookies")
                 
             # Clear page pool storage too
+            cleared_count = 0
             for page in list(self._page_pool):
                 try:
                     if not page.is_closed():
                         await page.evaluate("() => { try { localStorage.clear(); sessionStorage.clear(); } catch(e) {} }")
-                except:
-                    pass
+                        cleared_count += 1
+                except Exception as e:
+                    LOG.debug(f"[CLEAR_DATA] Failed to clear storage for pooled page: {e}")
+            
+            if cleared_count:
+                LOG.info(f"[CLEAR_DATA] ✅ Cleared storage for {cleared_count} pooled pages")
                     
         except Exception as e:
-            LOG.debug(f"Failed to clear site data: {e}")
+            LOG.warning(f"[CLEAR_DATA] ⚠️ Failed to clear site data: {e}")
 
     async def _setup_page(self, page: Page) -> None:
         """Apply anti-detection scripts & resource blocking to a freshly-created page."""
+        LOG.debug("[SETUP_PAGE] 🔧 Setting up new page...")
+        
         try:
             # init script to reduce webdriver fingerprinting
             await page.add_init_script(
@@ -474,8 +466,9 @@ class SharedPlaywrightManager:
                 try { Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 4 }); } catch(e){}
                 """
             )
-        except Exception:
-            LOG.debug("Failed to add init script for page (may still be fine)")
+            LOG.debug("[SETUP_PAGE] ✅ Init script added")
+        except Exception as e:
+            LOG.warning(f"[SETUP_PAGE] ⚠️ Failed to add init script: {e}")
 
         # Block heavy resources to reduce memory/network
         async def _abort(route):
@@ -500,91 +493,148 @@ class SharedPlaywrightManager:
             "**/*.mp4",
             "**/*.webm"
         ]
+        
+        blocked_count = 0
         for p in patterns:
             try:
                 await page.route(p, _abort)
-            except Exception:
-                LOG.debug("route setup failed for pattern: %s", p)
+                blocked_count += 1
+            except Exception as e:
+                LOG.debug(f"[SETUP_PAGE] Route setup failed for {p}: {e}")
+        
+        LOG.debug(f"[SETUP_PAGE] ✅ Set up {blocked_count} resource blocking patterns")
 
     async def get_page(self, url: str = "", wait_for_slot: bool = True) -> Optional[Page]:
         """
         Acquire a page from the pool (reuse) or create a new one if under max_open_pages.
         """
+        LOG.info(f"[GET_PAGE] 📄 Acquiring page for {url[:60] if url else 'general'}...")
+        LOG.info(f"[GET_PAGE]   Pool state: pool_size={len(self._page_pool)}, open_pages={self._open_pages}, pages_created={self._pages_created}")
+        
         if not self._initialized:
+            LOG.warning("[GET_PAGE] ⚠️ Not initialized, calling initialize()...")
             await self.initialize()
 
         if self._pages_created >= self._cfg["max_pages_before_reset"]:
-            LOG.warning("♻️ max_pages_before_reset reached. Recycling browser.")
+            LOG.warning(f"[GET_PAGE] ♻️ max_pages_before_reset ({self._cfg['max_pages_before_reset']}) reached. Recycling browser.")
             await self._recycle_browser()
 
         page = None
+        
+        # Try to reuse from pool
         if self._page_pool:
             page = self._page_pool.popleft()
-            LOG.debug("Reusing page from pool (pool size now %d)", len(self._page_pool))
+            LOG.info(f"[GET_PAGE] ♻️  Reused page from pool (pool size now {len(self._page_pool)})")
             return page
 
+        # Create new page if under limit
         if self._open_pages < self._cfg["max_open_pages"]:
-            page = await self.context.new_page()
-            await self._setup_page(page)
-            self._open_pages += 1
-            self._pages_created += 1
-            LOG.debug("Created new page (open_pages=%d pages_created=%d)", self._open_pages, self._pages_created)
-            return page
+            LOG.info(f"[GET_PAGE] 🆕 Creating new page ({self._open_pages + 1}/{self._cfg['max_open_pages']})...")
+            try:
+                page = await self.context.new_page()
+                await self._setup_page(page)
+                self._open_pages += 1
+                self._pages_created += 1
+                LOG.info(f"[GET_PAGE] ✅ Created new page (open_pages={self._open_pages}, pages_created={self._pages_created})")
+                return page
+            except Exception as e:
+                LOG.error(f"[GET_PAGE] ❌ Failed to create new page: {e}")
+                import traceback
+                LOG.error(f"[GET_PAGE] Traceback:\n{traceback.format_exc()}")
+                return None
 
+        # Wait for slot if requested
         if not wait_for_slot:
+            LOG.warning(f"[GET_PAGE] ⚠️ max_open_pages reached and wait_for_slot=False, returning None")
             return None
 
-        LOG.warning("max_open_pages reached. Waiting for free slot...")
+        LOG.warning(f"[GET_PAGE] ⏳ max_open_pages ({self._cfg['max_open_pages']}) reached. Waiting for free slot...")
+        wait_iterations = 0
         while self._open_pages >= self._cfg["max_open_pages"]:
+            wait_iterations += 1
+            if wait_iterations % 10 == 0:
+                LOG.warning(f"[GET_PAGE]   Still waiting... ({wait_iterations * 0.2:.1f}s elapsed)")
             await asyncio.sleep(0.2)
+            
             if self._page_pool:
                 page = self._page_pool.popleft()
-                LOG.debug("Reusing page after wait")
+                LOG.info(f"[GET_PAGE] ♻️  Got page from pool after waiting {wait_iterations * 0.2:.1f}s")
                 return page
 
+        # Try to create after waiting
         if self._open_pages < self._cfg["max_open_pages"]:
-            page = await self.context.new_page()
-            await self._setup_page(page)
-            self._open_pages += 1
-            self._pages_created += 1
-            LOG.debug("Created new page after wait")
-            return page
+            LOG.info(f"[GET_PAGE] 🆕 Creating new page after wait...")
+            try:
+                page = await self.context.new_page()
+                await self._setup_page(page)
+                self._open_pages += 1
+                self._pages_created += 1
+                LOG.info(f"[GET_PAGE] ✅ Created new page after wait")
+                return page
+            except Exception as e:
+                LOG.error(f"[GET_PAGE] ❌ Failed to create page after wait: {e}")
+                return None
 
+        LOG.error("[GET_PAGE] ❌ Failed to acquire page after waiting")
         return None
 
     async def release_page(self, page: Page) -> None:
+        """Release a page back to the pool or close it."""
         if not page:
+            LOG.debug("[RELEASE_PAGE] ℹ️  page=None, nothing to release")
             return
 
+        LOG.info("[RELEASE_PAGE] 🔄 Releasing page...")
+        
         try:
             if page.is_closed():
+                LOG.info("[RELEASE_PAGE] ℹ️  Page already closed, decrementing counter")
                 self._open_pages = max(0, self._open_pages - 1)
                 return
-        except Exception:
-            pass
+        except Exception as e:
+            LOG.warning(f"[RELEASE_PAGE] ⚠️ Cannot check if page is closed: {e}")
 
+        # Close if we're in recycle window
         if self._pages_created >= self._cfg["max_pages_before_reset"]:
-            await page.close()
-            self._open_pages = max(0, self._open_pages - 1)
-            LOG.debug("Closed page during recycle window")
+            LOG.info("[RELEASE_PAGE] ♻️  In recycle window, closing page instead of pooling")
+            try:
+                await page.close()
+                self._open_pages = max(0, self._open_pages - 1)
+                LOG.info("[RELEASE_PAGE] ✅ Page closed")
+            except Exception as e:
+                LOG.warning(f"[RELEASE_PAGE] ⚠️ Error closing page: {e}")
             return
 
+        # Return to pool if under capacity
         pool_capacity = self._cfg["max_open_pages"]
         if len(self._page_pool) < pool_capacity:
             try:
                 await page.evaluate("() => { window.stop && window.stop(); }")
                 self._page_pool.append(page)
-                LOG.debug("Returned page to pool")
-            except Exception:
+                LOG.info(f"[RELEASE_PAGE] ✅ Page returned to pool (pool_size={len(self._page_pool)})")
+            except Exception as e:
+                LOG.warning(f"[RELEASE_PAGE] ⚠️ Failed to stop page, closing instead: {e}")
+                try:
+                    await page.close()
+                    self._open_pages = max(0, self._open_pages - 1)
+                except Exception:
+                    pass
+        else:
+            LOG.info("[RELEASE_PAGE] 📦 Pool at capacity, closing page")
+            try:
                 await page.close()
                 self._open_pages = max(0, self._open_pages - 1)
-        else:
-            await page.close()
-            self._open_pages = max(0, self._open_pages - 1)
+                LOG.info("[RELEASE_PAGE] ✅ Page closed")
+            except Exception as e:
+                LOG.warning(f"[RELEASE_PAGE] ⚠️ Error closing page: {e}")
 
     async def _cloudscraper_fetch(self, url: str, timeout: int = 20) -> str:
+        """Fetch using cloudscraper (runs in executor)."""
         if cloudscraper is None:
+            LOG.debug("[CLOUDSCRAPER] ℹ️  Module not available")
             return ""
+        
+        LOG.debug(f"[CLOUDSCRAPER] 📡 Fetching {url[:60]}...")
         try:
             loop = asyncio.get_running_loop()
             def _sync_get():
@@ -593,20 +643,31 @@ class SharedPlaywrightManager:
                 if r.status_code == 200:
                     return r.text
                 return ""
-            return await loop.run_in_executor(None, _sync_get)
+            result = await loop.run_in_executor(None, _sync_get)
+            if result:
+                LOG.debug(f"[CLOUDSCRAPER] ✅ Success: {len(result)} bytes")
+            else:
+                LOG.debug("[CLOUDSCRAPER] ⚠️ Empty result")
+            return result
         except Exception as e:
-            LOG.debug("cloudscraper fetch failed: %s", e)
+            LOG.debug(f"[CLOUDSCRAPER] ❌ Failed: {e}")
             return ""
 
     async def _aiohttp_fetch(self, url: str, timeout: int = 20) -> str:
+        """Fetch using aiohttp."""
+        LOG.debug(f"[AIOHTTP] 📡 Fetching {url[:60]}...")
         headers = {"User-Agent": "Mozilla/5.0 (compatible; aiohttp)"}
         try:
             async with aiohttp.ClientSession(headers=headers) as session:
                 async with session.get(url, timeout=timeout) as resp:
                     if resp.status == 200:
-                        return await resp.text()
+                        result = await resp.text()
+                        LOG.debug(f"[AIOHTTP] ✅ Success: {len(result)} bytes")
+                        return result
+                    else:
+                        LOG.debug(f"[AIOHTTP] ⚠️ Status {resp.status}")
         except Exception as e:
-            LOG.debug("aiohttp fetch failed: %s", e)
+            LOG.debug(f"[AIOHTTP] ❌ Failed: {e}")
         return ""
 
     async def smart_fetch(
@@ -622,41 +683,79 @@ class SharedPlaywrightManager:
         partial_on_timeout: bool = True,
         min_http_length: int = 800
     ) -> str:
+        """Smart fetch with HTTP-first strategy and comprehensive logging."""
+        from urllib.parse import urlparse
+        
+        # ============================================================
+        # DIAGNOSTIC: Entry & strategy
+        # ============================================================
         parsed = urlparse(url)
         hostname = (parsed.hostname or "").lower()
+        
+        LOG.info(f"[SMART_FETCH] 🎯 ENTRY for {url[:60]}")
+        LOG.info(f"[SMART_FETCH]   Hostname: {hostname}")
+        LOG.info(f"[SMART_FETCH]   prefer_http: {prefer_http}")
+        LOG.info(f"[SMART_FETCH]   allow_playwright: {allow_playwright}")
 
-        # Clear cookies for MySchool before fetching to prevent blocking
+        # Clear cookies for MySchool
         if "myschool.ng" in hostname:
+            LOG.info(f"[SMART_FETCH] 🍪 Clearing cookies for myschool.ng...")
             await self.clear_site_data("myschool.ng")
+            LOG.info(f"[SMART_FETCH] ✅ Cookies cleared")
 
+        # Direct to Playwright for MySchool
         if not prefer_http or ("myschool.ng" in hostname):
-            return await self.fetch_html(
+            LOG.info(f"[SMART_FETCH] 🎭 Using Playwright directly (MySchool or prefer_http=False)")
+            result = await self.fetch_html(
                 url,
                 wait_for_selector=wait_for_selector,
                 scroll_to_load=scroll_to_load,
                 timeout=play_timeout,
                 partial_on_timeout=partial_on_timeout
             )
+            LOG.info(f"[SMART_FETCH] ✅ Playwright returned {len(result)} bytes")
+            return result
 
+        # Try cloudscraper first
+        LOG.info(f"[SMART_FETCH] ☁️  Trying cloudscraper first...")
         html = ""
         if cloudscraper is not None:
-            html = await self._cloudscraper_fetch(url, http_timeout)
+            try:
+                html = await self._cloudscraper_fetch(url, http_timeout)
+                if html and len(html) >= min_http_length:
+                    LOG.info(f"[SMART_FETCH] ✅ Cloudscraper success: {len(html)} bytes")
+                    return html
+                else:
+                    LOG.info(f"[SMART_FETCH] ⚠️ Cloudscraper returned {len(html)} bytes (< {min_http_length})")
+            except Exception as e:
+                LOG.warning(f"[SMART_FETCH] ❌ Cloudscraper failed: {e}")
+
+        # Try aiohttp
+        LOG.info(f"[SMART_FETCH] 🌐 Trying aiohttp...")
+        try:
+            html = await self._aiohttp_fetch(url, http_timeout)
             if html and len(html) >= min_http_length:
+                LOG.info(f"[SMART_FETCH] ✅ Aiohttp success: {len(html)} bytes")
                 return html
+            else:
+                LOG.info(f"[SMART_FETCH] ⚠️ Aiohttp returned {len(html)} bytes (< {min_http_length})")
+        except Exception as e:
+            LOG.warning(f"[SMART_FETCH] ❌ Aiohttp failed: {e}")
 
-        html = await self._aiohttp_fetch(url, http_timeout)
-        if html and len(html) >= min_http_length:
-            return html
-
+        # Fallback to Playwright
         if allow_playwright:
-            return await self.fetch_html(
+            LOG.info(f"[SMART_FETCH] 🎭 Falling back to Playwright...")
+            result = await self.fetch_html(
                 url,
                 wait_for_selector=wait_for_selector,
                 scroll_to_load=scroll_to_load,
                 timeout=play_timeout,
                 partial_on_timeout=partial_on_timeout
             )
+            LOG.info(f"[SMART_FETCH] ✅ Playwright fallback returned {len(result)} bytes")
+            return result
 
+        LOG.error(f"[SMART_FETCH] 💀 All methods failed for {url[:60]}")
         return ""
 
     async def fetch_html(
@@ -670,6 +769,14 @@ class SharedPlaywrightManager:
         partial_min_bytes: int = 800,
         partial_wait_ms: int = 1200
     ) -> str:
+        """Fetch HTML with comprehensive diagnostic logging."""
+        from urllib.parse import urlparse
+        
+        # ============================================================
+        # DIAGNOSTIC: Entry point
+        # ============================================================
+        LOG.info(f"[FETCH_HTML] 🚀 ENTRY → {url[:80]}")
+        
         page: Optional[Page] = None
         main_document_body = None
 
@@ -682,16 +789,55 @@ class SharedPlaywrightManager:
                 return False
 
         try:
+            # ============================================================
+            # DIAGNOSTIC: Check initialization
+            # ============================================================
+            LOG.info(f"[FETCH_HTML] 🔍 Checking if initialized... (_initialized={self._initialized})")
+            
             if not self._initialized:
+                LOG.warning(f"[FETCH_HTML] ⚠️ Not initialized! Calling initialize()...")
                 await self.initialize()
+                LOG.info(f"[FETCH_HTML] ✅ Initialize complete")
+            else:
+                LOG.info(f"[FETCH_HTML] ✅ Already initialized")
 
+            # ============================================================
+            # DIAGNOSTIC: Get page from pool
+            # ============================================================
+            LOG.info(f"[FETCH_HTML] 📄 Acquiring page from pool...")
+            LOG.info(f"[FETCH_HTML]   Pool state: pool_size={len(self._page_pool)}, open_pages={self._open_pages}, pages_created={self._pages_created}")
+            
             page = await self.get_page(url, wait_for_slot=True)
+            
+            # ============================================================
+            # DIAGNOSTIC: Check page acquisition result
+            # ============================================================
             if not page:
-                LOG.error(f"[FETCH_HTML] Failed to acquire page for {url} — pool exhausted")
+                LOG.error(f"[FETCH_HTML] ❌ FAILED to acquire page for {url[:80]} — pool exhausted or get_page returned None")
                 return ""
+            
+            LOG.info(f"[FETCH_HTML] ✅ Page acquired successfully")
+            
+            # ============================================================
+            # DIAGNOSTIC: Check page state
+            # ============================================================
+            try:
+                is_closed = page.is_closed()
+                LOG.info(f"[FETCH_HTML] 📊 Page state: is_closed={is_closed}")
+                
+                if is_closed:
+                    LOG.error(f"[FETCH_HTML] ❌ Page is CLOSED immediately after acquisition!")
+                    return ""
+            except Exception as check_e:
+                LOG.error(f"[FETCH_HTML] ⚠️ Cannot check page.is_closed(): {check_e}")
 
-            LOG.info(f"[FETCH_HTML] START → {url} | Page acquired (closed={page.is_closed() if page else 'N/A'})")
+            LOG.info(f"[FETCH_HTML] START → {url} | Page acquired")
 
+            # ============================================================
+            # DIAGNOSTIC: Set up response handler
+            # ============================================================
+            LOG.info(f"[FETCH_HTML] 🎣 Setting up response handler...")
+            
             async def _on_response(response):
                 nonlocal main_document_body
                 try:
@@ -703,172 +849,254 @@ class SharedPlaywrightManager:
                     LOG.debug(f"[FETCH_HTML] Response handler error: {e}")
 
             page.on("response", _on_response)
+            LOG.info(f"[FETCH_HTML] ✅ Response handler attached")
 
+            # ============================================================
+            # DIAGNOSTIC: Determine navigation strategy
+            # ============================================================
             parsed = urlparse(url.lower())
             hostname = parsed.hostname or ""
             is_myschool = "myschool.ng" in hostname or (force_networkidle_for and any(h in hostname for h in (force_networkidle_for or [])))
             wait_until = "networkidle" if is_myschool else "domcontentloaded"
             goto_timeout = timeout or (self._cfg.get("myschool_timeout") if is_myschool else self._cfg.get("default_timeout"))
 
-            LOG.info(f"[FETCH_HTML] Navigation → wait_until={wait_until} | timeout={goto_timeout}ms | myschool_mode={is_myschool}")
+            LOG.info(f"[FETCH_HTML] 🧭 Navigation strategy:")
+            LOG.info(f"[FETCH_HTML]   - hostname: {hostname}")
+            LOG.info(f"[FETCH_HTML]   - is_myschool: {is_myschool}")
+            LOG.info(f"[FETCH_HTML]   - wait_until: {wait_until}")
+            LOG.info(f"[FETCH_HTML]   - timeout: {goto_timeout}ms")
 
+            # ============================================================
+            # DIAGNOSTIC: Start navigation
+            # ============================================================
+            LOG.info(f"[FETCH_HTML] 🌐 STARTING page.goto() for {url[:60]}...")
+            nav_start = asyncio.get_event_loop().time()
+            
             try:
                 response = await page.goto(url, wait_until=wait_until, timeout=goto_timeout)
+                nav_duration = asyncio.get_event_loop().time() - nav_start
+                
+                # ============================================================
+                # DIAGNOSTIC: Navigation success
+                # ============================================================
                 if response:
-                    LOG.info(f"[FETCH_HTML] Navigation SUCCESS | Status: {response.status} | URL now: {page.url}")
+                    LOG.info(f"[FETCH_HTML] ✅ Navigation SUCCESS in {nav_duration:.2f}s")
+                    LOG.info(f"[FETCH_HTML]   - Status: {response.status}")
+                    LOG.info(f"[FETCH_HTML]   - URL now: {page.url}")
                 else:
-                    LOG.warning(f"[FETCH_HTML] Navigation returned None response")
+                    LOG.warning(f"[FETCH_HTML] ⚠️ Navigation returned None response after {nav_duration:.2f}s")
+                    
             except PlaywrightTimeoutError as nav_error:
-                LOG.warning(f"[FETCH_HTML] Navigation TIMEOUT → {nav_error}")
-                LOG.warning(f"[FETCH_HTML] Current URL after timeout: {page.url}")
+                nav_duration = asyncio.get_event_loop().time() - nav_start
+                
+                # ============================================================
+                # DIAGNOSTIC: Navigation timeout
+                # ============================================================
+                LOG.warning(f"[FETCH_HTML] ⏰ Navigation TIMEOUT after {nav_duration:.2f}s (limit: {goto_timeout}ms)")
+                LOG.warning(f"[FETCH_HTML]   - Error: {nav_error}")
+                LOG.warning(f"[FETCH_HTML]   - Current URL: {page.url}")
 
+                # Check if we captured main document
                 if main_document_body:
-                    LOG.info(f"[FETCH_HTML] Using captured main_document_body ({len(main_document_body)} bytes) from response handler")
+                    LOG.info(f"[FETCH_HTML] 💾 Using captured main_document_body ({len(main_document_body)} bytes)")
                     return main_document_body
 
+                # Wait a bit more
+                LOG.info(f"[FETCH_HTML] ⏳ Waiting {partial_wait_ms}ms for partial content...")
                 await page.wait_for_timeout(partial_wait_ms)
 
                 try:
                     ready = await page.evaluate("() => document.readyState")
-                    LOG.debug(f"[FETCH_HTML] document.readyState after partial wait: {ready}")
+                    LOG.debug(f"[FETCH_HTML] document.readyState: {ready}")
                 except Exception:
                     ready = None
 
                 try:
                     partial_html = await page.content()
-                    LOG.debug(f"[FETCH_HTML] Partial content length after timeout: {len(partial_html)} bytes")
+                    LOG.info(f"[FETCH_HTML] 📄 Partial content: {len(partial_html)} bytes")
                 except Exception as e:
+                    LOG.error(f"[FETCH_HTML] ❌ Failed to get partial content: {e}")
                     partial_html = ""
-                    LOG.debug(f"[FETCH_HTML] Failed to get partial content: {e}")
 
                 if partial_on_timeout:
                     if (partial_html and len(partial_html) >= partial_min_bytes) or (ready in ("interactive", "complete")):
-                        LOG.info(f"[FETCH_HTML] Returning partial HTML ({len(partial_html)} bytes) due to timeout")
+                        LOG.info(f"[FETCH_HTML] ✅ Returning partial HTML ({len(partial_html)} bytes)")
                         return partial_html
 
-                    # Extra retry with 'load'
+                    # Retry with 'load'
                     try:
-                        LOG.info(f"[FETCH_HTML] Retrying navigation with wait_until='load' (15s)")
+                        LOG.info(f"[FETCH_HTML] 🔄 Retrying with wait_until='load' (15s)...")
+                        retry_start = asyncio.get_event_loop().time()
                         await page.goto(url, wait_until="load", timeout=15000)
+                        retry_duration = asyncio.get_event_loop().time() - retry_start
                         html_after = await page.content()
                         if html_after and len(html_after) > len(partial_html):
-                            LOG.info(f"[FETCH_HTML] Retry success — got {len(html_after)} bytes")
+                            LOG.info(f"[FETCH_HTML] ✅ Retry success in {retry_duration:.2f}s: {len(html_after)} bytes")
                             return html_after
                     except Exception as retry_e:
-                        LOG.warning(f"[FETCH_HTML] Retry with 'load' failed: {retry_e}")
+                        LOG.warning(f"[FETCH_HTML] ❌ Retry failed: {retry_e}")
 
-                # Ultimate aiohttp fallback
+                # Aiohttp fallback
+                LOG.info(f"[FETCH_HTML] 🌐 Trying aiohttp fallback...")
                 fallback_html = await self._aiohttp_fetch(url, timeout=15)
                 if fallback_html:
-                    LOG.info(f"[FETCH_HTML] Aiohttp fallback SUCCESS — {len(fallback_html)} bytes")
+                    LOG.info(f"[FETCH_HTML] ✅ Aiohttp success: {len(fallback_html)} bytes")
                     return fallback_html
 
                 if partial_html:
-                    LOG.info(f"[FETCH_HTML] Returning minimal partial HTML ({len(partial_html)} bytes) as last resort")
+                    LOG.info(f"[FETCH_HTML] ⚠️ Returning minimal partial: {len(partial_html)} bytes")
                     return partial_html
 
-                LOG.error(f"[FETCH_HTML] Navigation timeout — no content recovered")
+                LOG.error(f"[FETCH_HTML] ❌ Navigation timeout — no content recovered")
                 return ""
 
             except TargetClosedError as tce:
-                LOG.error(f"[FETCH_HTML] TARGET CLOSED (browser/page died) during navigation: {tce}")
+                # ============================================================
+                # DIAGNOSTIC: Target closed during navigation
+                # ============================================================
+                LOG.error(f"[FETCH_HTML] 💀 TARGET CLOSED during navigation!")
+                LOG.error(f"[FETCH_HTML]   - Error: {tce}")
+                LOG.error(f"[FETCH_HTML]   - This means browser/page died mid-navigation")
                 return ""
+                
             except Exception as nav_e:
-                LOG.error(f"[FETCH_HTML] Unexpected navigation error: {type(nav_e).__name__}: {nav_e}")
+                # ============================================================
+                # DIAGNOSTIC: Other navigation error
+                # ============================================================
+                LOG.error(f"[FETCH_HTML] ❌ Navigation error: {type(nav_e).__name__}")
+                LOG.error(f"[FETCH_HTML]   - Details: {nav_e}")
+                import traceback
+                LOG.error(f"[FETCH_HTML]   - Traceback:\n{traceback.format_exc()}")
                 return ""
 
-            # Post-navigation diagnostics
+            # ============================================================
+            # DIAGNOSTIC: Post-navigation checks
+            # ============================================================
+            LOG.info(f"[FETCH_HTML] 🔍 Running post-navigation diagnostics...")
+            
             await page.wait_for_timeout(500)
 
             try:
                 page_title = await page.title()
-                LOG.info(f"[FETCH_HTML] Page title: '{page_title}'")
+                LOG.info(f"[FETCH_HTML] 📰 Page title: '{page_title}'")
             except Exception:
-                page_title = "<unknown>"
-                LOG.debug(f"[FETCH_HTML] Failed to get page title")
+                LOG.warning(f"[FETCH_HTML] ⚠️ Failed to get page title")
 
             try:
                 body_text = await page.evaluate("() => document.body?.innerText || ''")
-                body_preview = body_text[:500].replace('\n', ' ')
-                LOG.debug(f"[FETCH_HTML] Body text preview ({len(body_text)} chars): {body_preview}")
+                body_preview = body_text[:200].replace('\n', ' ')
+                LOG.debug(f"[FETCH_HTML] 📝 Body preview ({len(body_text)} chars): {body_preview}")
 
-                # Block detection
-                block_keywords = ['just a moment', 'checking your browser', 'cloudflare', 'attention required',
-                                  'verify you are human', 'cf-browser-verification', 'ray id']
+                block_keywords = ['just a moment', 'checking your browser', 'cloudflare']
                 blocked = any(kw in body_text.lower() for kw in block_keywords)
-                LOG.warning(f"[FETCH_HTML] Potential BLOCK detected: {blocked}")
                 if blocked:
-                    LOG.warning(f"[FETCH_HTML] Block keywords found in body")
+                    LOG.warning(f"[FETCH_HTML] 🚫 Potential BLOCK detected!")
             except Exception as e:
-                LOG.debug(f"[FETCH_HTML] Failed to evaluate body text: {e}")
+                LOG.warning(f"[FETCH_HTML] ⚠️ Failed to evaluate body: {e}")
 
-            try:
-                diagnostics = await page.evaluate("""() => ({
-                    readyState: document.readyState,
-                    hasH1: !!document.querySelector('h1,h2,h3'),
-                    hasArticle: !!document.querySelector('article, .content, .post, .clearfix'),
-                    bodyLength: document.body?.innerText?.length || 0,
-                    hasCF: /cloudflare/i.test(document.documentElement.outerHTML)
-                })""")
-                LOG.info(f"[FETCH_HTML] Page diagnostics: {diagnostics}")
-            except Exception as e:
-                LOG.debug(f"[FETCH_HTML] Diagnostics evaluate failed: {e}")
-
+            # Scrolling
             if scroll_to_load or is_myschool:
                 loops = 5 if is_myschool else 3
                 per_wait = 1500 if is_myschool else 1000
-                LOG.info(f"[FETCH_HTML] Scrolling to load ({loops} loops)")
+                LOG.info(f"[FETCH_HTML] 📜 Scrolling {loops} times...")
+                
                 for i in range(loops):
                     try:
                         await page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
                         await page.wait_for_timeout(per_wait)
-                        LOG.debug(f"[FETCH_HTML] Scroll loop {i+1}/{loops} completed")
+                        LOG.debug(f"[FETCH_HTML]   Scroll {i+1}/{loops} complete")
                     except Exception as scroll_e:
-                        LOG.warning(f"[FETCH_HTML] Scroll failed at loop {i+1}: {scroll_e}")
+                        LOG.warning(f"[FETCH_HTML]   Scroll {i+1} failed: {scroll_e}")
                         break
+                        
                 await page.wait_for_timeout(800)
 
+            # Wait for selector
             if wait_for_selector:
                 try:
-                    LOG.info(f"[FETCH_HTML] Waiting for selector: {wait_for_selector}")
+                    LOG.info(f"[FETCH_HTML] ⏳ Waiting for selector: {wait_for_selector}")
                     await page.wait_for_selector(wait_for_selector, timeout=10000)
-                    LOG.info(f"[FETCH_HTML] Selector '{wait_for_selector}' FOUND")
+                    LOG.info(f"[FETCH_HTML] ✅ Selector found")
                 except Exception as sel_e:
-                    LOG.warning(f"[FETCH_HTML] Selector '{wait_for_selector}' NOT found: {sel_e}")
+                    LOG.warning(f"[FETCH_HTML] ⚠️ Selector not found: {sel_e}")
 
+            # Stop loading
             try:
                 await page.evaluate("() => { try { window.stop(); } catch(e) {} }")
             except Exception:
                 pass
 
-            html = await page.content()
-            LOG.info(f"[FETCH_HTML] Final await page.content() → {len(html)} bytes")
+            # ============================================================
+            # DIAGNOSTIC: Get final content
+            # ============================================================
+            LOG.info(f"[FETCH_HTML] 📥 Calling page.content()...")
+            
+            try:
+                html = await page.content()
+                LOG.info(f"[FETCH_HTML] ✅ Got content: {len(html)} bytes")
+            except Exception as content_e:
+                LOG.error(f"[FETCH_HTML] ❌ page.content() failed: {content_e}")
+                html = ""
 
             if main_document_body and len(main_document_body) > len(html):
-                LOG.info(f"[FETCH_HTML] Using larger captured main_document_body ({len(main_document_body)} bytes)")
+                LOG.info(f"[FETCH_HTML] 🔄 Using larger captured response: {len(main_document_body)} bytes")
                 html = main_document_body
 
-            LOG.info(f"[FETCH_HTML] SUCCESS → {len(html)} bytes returned for {url}")
+            LOG.info(f"[FETCH_HTML] 🎉 SUCCESS → Returning {len(html)} bytes for {url[:60]}")
             return html
 
         except TargetClosedError as tce:
-            LOG.error(f"[FETCH_HTML] TARGET CLOSED (browser/page died) → {tce}")
+            # ============================================================
+            # DIAGNOSTIC: Outer target closed
+            # ============================================================
+            LOG.error(f"[FETCH_HTML] 💀 TARGET CLOSED (outer catch)")
+            LOG.error(f"[FETCH_HTML]   - Error: {tce}")
             return ""
+            
         except Exception as e:
-            LOG.error(f"[FETCH_HTML] FATAL ERROR for {url}: {type(e).__name__}: {e}")
+            # ============================================================
+            # DIAGNOSTIC: Fatal error
+            # ============================================================
+            LOG.error(f"[FETCH_HTML] 💥 FATAL ERROR")
+            LOG.error(f"[FETCH_HTML]   - Type: {type(e).__name__}")
+            LOG.error(f"[FETCH_HTML]   - Details: {e}")
+            
+            import traceback
+            LOG.error(f"[FETCH_HTML] 📋 Traceback:\n{traceback.format_exc()}")
+            
+            # Final fallback
+            LOG.info(f"[FETCH_HTML] 🆘 Attempting final aiohttp fallback...")
             fallback = await self._aiohttp_fetch(url, timeout=15)
             if fallback:
-                LOG.info(f"[FETCH_HTML] Final aiohttp fallback → {len(fallback)} bytes")
+                LOG.info(f"[FETCH_HTML] ✅ Fallback success: {len(fallback)} bytes")
                 return fallback
+                
             return ""
+            
         finally:
+            # ============================================================
+            # DIAGNOSTIC: Cleanup
+            # ============================================================
+            LOG.info(f"[FETCH_HTML] 🧹 Starting cleanup for {url[:60]}...")
+            
             try:
-                page.off("response", _on_response)
-            except Exception:
-                pass
+                if page:
+                    page.off("response", _on_response)
+                    LOG.debug(f"[FETCH_HTML]   Response handler removed")
+            except Exception as off_e:
+                LOG.warning(f"[FETCH_HTML]   Failed to remove handler: {off_e}")
+                
             if page:
+                try:
+                    is_closed_before_release = page.is_closed()
+                    LOG.info(f"[FETCH_HTML]   Page state before release: is_closed={is_closed_before_release}")
+                except Exception:
+                    LOG.warning(f"[FETCH_HTML]   Cannot check page state before release")
+                    
                 await self.release_page(page)
-            LOG.debug(f"[FETCH_HTML] Cleanup complete for {url}")
+                LOG.info(f"[FETCH_HTML]   Page released back to pool")
+                
+            LOG.info(f"[FETCH_HTML] ✅ Cleanup complete for {url[:60]}")
 
     async def fetch_with_semaphore(
         self,
@@ -880,31 +1108,98 @@ class SharedPlaywrightManager:
         allow_playwright: bool = True,
         **fetch_kwargs
     ) -> str:
+        """Enhanced with diagnostic logging."""
+        
+        # ============================================================
+        # DIAGNOSTIC: Entry
+        # ============================================================
+        LOG.info(f"[FETCH_SEMAPHORE] 🎯 ENTRY for {url[:60]}")
+        LOG.info(f"[FETCH_SEMAPHORE]   Retries: {retries}, http_first: {use_http_first}, playwright: {allow_playwright}")
+        
         if not self._initialized:
+            LOG.warning(f"[FETCH_SEMAPHORE] ⚠️ Not initialized, calling initialize()...")
             await self.initialize()
+            LOG.info(f"[FETCH_SEMAPHORE] ✅ Initialization complete")
 
         attempt = 0
         last_exc = None
+        
+        # ============================================================
+        # DIAGNOSTIC: Semaphore acquisition
+        # ============================================================
+        LOG.info(f"[FETCH_SEMAPHORE] 🔒 Waiting for semaphore (max_concurrency={self._cfg['max_concurrency']})...")
+        sem_acquired_at = asyncio.get_event_loop().time()
+        
         async with self._sem:
+            sem_wait_time = asyncio.get_event_loop().time() - sem_acquired_at
+            LOG.info(f"[FETCH_SEMAPHORE] ✅ Semaphore acquired (waited {sem_wait_time:.2f}s)")
+            
+            # Rate limiting delay
+            LOG.debug(f"[FETCH_SEMAPHORE] ⏳ Rate limit delay: 3s")
             await asyncio.sleep(3)
+            
+            # ============================================================
+            # DIAGNOSTIC: Retry loop
+            # ============================================================
             while attempt <= retries:
+                attempt += 1
+                LOG.info(f"[FETCH_SEMAPHORE] 🔄 Attempt {attempt}/{retries+1} for {url[:60]}")
+                
                 try:
-                    attempt += 1
+                    fetch_start = asyncio.get_event_loop().time()
+                    
+                    LOG.info(f"[FETCH_SEMAPHORE] 📞 Calling smart_fetch...")
                     html = await self.smart_fetch(
                         url,
                         prefer_http=use_http_first,
                         allow_playwright=allow_playwright,
                         **fetch_kwargs
                     )
+                    
+                    fetch_time = asyncio.get_event_loop().time() - fetch_start
+                    
+                    # ============================================================
+                    # DIAGNOSTIC: Check result
+                    # ============================================================
                     if html:
+                        LOG.info(f"[FETCH_SEMAPHORE] ✅ SUCCESS on attempt {attempt}")
+                        LOG.info(f"[FETCH_SEMAPHORE]   Size: {len(html)} bytes")
+                        LOG.info(f"[FETCH_SEMAPHORE]   Time: {fetch_time:.2f}s")
                         return html
-                    raise RuntimeError("Empty HTML returned")
+                    else:
+                        LOG.warning(f"[FETCH_SEMAPHORE] ⚠️ Empty HTML on attempt {attempt}")
+                        LOG.warning(f"[FETCH_SEMAPHORE]   Time: {fetch_time:.2f}s")
+                        raise RuntimeError("Empty HTML returned from smart_fetch")
+                        
                 except Exception as exc:
+                    fetch_time = asyncio.get_event_loop().time() - fetch_start
                     last_exc = exc
+                    
+                    # ============================================================
+                    # DIAGNOSTIC: Exception details
+                    # ============================================================
+                    LOG.error(f"[FETCH_SEMAPHORE] ❌ Attempt {attempt} FAILED")
+                    LOG.error(f"[FETCH_SEMAPHORE]   Exception: {type(exc).__name__}")
+                    LOG.error(f"[FETCH_SEMAPHORE]   Message: {exc}")
+                    LOG.error(f"[FETCH_SEMAPHORE]   Time: {fetch_time:.2f}s")
+                    
                     if attempt > retries:
+                        LOG.error(f"[FETCH_SEMAPHORE] 💀 All {retries+1} attempts exhausted for {url[:60]}")
                         break
+                        
+                    # Backoff
                     sleep_for = backoff_factor * (2 ** (attempt - 1))
+                    LOG.warning(f"[FETCH_SEMAPHORE] ⏳ Backing off for {sleep_for:.2f}s before retry...")
                     await asyncio.sleep(sleep_for)
+        
+        # ============================================================
+        # DIAGNOSTIC: Final failure
+        # ============================================================
+        LOG.error(f"[FETCH_SEMAPHORE] 💀 FINAL FAILURE for {url[:60]}")
+        if last_exc:
+            LOG.error(f"[FETCH_SEMAPHORE]   Last exception: {type(last_exc).__name__}: {last_exc}")
+        LOG.error(f"[FETCH_SEMAPHORE]   Returning empty string")
+        
         return ""
 
     async def run_concurrent(
@@ -917,34 +1212,34 @@ class SharedPlaywrightManager:
         allow_playwright: bool = True,
         fetch_kwargs: Optional[dict] = None,
     ) -> List[Tuple[str, bytes]]:
-        """
-        Run concurrent fetches with enhanced logging.
-
-        Args:
-            urls: Iterable of URLs to fetch.
-            retries: number of retry attempts (in addition to the initial attempt).
-            backoff_factor: base backoff factor (exponential backoff multiplier).
-            use_http_first: prefer HTTP (aiohttp) before Playwright.
-            allow_playwright: allow falling back to Playwright for JS-heavy pages.
-            fetch_kwargs: extra kwargs passed to fetch_with_semaphore/_fetch_with_retries.
-
-        Returns:
-            List of tuples (url, bytes_result) in the same order as the input urls.
-        """
+        """Run concurrent fetches with enhanced logging."""
         if fetch_kwargs is None:
             fetch_kwargs = {}
 
         url_list = list(urls)
+        
+        # ============================================================
+        # DIAGNOSTIC: Initial state
+        # ============================================================
         LOG.info(f"[run_concurrent] 🔄 Starting for {len(url_list)} URLs")
         LOG.info(f"[run_concurrent] Config: http_first={use_http_first}, playwright={allow_playwright}, retries={retries}")
+        LOG.info(f"[run_concurrent] 🔧 Semaphore state: max_concurrency={self._cfg['max_concurrency']}")
+        LOG.info(f"[run_concurrent] 📊 Pool state: pool_size={len(self._page_pool)}, open_pages={self._open_pages}, pages_created={self._pages_created}")
 
         if url_list:
             LOG.info(f"[run_concurrent] Sample URLs:")
             for sample in url_list[:3]:
                 LOG.info(f"[run_concurrent]   - {sample}")
 
+        # ============================================================
+        # DIAGNOSTIC: Create tasks with individual tracking
+        # ============================================================
         tasks: List[asyncio.Task] = []
-        for u in url_list:
+        task_metadata = {}  # Track task -> URL mapping
+        
+        for idx, u in enumerate(url_list):
+            LOG.info(f"[run_concurrent] 📋 Creating task {idx+1}/{len(url_list)} for {u[:60]}...")
+            
             coro = self.fetch_with_semaphore(
                 u,
                 retries=retries,
@@ -953,87 +1248,222 @@ class SharedPlaywrightManager:
                 allow_playwright=allow_playwright,
                 **fetch_kwargs
             )
-            tasks.append(asyncio.create_task(coro))
+            
+            task = asyncio.create_task(coro)
+            tasks.append(task)
+            task_metadata[id(task)] = {
+                'url': u,
+                'index': idx,
+                'created_at': asyncio.get_event_loop().time()
+            }
+            
+            LOG.debug(f"[run_concurrent]   Task {idx+1} created: {task}")
 
-        LOG.info(f"[run_concurrent] 📋 Created {len(tasks)} tasks")
+        LOG.info(f"[run_concurrent] 📋 All {len(tasks)} tasks created successfully")
 
+        # ============================================================
+        # DIAGNOSTIC: Monitor task progress
+        # ============================================================
         try:
-            results = await asyncio.gather(*tasks, return_exceptions=False)
-
-            success_count = sum(1 for r in results if r and len(r) > 0)
-            LOG.info(f"[run_concurrent] ✅ Gather completed: {success_count}/{len(results)} successful fetches")
-
-            # Log failures
+            LOG.info(f"[run_concurrent] ⏳ Waiting for all tasks to complete...")
+            start_time = asyncio.get_event_loop().time()
+            
+            # Gather with task monitoring
+            results = await asyncio.gather(*tasks, return_exceptions=True)
+            
+            end_time = asyncio.get_event_loop().time()
+            elapsed = end_time - start_time
+            
+            # ============================================================
+            # DIAGNOSTIC: Analyze results
+            # ============================================================
+            success_count = 0
+            empty_count = 0
+            exception_count = 0
+            
+            LOG.info(f"[run_concurrent] ✅ Gather completed in {elapsed:.2f}s")
+            LOG.info(f"[run_concurrent] 📊 Analyzing {len(results)} results...")
+            
             for idx, (url, result) in enumerate(zip(url_list, results)):
-                if not result or len(result) == 0:
-                    LOG.warning(f"[run_concurrent]   ✗ [{idx+1}] Failed: {url[:60]}")
+                # Check if result is an exception
+                if isinstance(result, Exception):
+                    exception_count += 1
+                    LOG.error(f"[run_concurrent]   ❌ [{idx+1}] EXCEPTION for {url[:60]}")
+                    LOG.error(f"[run_concurrent]       Type: {type(result).__name__}")
+                    LOG.error(f"[run_concurrent]       Message: {result}")
+                    
+                    # Log traceback for exceptions
+                    import traceback
+                    tb = ''.join(traceback.format_exception(type(result), result, result.__traceback__))
+                    LOG.error(f"[run_concurrent]       Traceback:\n{tb}")
+                    
+                elif not result or len(result) == 0:
+                    empty_count += 1
+                    LOG.warning(f"[run_concurrent]   ✗ [{idx+1}] EMPTY for {url[:60]}")
+                    LOG.warning(f"[run_concurrent]       Result type: {type(result)}")
+                    LOG.warning(f"[run_concurrent]       Result value: {repr(result)[:100]}")
+                    
                 else:
-                    try:
-                        LOG.debug(f"[run_concurrent]   ✓ [{idx+1}] Success: {url[:60]} ({len(result)} bytes)")
-                    except Exception:
-                        LOG.debug(f"[run_concurrent]   ✓ [{idx+1}] Success: {url[:60]}")
+                    success_count += 1
+                    LOG.info(f"[run_concurrent]   ✓ [{idx+1}] SUCCESS for {url[:60]}")
+                    LOG.info(f"[run_concurrent]       Size: {len(result)} bytes")
+            
+            # ============================================================
+            # DIAGNOSTIC: Summary
+            # ============================================================
+            LOG.info(f"[run_concurrent] 📊 RESULTS SUMMARY:")
+            LOG.info(f"[run_concurrent]   ✅ Success: {success_count}/{len(results)}")
+            LOG.info(f"[run_concurrent]   ⚠️  Empty:   {empty_count}/{len(results)}")
+            LOG.info(f"[run_concurrent]   ❌ Exceptions: {exception_count}/{len(results)}")
+            LOG.info(f"[run_concurrent]   ⏱️  Total time: {elapsed:.2f}s")
+            LOG.info(f"[run_concurrent]   ⚡ Avg time per URL: {elapsed/len(url_list):.2f}s")
 
         except Exception as e:
-            LOG.exception(f"[run_concurrent] ❌ Gather failed with exception: {e}")
-            LOG.error(f"[run_concurrent] Traceback:\n{traceback.format_exc()}")
+            # ============================================================
+            # DIAGNOSTIC: Gather failure
+            # ============================================================
+            LOG.exception(f"[run_concurrent] 💥 GATHER FAILED")
+            LOG.error(f"[run_concurrent]   Exception type: {type(e).__name__}")
+            LOG.error(f"[run_concurrent]   Exception message: {e}")
+            
+            import traceback
+            LOG.error(f"[run_concurrent]   Traceback:\n{traceback.format_exc()}")
+            
+            # Check task states
+            LOG.error(f"[run_concurrent] 🔍 Checking task states:")
+            for idx, task in enumerate(tasks):
+                LOG.error(f"[run_concurrent]   Task {idx+1}: done={task.done()}, cancelled={task.cancelled()}")
+                if task.done() and not task.cancelled():
+                    try:
+                        exc = task.exception()
+                        if exc:
+                            LOG.error(f"[run_concurrent]     Exception: {exc}")
+                    except Exception:
+                        pass
+            
             raise
 
         return list(zip(url_list, results))
 
     async def _recycle_browser(self):
+        """Recycle browser and context."""
         async with self._lock:
             if not self._initialized:
+                LOG.warning("[RECYCLE] ⚠️ Not initialized, skipping recycle")
                 return
 
-            LOG.warning("♻️ Recycling Playwright browser/context...")
+            LOG.warning("[RECYCLE] ♻️  Recycling Playwright browser/context...")
 
+            # Close all pooled pages
+            LOG.info(f"[RECYCLE] 🧹 Closing {len(self._page_pool)} pooled pages...")
             while self._page_pool:
                 p = self._page_pool.popleft()
-                await p.close()
+                try:
+                    await p.close()
+                except Exception as e:
+                    LOG.warning(f"[RECYCLE]   Failed to close pooled page: {e}")
 
             self._open_pages = 0
+            LOG.info("[RECYCLE] ✅ All pooled pages closed")
 
+            # Close context
             if self.context:
-                await self.context.close()
+                LOG.info("[RECYCLE] 🔒 Closing context...")
+                try:
+                    await self.context.close()
+                    LOG.info("[RECYCLE] ✅ Context closed")
+                except Exception as e:
+                    LOG.error(f"[RECYCLE] ❌ Failed to close context: {e}")
 
+            # Close browser
             if self.browser:
-                await self.browser.close()
+                LOG.info("[RECYCLE] 🌐 Closing browser...")
+                try:
+                    await self.browser.close()
+                    LOG.info("[RECYCLE] ✅ Browser closed")
+                except Exception as e:
+                    LOG.error(f"[RECYCLE] ❌ Failed to close browser: {e}")
 
-            self.browser = await self.playwright.chromium.launch(
-                headless=self._cfg["headless"],
-                args=self._cfg["args"],
-                timeout=60000
-            )
+            # Relaunch
+            LOG.info("[RECYCLE] 🚀 Relaunching browser...")
+            try:
+                self.browser = await self.playwright.chromium.launch(
+                    headless=self._cfg["headless"],
+                    args=self._cfg["args"],
+                    timeout=60000
+                )
+                LOG.info("[RECYCLE] ✅ Browser relaunched")
+            except Exception as e:
+                LOG.error(f"[RECYCLE] ❌ Failed to relaunch browser: {e}")
+                raise
+
+            # Recreate context
             ua = random.choice(self._cfg["user_agent_list"]) if self._cfg["user_agent_list"] else None
-            self.context = await self.browser.new_context(
-                user_agent=ua,
-                viewport=self._cfg["viewport"],
-                locale=self._cfg["locale"],
-                timezone_id=self._cfg["timezone_id"],
-                java_script_enabled=True,
-                bypass_csp=True,
-                storage_state=None  # Fresh state on recycle
-            )
-            self.context.set_default_timeout(self._cfg["default_timeout"])
-            self.context.set_default_navigation_timeout(self._cfg["default_timeout"])
+            LOG.info(f"[RECYCLE] 🔧 Creating new context...")
+            
+            try:
+                self.context = await self.browser.new_context(
+                    user_agent=ua,
+                    viewport=self._cfg["viewport"],
+                    locale=self._cfg["locale"],
+                    timezone_id=self._cfg["timezone_id"],
+                    java_script_enabled=True,
+                    bypass_csp=True,
+                    storage_state=None  # Fresh state on recycle
+                )
+                self.context.set_default_timeout(self._cfg["default_timeout"])
+                self.context.set_default_navigation_timeout(self._cfg["default_timeout"])
+                LOG.info("[RECYCLE] ✅ Context created")
+            except Exception as e:
+                LOG.error(f"[RECYCLE] ❌ Failed to create context: {e}")
+                raise
+            
             self._pages_created = 0
-            LOG.warning("✅ Browser recycled")
+            LOG.warning("[RECYCLE] ✅ Browser recycled successfully")
 
     async def cleanup(self):
+        """Clean up all resources."""
         async with self._lock:
             if not self._initialized:
+                LOG.info("[CLEANUP] ℹ️  Not initialized, nothing to clean")
                 return
+            
+            LOG.info("[CLEANUP] 🧹 Starting cleanup...")
+            
+            # Close pooled pages
             while self._page_pool:
                 p = self._page_pool.popleft()
-                await p.close()
+                try:
+                    await p.close()
+                except Exception as e:
+                    LOG.debug(f"[CLEANUP] Failed to close pooled page: {e}")
+            
+            # Close context
             if self.context:
-                await self.context.close()
+                try:
+                    await self.context.close()
+                    LOG.info("[CLEANUP] ✅ Context closed")
+                except Exception as e:
+                    LOG.warning(f"[CLEANUP] ⚠️ Failed to close context: {e}")
+            
+            # Close browser
             if self.browser:
-                await self.browser.close()
+                try:
+                    await self.browser.close()
+                    LOG.info("[CLEANUP] ✅ Browser closed")
+                except Exception as e:
+                    LOG.warning(f"[CLEANUP] ⚠️ Failed to close browser: {e}")
+            
+            # Stop playwright
             if self.playwright:
-                await self.playwright.stop()
+                try:
+                    await self.playwright.stop()
+                    LOG.info("[CLEANUP] ✅ Playwright stopped")
+                except Exception as e:
+                    LOG.warning(f"[CLEANUP] ⚠️ Failed to stop playwright: {e}")
+            
             self._initialized = False
-            LOG.info("✅ Shared Playwright cleaned up")
+            LOG.info("[CLEANUP] ✅ Shared Playwright cleaned up")
 
 # Global instance
 shared_playwright = SharedPlaywrightManager()
