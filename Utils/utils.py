@@ -3663,7 +3663,7 @@ async def scrape_school_news(
         import traceback
         #LOG.error(f"🧪 Diagnostic traceback:\n{traceback.format_exc()}")
     
-    LOG.info("="*70 + "\n")
+    #LOG.info("="*70 + "\n")
     # ═══════════════════════════════════════════════════════════════════════
 
     if not urls:
