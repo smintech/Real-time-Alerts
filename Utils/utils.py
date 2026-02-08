@@ -3660,7 +3660,7 @@ async def scrape_school_news(
         
     #except Exception as diag_e:
         #LOG.exception(f"🧪 DIAGNOSTIC FAILED: {diag_e}")
-        import traceback
+        #import traceback
         #LOG.error(f"🧪 Diagnostic traceback:\n{traceback.format_exc()}")
     
     #LOG.info("="*70 + "\n")
