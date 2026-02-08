@@ -24,6 +24,7 @@ from collections import Counter, deque
 from playwright._impl._errors import TargetClosedError
 import aiohttp
 import importlib
+import time
 # Settings / thresholds
 from bot.settings import (
     SUPPORTED_SITES,
@@ -406,7 +407,8 @@ class SharedPlaywrightManager:
                     locale=self._cfg["locale"],
                     timezone_id=self._cfg["timezone_id"],
                     java_script_enabled=True,
-                    bypass_csp=True
+                    bypass_csp=True,
+                    storage_state=None  # Start with clean state
                 )
 
                 # timeouts applied to context
@@ -429,6 +431,35 @@ class SharedPlaywrightManager:
                 except Exception:
                     pass
                 raise
+
+    async def clear_site_data(self, domain: str = None):
+        """Clear cookies and storage for a specific domain or all domains."""
+        if not self._initialized or not self.context:
+            return
+        
+        try:
+            if domain:
+                # Clear cookies for specific domain
+                cookies = await self.context.cookies()
+                domain_cookies = [c for c in cookies if domain in c.get('domain', '')]
+                if domain_cookies:
+                    await self.context.clear_cookies(domain_cookies)
+                    LOG.debug(f"Cleared {len(domain_cookies)} cookies for {domain}")
+            else:
+                # Clear all cookies
+                await self.context.clear_cookies()
+                LOG.debug("Cleared all cookies")
+                
+            # Clear page pool storage too
+            for page in list(self._page_pool):
+                try:
+                    if not page.is_closed():
+                        await page.evaluate("() => { try { localStorage.clear(); sessionStorage.clear(); } catch(e) {} }")
+                except:
+                    pass
+                    
+        except Exception as e:
+            LOG.debug(f"Failed to clear site data: {e}")
 
     async def _setup_page(self, page: Page) -> None:
         """Apply anti-detection scripts & resource blocking to a freshly-created page."""
@@ -593,6 +624,10 @@ class SharedPlaywrightManager:
     ) -> str:
         parsed = urlparse(url)
         hostname = (parsed.hostname or "").lower()
+
+        # Clear cookies for MySchool before fetching to prevent blocking
+        if "myschool.ng" in hostname:
+            await self.clear_site_data("myschool.ng")
 
         if not prefer_http or ("myschool.ng" in hostname):
             return await self.fetch_html(
@@ -898,7 +933,8 @@ class SharedPlaywrightManager:
                 locale=self._cfg["locale"],
                 timezone_id=self._cfg["timezone_id"],
                 java_script_enabled=True,
-                bypass_csp=True
+                bypass_csp=True,
+                storage_state=None  # Fresh state on recycle
             )
             self.context.set_default_timeout(self._cfg["default_timeout"])
             self.context.set_default_navigation_timeout(self._cfg["default_timeout"])
@@ -2576,16 +2612,24 @@ async def scrape_lpg_prices() -> Dict[str, Any]:
 # ═══════════════════════════════════════════════════════════════════════════
 # SITE-SPECIFIC ARTICLE LISTING PAGES (WITH ENHANCED LOGGING)
 # ═══════════════════════════════════════════════════════════════════════════
-
 async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news") -> List[str]:
-    """Get recent article URLs from MySchool - FORCE PLAYWRIGHT (JavaScript required)"""
+    """Get recent article URLs from MySchool - WITH COOLDOWN"""
     LOG.info(f"[MySchool Listing] 🔍 Starting extraction from {base_url}")
+    
+    # Add cooldown between MySchool requests
+    LAST_MYSCHOOL_REQUEST = getattr(get_myschool_recent_articles, "_last_request", 0)
+    current_time = time.time()
+    
+    if current_time - LAST_MYSCHOOL_REQUEST < 5:  # 5 second cooldown
+        wait_time = 5 - (current_time - LAST_MYSCHOOL_REQUEST)
+        LOG.info(f"[MySchool Listing] ⏳ Cooling down for {wait_time:.1f}s...")
+        await asyncio.sleep(wait_time)
+    
+    get_myschool_recent_articles._last_request = time.time()
     
     root = base_url.rstrip("/").rsplit("/", 1)[0] if "/" in base_url else base_url
     urls_to_try = [
-        #f"{base_url.rstrip('/')}/latest",
         base_url.rstrip("/"),
-        #root,
     ]
     
     LOG.info(f"[MySchool Listing] 📋 Will try {len(urls_to_try)} listing URLs")
@@ -2594,12 +2638,14 @@ async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news
         LOG.info(f"[MySchool Listing] 🌐 [{idx}/{len(urls_to_try)}] Fetching: {listing_url}")
         
         try:
-            # ✅ FIX: Use fetch_html directly to FORCE Playwright (no HTTP fallback)
+            # Clear cookies before fetch
+            await shared_playwright.clear_site_data("myschool.ng")
+            
             html = await shared_playwright.fetch_html(
                 listing_url,
-                wait_for_selector='a[href*="/news/',
+                wait_for_selector='a[href*="/news/"]',
                 scroll_to_load=True,
-                timeout=100000,  # MySchool is slow
+                timeout=100000,
                 partial_on_timeout=False,
                 partial_min_bytes=5000,
                 partial_wait_ms=2000,
@@ -2639,7 +2685,7 @@ async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news
                         LOG.debug(f"[MySchool Listing]   ✓ Added: {full_url}")
 
             if article_urls:
-                final_urls = list(article_urls)[:25]
+                final_urls = list(article_urls)[:25]  # LIMIT TO 25
                 LOG.info(f"[MySchool Listing] ✅ Extracted {len(final_urls)} article URLs from {listing_url}")
                 LOG.info(f"[MySchool Listing] 📌 Sample URLs:")
                 for sample_url in final_urls[:3]:
@@ -2647,19 +2693,9 @@ async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news
                 return final_urls
             else:
                 LOG.warning(f"[MySchool Listing] ⚠️ No article URLs found in {listing_url}")
-                # ✅ ADD: Save HTML to debug
-                debug_path = f"/tmp/myschool_debug_{idx}.html"
-                try:
-                    with open(debug_path, 'w', encoding='utf-8') as f:
-                        f.write(html)
-                    LOG.warning(f"[MySchool Listing] 💾 Saved debug HTML to {debug_path}")
-                except:
-                    pass
                 
         except Exception as e:
             LOG.exception(f"[MySchool Listing] ❌ Exception while processing {listing_url}: {e}")
-            import traceback
-            LOG.error(f"[MySchool Listing] Traceback:\n{traceback.format_exc()}")
             continue
 
     LOG.error("[MySchool Listing] ❌ All listing URLs failed - returning empty list")
@@ -3351,7 +3387,7 @@ def extract_clean_content_v5(html: str, url: str, site_type: str = '') -> Dict[s
 # SITE-SPECIFIC SCRAPERS (WITH ENHANCED LOGGING)
 # ═══════════════════════════════════════════════════════════════════════════
 async def scrape_myschool_recent(base_url: str = "https://myschool.ng", max_articles: int = 10) -> List[Dict]:
-    """Scrape MySchool recent articles - ENHANCED LOGGING"""
+    """Scrape MySchool recent articles - FIXED FETCH SETTINGS"""
     LOG.info(f"\n{'='*70}")
     LOG.info(f"[MySchool Scraper] 🎯 STARTING - base_url={base_url}, max={max_articles}")
     LOG.info(f"{'='*70}")
@@ -3368,18 +3404,19 @@ async def scrape_myschool_recent(base_url: str = "https://myschool.ng", max_arti
         LOG.info(f"[MySchool Scraper] ✅ STEP 1 COMPLETE: {len(article_urls)} URLs obtained")
         
         # STEP 2: Fetch HTML for each article
-        LOG.info(f"[MySchool Scraper] STEP 2: Fetching HTML for {len(article_urls[:25])} articles...")
+        LOG.info(f"[MySchool Scraper] STEP 2: Fetching HTML for {len(article_urls[:10])} articles...")
         
+        # ✅ FIX: MySchool needs Playwright, not HTTP first
         html_results = await shared_playwright.run_concurrent(
-            article_urls[:10],  # Limit to 10 to avoid overload
-            use_http_first=True,
+            article_urls[:10],
+            use_http_first=False,  # MySchool needs Playwright directly
             allow_playwright=True,
             fetch_kwargs={
                 "wait_for_selector": 'h3.page-title.blog-header-title, div.clearfix, div.pb-5',
                 "scroll_to_load": False,
-                "timeout": 30000,
-                "partial_on_timeout": True,  # ADD THIS
-                "partial_min_bytes": 3000,   # ADD THIS
+                "timeout": 45000,
+                "partial_on_timeout": True,
+                "partial_min_bytes": 3000,
             }
         )
         
