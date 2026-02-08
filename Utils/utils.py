@@ -359,8 +359,8 @@ class SharedPlaywrightManager:
         "user_agent_list": _USER_AGENTS,
         # Concurrency & pooling - updated for Render free plan (lower limits)
         "max_concurrency": 1,          # Reduced to 1 to minimize instances
-        "max_open_pages": 3,           # Reduced pool size
-        "max_pages_before_reset": 5,   # More frequent reset to reclaim memory
+        "max_open_pages": 1,           # Reduced pool size
+        "max_pages_before_reset": 1,   # More frequent reset to reclaim memory
     }
 
     def __new__(cls):
@@ -708,8 +708,14 @@ class SharedPlaywrightManager:
 
             try:
                 await page.goto(url, wait_until=wait_until, timeout=goto_timeout)
-            except PlaywrightTimeoutError as nav_error:
-                LOG.warning("Navigation timeout for %s: %s", url, nav_error)
+                return await page.content()
+            except (TargetClosedError, PlaywrightTimeoutError) as e:
+                LOG.error(f"Browser crashed or timed out on {url}: {e}")
+                await self.shutdown()
+                return ""
+            except Exception as e:
+                LOG.error(f"Unexpected fetch error: {e}")
+                return ""
 
                 if main_document_body:
                     return main_document_body
@@ -809,6 +815,7 @@ class SharedPlaywrightManager:
         attempt = 0
         last_exc = None
         async with self._sem:
+            await asyncio.sleep(3)
             while attempt <= retries:
                 try:
                     attempt += 1
