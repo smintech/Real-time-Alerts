@@ -687,7 +687,10 @@ class SharedPlaywrightManager:
 
             page = await self.get_page(url, wait_for_slot=True)
             if not page:
+                LOG.error(f"[FETCH_HTML] Failed to acquire page for {url} — pool exhausted")
                 return ""
+
+            LOG.info(f"[FETCH_HTML] START → {url} | Page acquired (closed={page.is_closed() if page else 'N/A'})")
 
             async def _on_response(response):
                 nonlocal main_document_body
@@ -695,8 +698,9 @@ class SharedPlaywrightManager:
                     if response.request.resource_type == "document" or _response_matches_url(response, url):
                         if main_document_body is None:
                             main_document_body = await response.text()
-                except Exception:
-                    pass
+                            LOG.debug(f"[FETCH_HTML] Captured main document response: {len(main_document_body)} bytes")
+                except Exception as e:
+                    LOG.debug(f"[FETCH_HTML] Response handler error: {e}")
 
             page.on("response", _on_response)
 
@@ -706,71 +710,131 @@ class SharedPlaywrightManager:
             wait_until = "networkidle" if is_myschool else "domcontentloaded"
             goto_timeout = timeout or (self._cfg.get("myschool_timeout") if is_myschool else self._cfg.get("default_timeout"))
 
+            LOG.info(f"[FETCH_HTML] Navigation → wait_until={wait_until} | timeout={goto_timeout}ms | myschool_mode={is_myschool}")
+
             try:
-                await page.goto(url, wait_until=wait_until, timeout=goto_timeout)
-                return await page.content()
-            except (TargetClosedError, PlaywrightTimeoutError) as e:
-                LOG.error(f"Browser crashed or timed out on {url}: {e}")
-                await self.shutdown()
-                return ""
-            except Exception as e:
-                LOG.error(f"Unexpected fetch error: {e}")
-                return ""
+                response = await page.goto(url, wait_until=wait_until, timeout=goto_timeout)
+                if response:
+                    LOG.info(f"[FETCH_HTML] Navigation SUCCESS | Status: {response.status} | URL now: {page.url}")
+                else:
+                    LOG.warning(f"[FETCH_HTML] Navigation returned None response")
+            except PlaywrightTimeoutError as nav_error:
+                LOG.warning(f"[FETCH_HTML] Navigation TIMEOUT → {nav_error}")
+                LOG.warning(f"[FETCH_HTML] Current URL after timeout: {page.url}")
 
                 if main_document_body:
+                    LOG.info(f"[FETCH_HTML] Using captured main_document_body ({len(main_document_body)} bytes) from response handler")
                     return main_document_body
 
                 await page.wait_for_timeout(partial_wait_ms)
 
                 try:
                     ready = await page.evaluate("() => document.readyState")
+                    LOG.debug(f"[FETCH_HTML] document.readyState after partial wait: {ready}")
                 except Exception:
                     ready = None
 
                 try:
                     partial_html = await page.content()
-                except Exception:
+                    LOG.debug(f"[FETCH_HTML] Partial content length after timeout: {len(partial_html)} bytes")
+                except Exception as e:
                     partial_html = ""
+                    LOG.debug(f"[FETCH_HTML] Failed to get partial content: {e}")
 
                 if partial_on_timeout:
                     if (partial_html and len(partial_html) >= partial_min_bytes) or (ready in ("interactive", "complete")):
+                        LOG.info(f"[FETCH_HTML] Returning partial HTML ({len(partial_html)} bytes) due to timeout")
                         return partial_html
 
+                    # Extra retry with 'load'
                     try:
+                        LOG.info(f"[FETCH_HTML] Retrying navigation with wait_until='load' (15s)")
                         await page.goto(url, wait_until="load", timeout=15000)
                         html_after = await page.content()
                         if html_after and len(html_after) > len(partial_html):
+                            LOG.info(f"[FETCH_HTML] Retry success — got {len(html_after)} bytes")
                             return html_after
-                    except Exception:
-                        pass
+                    except Exception as retry_e:
+                        LOG.warning(f"[FETCH_HTML] Retry with 'load' failed: {retry_e}")
 
+                # Ultimate aiohttp fallback
                 fallback_html = await self._aiohttp_fetch(url, timeout=15)
                 if fallback_html:
+                    LOG.info(f"[FETCH_HTML] Aiohttp fallback SUCCESS — {len(fallback_html)} bytes")
                     return fallback_html
 
                 if partial_html:
+                    LOG.info(f"[FETCH_HTML] Returning minimal partial HTML ({len(partial_html)} bytes) as last resort")
                     return partial_html
 
+                LOG.error(f"[FETCH_HTML] Navigation timeout — no content recovered")
                 return ""
 
+            except TargetClosedError as tce:
+                LOG.error(f"[FETCH_HTML] TARGET CLOSED (browser/page died) during navigation: {tce}")
+                return ""
+            except Exception as nav_e:
+                LOG.error(f"[FETCH_HTML] Unexpected navigation error: {type(nav_e).__name__}: {nav_e}")
+                return ""
+
+            # Post-navigation diagnostics
             await page.wait_for_timeout(500)
+
+            try:
+                page_title = await page.title()
+                LOG.info(f"[FETCH_HTML] Page title: '{page_title}'")
+            except Exception:
+                page_title = "<unknown>"
+                LOG.debug(f"[FETCH_HTML] Failed to get page title")
+
+            try:
+                body_text = await page.evaluate("() => document.body?.innerText || ''")
+                body_preview = body_text[:500].replace('\n', ' ')
+                LOG.debug(f"[FETCH_HTML] Body text preview ({len(body_text)} chars): {body_preview}")
+
+                # Block detection
+                block_keywords = ['just a moment', 'checking your browser', 'cloudflare', 'attention required',
+                                  'verify you are human', 'cf-browser-verification', 'ray id']
+                blocked = any(kw in body_text.lower() for kw in block_keywords)
+                LOG.warning(f"[FETCH_HTML] Potential BLOCK detected: {blocked}")
+                if blocked:
+                    LOG.warning(f"[FETCH_HTML] Block keywords found in body")
+            except Exception as e:
+                LOG.debug(f"[FETCH_HTML] Failed to evaluate body text: {e}")
+
+            try:
+                diagnostics = await page.evaluate("""() => ({
+                    readyState: document.readyState,
+                    hasH1: !!document.querySelector('h1,h2,h3'),
+                    hasArticle: !!document.querySelector('article, .content, .post, .clearfix'),
+                    bodyLength: document.body?.innerText?.length || 0,
+                    hasCF: /cloudflare/i.test(document.documentElement.outerHTML)
+                })""")
+                LOG.info(f"[FETCH_HTML] Page diagnostics: {diagnostics}")
+            except Exception as e:
+                LOG.debug(f"[FETCH_HTML] Diagnostics evaluate failed: {e}")
 
             if scroll_to_load or is_myschool:
                 loops = 5 if is_myschool else 3
                 per_wait = 1500 if is_myschool else 1000
-                for _ in range(loops):
+                LOG.info(f"[FETCH_HTML] Scrolling to load ({loops} loops)")
+                for i in range(loops):
                     try:
                         await page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
                         await page.wait_for_timeout(per_wait)
-                    except Exception:
+                        LOG.debug(f"[FETCH_HTML] Scroll loop {i+1}/{loops} completed")
+                    except Exception as scroll_e:
+                        LOG.warning(f"[FETCH_HTML] Scroll failed at loop {i+1}: {scroll_e}")
                         break
                 await page.wait_for_timeout(800)
 
             if wait_for_selector:
                 try:
+                    LOG.info(f"[FETCH_HTML] Waiting for selector: {wait_for_selector}")
                     await page.wait_for_selector(wait_for_selector, timeout=10000)
-                except Exception:
-                    LOG.debug("Selector '%s' not found within 10s for %s", wait_for_selector, url)
+                    LOG.info(f"[FETCH_HTML] Selector '{wait_for_selector}' FOUND")
+                except Exception as sel_e:
+                    LOG.warning(f"[FETCH_HTML] Selector '{wait_for_selector}' NOT found: {sel_e}")
 
             try:
                 await page.evaluate("() => { try { window.stop(); } catch(e) {} }")
@@ -778,17 +842,23 @@ class SharedPlaywrightManager:
                 pass
 
             html = await page.content()
+            LOG.info(f"[FETCH_HTML] Final await page.content() → {len(html)} bytes")
 
             if main_document_body and len(main_document_body) > len(html):
-                return main_document_body
+                LOG.info(f"[FETCH_HTML] Using larger captured main_document_body ({len(main_document_body)} bytes)")
+                html = main_document_body
 
-            LOG.debug("[Fetch] Success: %d bytes from %s", len(html), url)
+            LOG.info(f"[FETCH_HTML] SUCCESS → {len(html)} bytes returned for {url}")
             return html
 
+        except TargetClosedError as tce:
+            LOG.error(f"[FETCH_HTML] TARGET CLOSED (browser/page died) → {tce}")
+            return ""
         except Exception as e:
-            LOG.error("Shared context fetch failed for %s: %s", url, e)
+            LOG.error(f"[FETCH_HTML] FATAL ERROR for {url}: {type(e).__name__}: {e}")
             fallback = await self._aiohttp_fetch(url, timeout=15)
             if fallback:
+                LOG.info(f"[FETCH_HTML] Final aiohttp fallback → {len(fallback)} bytes")
                 return fallback
             return ""
         finally:
@@ -798,6 +868,7 @@ class SharedPlaywrightManager:
                 pass
             if page:
                 await self.release_page(page)
+            LOG.debug(f"[FETCH_HTML] Cleanup complete for {url}")
 
     async def fetch_with_semaphore(
         self,
@@ -3421,7 +3492,7 @@ async def scrape_myschool_recent(base_url: str = "https://myschool.ng", max_arti
             fetch_kwargs={
                 "wait_for_selector": 'h3.page-title.blog-header-title, div.clearfix, div.pb-5',
                 "scroll_to_load": False,
-                "timeout": 45000,
+                "timeout": 90000,
                 "partial_on_timeout": True,
                 "partial_min_bytes": 3000,
             }
