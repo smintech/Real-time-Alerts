@@ -2673,9 +2673,7 @@ async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news
                 wait_for_selector='a[href*="/news/"]',
                 scroll_to_load=True,
                 timeout=100000,
-                partial_on_timeout=False,
-                partial_min_bytes=5000,
-                partial_wait_ms=2000,
+                partial_on_timeout=True,
             )
             
             LOG.info(f"[MySchool Listing] 📄 HTML length: {len(html) if html else 0} bytes")
@@ -3443,7 +3441,6 @@ async def scrape_myschool_recent(base_url: str = "https://myschool.ng", max_arti
                 "scroll_to_load": True,
                 "timeout": 90000,
                 "partial_on_timeout": True,
-                "partial_min_bytes": 3000,
             }
         )
         
