@@ -324,7 +324,7 @@ class SharedPlaywrightManager:
         "locale": "en-US",
         "timezone_id": "Africa/Lagos",
         "default_timeout": 45000,
-        "myschool_timeout": 120000,
+        "myschool_timeout": 45000,
         "user_agent_list": _USER_AGENTS,
         "max_concurrency": 1,
     }
@@ -385,6 +385,7 @@ class SharedPlaywrightManager:
             
             # Create context with anti-detection
             ua = random.choice(self._cfg["user_agent_list"]) if self._cfg["user_agent_list"] else None
+            LOG.info(f"[ENSURE_BROWSER] 🎭 Using UA: {ua[:50]}...")
             
             self._context = await self._browser.new_context(
                 user_agent=ua,
@@ -457,12 +458,16 @@ class SharedPlaywrightManager:
     async def _setup_page(self, page: Page) -> None:
         """Apply anti-detection to page."""
         LOG.debug("[SETUP_PAGE] 🔧 Setting up page...")
-        
+        width = random.randint(1280, 1920)
+        height = random.randint(720, 1080)
+        await page.set_viewport_size({"width": width, "height": height})
+        LOG.debug(f"[SETUP_PAGE] 📐 Viewport: {width}x{height}")
         try:
             # Enhanced anti-detection
             await page.add_init_script(
                 """
                 Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                delete navigator.__proto__.webdriver;
                 
                 window.chrome = {
                     runtime: {},
@@ -474,13 +479,28 @@ class SharedPlaywrightManager:
                 Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
                 Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
                 Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
-                Object.defineProperty(navigator, 'hardwareConcurrency', { get: () => 8 });
-                Object.defineProperty(navigator, 'deviceMemory', { get: () => 8 });
+                Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {random.choice([4, 8, 16])} }});
+                Object.defineProperty(navigator, 'deviceMemory', {{ get: () => {random.choice([4, 8, 16])} }});
                 
-                Object.defineProperty(screen, 'width', { get: () => 1920 });
-                Object.defineProperty(screen, 'height', { get: () => 1080 });
+                Object.defineProperty(screen, 'width', {{ get: () => {width} }});
+                Object.defineProperty(screen, 'height', {{ get: () => {height} }});
+                Object.defineProperty(screen, 'availWidth', {{ get: () => {width} }});
+                Object.defineProperty(screen, 'availHeight', {{ get: () => {height - 40} }});
                 
-                delete navigator.__proto__.webdriver;
+                const originalQuery = window.navigator.permissions.query;
+                window.navigator.permissions.query = (parameters) => (
+                    parameters.name === 'notifications' ?
+                        Promise.resolve({{ state: Notification.permission }}) :
+                        originalQuery(parameters)
+                );
+                if (!navigator.getBattery) {{
+                    navigator.getBattery = () => Promise.resolve({{
+                        charging: true,
+                        chargingTime: 0,
+                        dischargingTime: Infinity,
+                        level: {random.uniform(0.5, 1.0):.2f}
+                   }});
+                }}
                 """
             )
             LOG.debug("[SETUP_PAGE] ✅ Anti-detection applied")
@@ -646,7 +666,7 @@ class SharedPlaywrightManager:
             parsed = urlparse(url.lower())
             hostname = parsed.hostname or ""
             is_myschool = "myschool.ng" in hostname
-            wait_until = "networkidle" if is_myschool else "domcontentloaded"
+            wait_until = "load" if is_myschool else "domcontentloaded"
             goto_timeout = timeout or (self._cfg["myschool_timeout"] if is_myschool else self._cfg["default_timeout"])
 
             LOG.info(f"[FETCH_HTML] 🧭 Strategy: wait_until={wait_until}, timeout={goto_timeout}ms")
@@ -675,55 +695,48 @@ class SharedPlaywrightManager:
                         LOG.warning(f"[FETCH_HTML]   Title: '{page_title}'")
                         LOG.warning(f"[FETCH_HTML]   Body preview: {body_text[:200]}")
                         
-                        # Try to wait for clearance
-                        cleared = await self._wait_for_cloudflare_clearance(page, timeout=20000)
-                        
-                        if cleared:
-                            LOG.info(f"[FETCH_HTML] ✅ Cloudflare cleared!")
-                            await page.wait_for_timeout(2000)
-                        else:
-                            LOG.error(f"[FETCH_HTML] ❌ Cloudflare NOT cleared")
+                        if recreate_on_block:
+                            LOG.warning(f"[FETCH_HTML] ♻️ RECREATING browser to bypass block...")
                             
-                            # Close current page
                             try:
                                 await page.close()
                             except Exception:
                                 pass
+                                
+                            await self._ensure_browser(force_new=True)
                             
-                            # Recreate browser if enabled
-                            if recreate_on_block:
-                                LOG.warning(f"[FETCH_HTML] ♻️ RECREATING browser to bypass block...")
-                                await self._ensure_browser(force_new=True)
-                                
+                            delay = random.uniform(3, 7)
+                            LOG.info(f"[FETCH_HTML] ⏳ Waiting {delay:.1f}s before retry...")
+                            await asyncio.sleep(delay)
                                 # Try again with fresh browser
-                                LOG.info(f"[FETCH_HTML] 🔄 Retrying with fresh browser...")
+                            LOG.info(f"[FETCH_HTML] 🔄 Retrying with fresh browser...")
                                 
-                                try:
-                                    page = await self._context.new_page()
-                                    await self._setup_page(page)
-                                    page.on("response", _on_response)
+                            try:
+                                page = await self._context.new_page()
+                                await self._setup_page(page)
+                                page.on("response", _on_response)
                                     
-                                    await page.goto(url, wait_until=wait_until, timeout=goto_timeout)
-                                    await page.wait_for_timeout(2000)
+                                await page.goto(url, wait_until=wait_until, timeout=goto_timeout)
+                                await page.wait_for_timeout(2000)
                                     
                                     # Check again
-                                    retry_title = await page.title()
-                                    retry_body = await page.evaluate("() => document.body?.innerText || ''")
+                                retry_title = await page.title()
+                                retry_body = await page.evaluate("() => document.body?.innerText || ''")
                                     
-                                    if self._is_cloudflare_blocked(200, retry_title, retry_body):
-                                        LOG.error(f"[FETCH_HTML] ❌ Still blocked after browser recreation")
+                                if self._is_cloudflare_blocked(200, retry_title, retry_body):
+                                    LOG.error(f"[FETCH_HTML] ❌ Still blocked after browser recreation")
                                         # Wait one more time
-                                        await self._wait_for_cloudflare_clearance(page, timeout=25000)
-                                    else:
-                                        LOG.info(f"[FETCH_HTML] ✅ Retry successful - block bypassed!")
-                                        
-                                except Exception as retry_e:
-                                    LOG.error(f"[FETCH_HTML] ❌ Retry failed: {retry_e}")
                                     return ""
-                            else:
+                                else:
+                                    LOG.info(f"[FETCH_HTML] ✅ Retry successful - block bypassed!")
+                                        
+                            except Exception as retry_e:
+                                LOG.error(f"[FETCH_HTML] ❌ Retry failed: {retry_e}")
                                 return ""
-                    else:
-                        LOG.info(f"[FETCH_HTML] ✅ No block detected")
+                        else:
+                            return ""
+                else:
+                    LOG.info(f"[FETCH_HTML] ✅ No block detected")
                         
             except PlaywrightTimeoutError as nav_error:
                 nav_duration = asyncio.get_event_loop().time() - nav_start
@@ -746,12 +759,12 @@ class SharedPlaywrightManager:
                 return ""
             
             # Post-navigation
-            await page.wait_for_timeout(500)
+            await page.wait_for_timeout(1000)
             
             # Scrolling
             if scroll_to_load or is_myschool:
                 LOG.info(f"[FETCH_HTML] 📜 Scrolling...")
-                loops = 5 if is_myschool else 3
+                loops = 3 if is_myschool else 3
                 for i in range(loops):
                     try:
                         await page.evaluate("window.scrollTo(0, document.body.scrollHeight);")
@@ -946,7 +959,9 @@ class SharedPlaywrightManager:
                 
                 # Delay between URLs
                 if idx < len(url_list) - 1:
-                    await asyncio.sleep(5)
+                    delay = random.uniform(5, 10)
+                    LOG.info(f"[run_concurrent] ⏳ Waiting {delay:.1f}s before next URL...")
+                    await asyncio.sleep(delay)
             
             # Cleanup browser after batch
             if self._browser:
