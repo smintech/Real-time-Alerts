@@ -2668,8 +2668,6 @@ async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news
         
         try:
             # Clear cookies before fetch
-            await shared_playwright.clear_site_data("myschool.ng")
-            
             html = await shared_playwright.fetch_html(
                 listing_url,
                 wait_for_selector='a[href*="/news/"]',
