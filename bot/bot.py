@@ -902,7 +902,8 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 source_name: config
             }
             
-            if site_type == 'myschool':
+            current_site_type = config.get('type', 'generic')
+            if current_site_type == 'myschool':
                 timeout_seconds = 600.0  # 10 minutes for MySchool (Cloudflare heavy)
                 LOG.info(f"⏰ Using extended timeout for MySchool: {timeout_seconds}s")
             else:
