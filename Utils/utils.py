@@ -680,6 +680,8 @@ class SharedPlaywrightManager:
         play_timeout: Optional[int] = None,
         wait_for_selector: Optional[str] = None,
         scroll_to_load: bool = False,
+        partial_min_bytes: Optional[int] = None,
+        partial_wait_ms: Optional[int] = None,
         partial_on_timeout: bool = True,
         min_http_length: int = 800
     ) -> str:
@@ -711,6 +713,8 @@ class SharedPlaywrightManager:
                 wait_for_selector=wait_for_selector,
                 scroll_to_load=scroll_to_load,
                 timeout=play_timeout,
+                partial_min_bytes=partial_min_bytes,
+                partial_wait_ms=partial_wait_ms,
                 partial_on_timeout=partial_on_timeout
             )
             LOG.info(f"[SMART_FETCH] ✅ Playwright returned {len(result)} bytes")
@@ -750,6 +754,8 @@ class SharedPlaywrightManager:
                 wait_for_selector=wait_for_selector,
                 scroll_to_load=scroll_to_load,
                 timeout=play_timeout,
+                partial_min_bytes=partial_min_bytes,
+                partial_wait_ms=partial_wait_ms,
                 partial_on_timeout=partial_on_timeout
             )
             LOG.info(f"[SMART_FETCH] ✅ Playwright fallback returned {len(result)} bytes")
