@@ -902,14 +902,20 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 source_name: config
             }
             
-            # Timeout wrapper to prevent hanging
+            if site_type == 'myschool':
+                timeout_seconds = 600.0  # 10 minutes for MySchool (Cloudflare heavy)
+                LOG.info(f"⏰ Using extended timeout for MySchool: {timeout_seconds}s")
+            else:
+                timeout_seconds = 250.0  # Standard timeout for other sites
+                LOG.info(f"⏰ Using standard timeout: {timeout_seconds}s")
+                
             items = await asyncio.wait_for(
                 scrape_school_news(
                     single_site_config, 
                     fetch_full_content=False, 
                     max_articles=config.get('max_articles', 10)
                 ),
-                timeout=250.0
+                timeout=timeout_seconds
             )
             
             item_count = len(items) if items else 0
