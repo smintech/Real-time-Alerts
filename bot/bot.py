@@ -1069,7 +1069,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             }
             
         except asyncio.TimeoutError:
-            LOG.error(f"⏱️  TIMEOUT processing {source_name} after 120s")
+            LOG.error(f"⏱️  TIMEOUT processing {source_name} after {timeout_seconds}")
             error_count += 1
         except Exception as e:
             LOG.error(f"❌ CRITICAL ERROR in {source_name}: {str(e)}")
