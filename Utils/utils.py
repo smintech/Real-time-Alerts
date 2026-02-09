@@ -3788,7 +3788,7 @@ async def scrape_school_news(
             "myschool": {"task": scrape_myschool_recent, "max_articles": 10, "type": "myschool"},
             "punch": {"task": scrape_punch_recent, "max_articles": 10, "type": "punch"},
             # Handle the bot's friendly names too
-            "nuc (universities)": {"task": scrape_nuc_recent, "max_articles": 8, "type": "nuc"},
+            "nuc (universities)": {"task": scrape_nuc_recent, "max_articles": 5, "type": "nuc"},
             "myschool.ng": {"task": scrape_myschool_recent, "max_articles": 10, "type": "myschool"},
             "punch education": {"task": scrape_punch_recent, "max_articles": 10, "type": "punch"},
         }
