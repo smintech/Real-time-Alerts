@@ -3921,8 +3921,8 @@ async def scrape_myschool_recent(base_url: str = "https://myschool.ng", max_arti
             allow_playwright=True,
             fetch_kwargs={
                 "wait_for_selector": 'h3.page-title.blog-header-title, div.clearfix, div.pb-5',
-                "scroll_to_load": False,
-                "timeout": 90000,
+                "scroll_to_load": True,
+                "play_timeout": 60000,
                 "partial_on_timeout": True,
                 "partial_min_bytes": 3000,
             }
