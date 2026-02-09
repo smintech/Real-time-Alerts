@@ -2678,7 +2678,6 @@ async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news
         LOG.info(f"[MySchool Listing] 🌐 [{idx}/{len(urls_to_try)}] Fetching: {listing_url}")
         
         try:
-            # Clear cookies before fetch
             html = await shared_playwright.fetch_html(
                 listing_url,
                 wait_for_selector='a[href*="/news/"]',
@@ -2694,39 +2693,65 @@ async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news
                 continue
 
             soup = BeautifulSoup(html, 'lxml')
-            article_urls: Set[str] = set()
-
-            selectors = [
-                '.card a[href*="/news/"]',
-                '.col-sm-6 a[href*="/news/"]',
-                '.col-lg-4 a[href*="/news/"]',
-                '.col-xl-4 a[href*="/news/"]',
-                'a[href*="/news/"]:not([href*="category"]):not([href*="tag"]):not([href*="author"])'
-            ]
-
-            LOG.info(f"[MySchool Listing] 🔎 Searching with {len(selectors)} CSS selectors...")
+            seen: Set[str] = set()
+            ordered_urls: List[str] = []
             
-            for sel_idx, selector in enumerate(selectors, 1):
-                matches = soup.select(selector)
-                LOG.debug(f"[MySchool Listing]   Selector [{sel_idx}] '{selector[:40]}': {len(matches)} matches")
+            LOG.info(f"[MySchool Listing] 🔎 Scanning DOM for article links in document order...")
+            
+            # Find all anchor tags in document order
+            for a in soup.find_all('a', href=True):
+                href = a.get('href', '').strip()
                 
-                for a in matches:
-                    href = a.get('href', '')
-                    if href and '/news/' in href:
-                        if any(bad in href for bad in ['category', 'tag', 'author', 'page', '#', '?']):
-                            LOG.debug(f"[MySchool Listing]   ✗ Filtered out: {href[:60]}")
-                            continue
-                        full_url = urljoin("https://myschool.ng", href)
-                        article_urls.add(full_url)
-                        LOG.debug(f"[MySchool Listing]   ✓ Added: {full_url}")
-
-            if article_urls:
-                final_urls = list(article_urls)[:25]  # LIMIT TO 25
-                LOG.info(f"[MySchool Listing] ✅ Extracted {len(final_urls)} article URLs from {listing_url}")
-                LOG.info(f"[MySchool Listing] 📌 Sample URLs:")
-                for sample_url in final_urls[:3]:
-                    LOG.info(f"[MySchool Listing]    - {sample_url}")
-                return final_urls
+                # Must contain /news/ to be an article
+                if '/news/' not in href:
+                    continue
+                
+                # Skip non-article links
+                if any(bad in href for bad in [
+                    '/news/category/', '/news/tag/', '/news/author/',
+                    '/category/', '/tag/', '/author/',
+                    'page=', '#', '?feed=', '?share='
+                ]):
+                    LOG.debug(f"[MySchool Listing]   ✗ Filtered out (non-article): {href[:60]}")
+                    continue
+                
+                # Skip pagination, archives
+                if any(kw in href for kw in [
+                    'page-', '/page/', '?page=', 'archive', 'year=', 'month='
+                ]):
+                    LOG.debug(f"[MySchool Listing]   ✗ Filtered out (pagination/archive): {href[:60]}")
+                    continue
+                
+                # Skip comment links
+                if href.startswith('#') or href.startswith('javascript:'):
+                    LOG.debug(f"[MySchool Listing]   ✗ Filtered out (JS/anchor): {href[:60]}")
+                    continue
+                
+                # Construct full URL
+                full_url = urljoin("https://myschool.ng", href)
+                
+                # Ensure it's a proper news article URL pattern
+                if not re.match(r'^https://myschool\.ng/news/[^/]+/?$', full_url):
+                    LOG.debug(f"[MySchool Listing]   ✗ Filtered out (bad pattern): {full_url[:60]}")
+                    continue
+                
+                # Deduplicate
+                if full_url in seen:
+                    continue
+                
+                seen.add(full_url)
+                ordered_urls.append(full_url)
+                LOG.debug(f"[MySchool Listing]   ✓ Added ({len(ordered_urls)}): {full_url[:60]}")
+                
+                if len(ordered_urls) >= 10:  # LIMIT TO 25
+                    break
+            
+            if ordered_urls:
+                LOG.info(f"[MySchool Listing] ✅ Extracted {len(ordered_urls)} article URLs from {listing_url}")
+                LOG.info(f"[MySchool Listing] 📌 Sample URLs (in page order):")
+                for sample_idx, sample_url in enumerate(ordered_urls[:3], 1):
+                    LOG.info(f"[MySchool Listing]    {sample_idx}. {sample_url}")
+                return ordered_urls
             else:
                 LOG.warning(f"[MySchool Listing] ⚠️ No article URLs found in {listing_url}")
                 
