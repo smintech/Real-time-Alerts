@@ -1367,12 +1367,12 @@ async def run_bot():
         
         # Register jobs
         if application.job_queue:
-            application.job_queue.run_repeating(
-                callback=check_all_watches,
-                interval=CHECK_INTERVAL_SECONDS,
-                first=30,
-                name="price_checker"
-            )
+            #application.job_queue.run_repeating(
+                #callback=check_all_watches,
+                #interval=CHECK_INTERVAL_SECONDS,
+                #first=30,
+                #name="price_checker"
+            #)
             application.job_queue.run_repeating(
             #application.job_queue.run_repeating(
                 callback=check_and_post_channel_deals,
@@ -1388,12 +1388,12 @@ async def run_bot():
                 name="check_fuel_prices",
                 first=20,
             )
-            application.job_queue.run_repeating(
-                callback=check_trials,
-                interval=86400,
-                first=3600,
-                name="trial_checker"
-            )
+            #application.job_queue.run_repeating(
+                #callback=check_trials,
+                #interval=86400,
+                #first=3600,
+                #name="trial_checker"
+            #)
             application.job_queue.run_repeating(
                 callback=check_and_post_school_updates,
                 interval=CHECK_INTERVAL_SECONDS,  # 6 hours
