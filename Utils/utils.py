@@ -337,7 +337,9 @@ class SharedPlaywrightManager:
             cls._instance._browser = None
             cls._instance._context = None
             cls._instance._active_page = None
-            cls._instance._browser_uses = 0  # Track how many times browser has been used
+            cls._instance._browser_uses = 0
+            cls._instance._cleanup_lock = asyncio.Lock()  # NEW: Separate lock for cleanup
+            cls._instance._browser_lock = asyncio.Lock()  # NEW: Separate lock for browser ops
         return cls._instance
 
     async def initialize(self, **kwargs):
@@ -364,96 +366,138 @@ class SharedPlaywrightManager:
 
     async def _ensure_browser(self, force_new: bool = False):
         """Create browser + context only when needed."""
-        if not force_new and self._browser and self._context:
-            LOG.debug("[ENSURE_BROWSER] ✅ Browser already exists")
-            return
-        
-        if force_new and (self._browser or self._context):
-            LOG.info("[ENSURE_BROWSER] ♻️ Force recreate - cleaning up old browser...")
-            await self._cleanup_browser()
+        async with self._browser_lock:  # NEW: Use dedicated browser lock
+            if not force_new and self._browser and self._context:
+                LOG.debug("[ENSURE_BROWSER] ✅ Browser already exists")
+                return
             
-        LOG.info("[ENSURE_BROWSER] 🌐 Creating fresh browser + context...")
-        
-        try:
-            # Launch browser
-            self._browser = await self._playwright.chromium.launch(
-                headless=self._cfg["headless"],
-                args=self._cfg["args"],
-                timeout=60000
-            )
-            LOG.info("[ENSURE_BROWSER] ✅ Browser launched")
+            if force_new and (self._browser or self._context):
+                LOG.info("[ENSURE_BROWSER] ♻️ Force recreate - cleaning up old browser...")
+                await self._cleanup_browser()
+                
+            LOG.info("[ENSURE_BROWSER] 🌐 Creating fresh browser + context...")
             
-            # Create context with anti-detection
-            ua = random.choice(self._cfg["user_agent_list"]) if self._cfg["user_agent_list"] else None
-            LOG.info(f"[ENSURE_BROWSER] 🎭 Using UA: {ua[:50]}...")
-            
-            self._context = await self._browser.new_context(
-                user_agent=ua,
-                viewport=self._cfg["viewport"],
-                locale=self._cfg["locale"],
-                timezone_id=self._cfg["timezone_id"],
-                java_script_enabled=True,
-                bypass_csp=True,
-                is_mobile=False,
-                has_touch=False,
-                color_scheme='light',
-                extra_http_headers={
-                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                    'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept-Encoding': 'gzip, deflate, br',
-                    'DNT': '1',
-                    'Connection': 'keep-alive',
-                    'Upgrade-Insecure-Requests': '1',
-                    'Sec-Fetch-Dest': 'document',
-                    'Sec-Fetch-Mode': 'navigate',
-                    'Sec-Fetch-Site': 'none',
-                    'Sec-Fetch-User': '?1',
-                }
-            )
-            
-            self._context.set_default_timeout(self._cfg["default_timeout"])
-            self._context.set_default_navigation_timeout(self._cfg["default_timeout"])
-            
-            self._browser_uses = 0
-            LOG.info("[ENSURE_BROWSER] ✅ Context created")
-            
-        except Exception as e:
-            LOG.error(f"[ENSURE_BROWSER] ❌ Failed: {e}")
-            raise
+            try:
+                # Launch browser with explicit timeout
+                self._browser = await asyncio.wait_for(
+                    self._playwright.chromium.launch(
+                        headless=self._cfg["headless"],
+                        args=self._cfg["args"],
+                        timeout=60000
+                    ),
+                    timeout=65  # Slightly longer than internal timeout
+                )
+                LOG.info("[ENSURE_BROWSER] ✅ Browser launched")
+                
+                # Create context with anti-detection
+                ua = random.choice(self._cfg["user_agent_list"]) if self._cfg["user_agent_list"] else None
+                LOG.info(f"[ENSURE_BROWSER] 🎭 Using UA: {ua[:50] if ua else 'None'}...")
+                
+                self._context = await asyncio.wait_for(
+                    self._browser.new_context(
+                        user_agent=ua,
+                        viewport=self._cfg["viewport"],
+                        locale=self._cfg["locale"],
+                        timezone_id=self._cfg["timezone_id"],
+                        java_script_enabled=True,
+                        bypass_csp=True,
+                        is_mobile=False,
+                        has_touch=False,
+                        color_scheme='light',
+                        extra_http_headers={
+                            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                            'Accept-Language': 'en-US,en;q=0.9',
+                            'Accept-Encoding': 'gzip, deflate, br',
+                            'DNT': '1',
+                            'Connection': 'keep-alive',
+                            'Upgrade-Insecure-Requests': '1',
+                            'Sec-Fetch-Dest': 'document',
+                            'Sec-Fetch-Mode': 'navigate',
+                            'Sec-Fetch-Site': 'none',
+                            'Sec-Fetch-User': '?1',
+                        }
+                    ),
+                    timeout=30
+                )
+                
+                self._context.set_default_timeout(self._cfg["default_timeout"])
+                self._context.set_default_navigation_timeout(self._cfg["default_timeout"])
+                
+                self._browser_uses = 0
+                LOG.info("[ENSURE_BROWSER] ✅ Context created")
+                
+            except asyncio.TimeoutError:
+                LOG.error("[ENSURE_BROWSER] ❌ Timeout creating browser/context")
+                await self._cleanup_browser()
+                raise
+            except Exception as e:
+                LOG.error(f"[ENSURE_BROWSER] ❌ Failed: {e}")
+                await self._cleanup_browser()
+                raise
 
     async def _cleanup_browser(self):
         """Close everything - browser, context, pages."""
-        LOG.info("[CLEANUP_BROWSER] 🧹 Closing browser resources...")
-        
-        # Close active page
-        if self._active_page:
-            try:
-                if not self._active_page.is_closed():
-                    await self._active_page.close()
-                LOG.debug("[CLEANUP_BROWSER]   Active page closed")
-            except Exception as e:
-                LOG.debug(f"[CLEANUP_BROWSER]   Page close error: {e}")
-            self._active_page = None
-        
-        # Close context
-        if self._context:
-            try:
-                await self._context.close()
-                LOG.debug("[CLEANUP_BROWSER]   Context closed")
-            except Exception as e:
-                LOG.debug(f"[CLEANUP_BROWSER]   Context close error: {e}")
-            self._context = None
-        
-        # Close browser
-        if self._browser:
-            try:
-                await self._browser.close()
-                LOG.info("[CLEANUP_BROWSER] ✅ Browser closed")
-            except Exception as e:
-                LOG.warning(f"[CLEANUP_BROWSER] ⚠️ Browser close error: {e}")
-            self._browser = None
-        
-        self._browser_uses = 0
+        async with self._cleanup_lock:  # NEW: Use dedicated cleanup lock
+            LOG.info("[CLEANUP_BROWSER] 🧹 Closing browser resources...")
+            
+            # Close active page with timeout
+            if self._active_page:
+                try:
+                    if not self._active_page.is_closed():
+                        await asyncio.wait_for(self._active_page.close(), timeout=5)
+                    LOG.debug("[CLEANUP_BROWSER]   Active page closed")
+                except asyncio.TimeoutError:
+                    LOG.warning("[CLEANUP_BROWSER]   ⚠️ Page close timeout, forcing...")
+                    try:
+                        # Try harder to close
+                        await self._active_page.evaluate("window.stop()")
+                        await asyncio.sleep(0.1)
+                        if not self._active_page.is_closed():
+                            await self._active_page.close()
+                    except Exception:
+                        pass
+                except Exception as e:
+                    LOG.debug(f"[CLEANUP_BROWSER]   Page close error: {e}")
+                finally:
+                    self._active_page = None
+            
+            # Close context with timeout
+            if self._context:
+                try:
+                    await asyncio.wait_for(self._context.close(), timeout=10)
+                    LOG.debug("[CLEANUP_BROWSER]   Context closed")
+                except asyncio.TimeoutError:
+                    LOG.warning("[CLEANUP_BROWSER]   ⚠️ Context close timeout")
+                except Exception as e:
+                    LOG.debug(f"[CLEANUP_BROWSER]   Context close error: {e}")
+                finally:
+                    self._context = None
+            
+            # Close browser with timeout - MOST CRITICAL
+            if self._browser:
+                try:
+                    # First try graceful close
+                    await asyncio.wait_for(self._browser.close(), timeout=15)
+                    LOG.info("[CLEANUP_BROWSER] ✅ Browser closed gracefully")
+                except asyncio.TimeoutError:
+                    LOG.warning("[CLEANUP_BROWSER]   ⚠️ Browser close timeout, forcing...")
+                    try:
+                        # Force kill if possible
+                        if hasattr(self._browser, '_browser'):
+                            proc = self._browser._browser
+                            if proc and hasattr(proc, 'pid'):
+                                import os
+                                import signal
+                                os.kill(proc.pid, signal.SIGKILL)
+                                LOG.info("[CLEANUP_BROWSER]   💀 Browser process killed")
+                    except Exception as kill_e:
+                        LOG.debug(f"[CLEANUP_BROWSER]   Kill error: {kill_e}")
+                except Exception as e:
+                    LOG.warning(f"[CLEANUP_BROWSER] ⚠️ Browser close error: {e}")
+                finally:
+                    self._browser = None
+            
+            self._browser_uses = 0
 
     async def _setup_page(self, page: Page) -> None:
         """Apply anti-detection to page."""
@@ -465,20 +509,20 @@ class SharedPlaywrightManager:
         try:
             # Enhanced anti-detection
             await page.add_init_script(
-                """
-                Object.defineProperty(navigator, 'webdriver', { get: () => undefined });
+                f"""
+                Object.defineProperty(navigator, 'webdriver', {{ get: () => undefined }});
                 delete navigator.__proto__.webdriver;
                 
-                window.chrome = {
-                    runtime: {},
-                    loadTimes: function() {},
-                    csi: function() {},
-                    app: {}
-                };
+                window.chrome = {{
+                    runtime: {{}},
+                    loadTimes: function() {{}},
+                    csi: function() {{}},
+                    app: {{}}
+                }};
                 
-                Object.defineProperty(navigator, 'plugins', { get: () => [1, 2, 3, 4, 5] });
-                Object.defineProperty(navigator, 'languages', { get: () => ['en-US', 'en'] });
-                Object.defineProperty(navigator, 'platform', { get: () => 'Win32' });
+                Object.defineProperty(navigator, 'plugins', {{ get: () => [1, 2, 3, 4, 5] }});
+                Object.defineProperty(navigator, 'languages', {{ get: () => ['en-US', 'en'] }});
+                Object.defineProperty(navigator, 'platform', {{ get: () => 'Win32' }});
                 Object.defineProperty(navigator, 'hardwareConcurrency', {{ get: () => {random.choice([4, 8, 16])} }});
                 Object.defineProperty(navigator, 'deviceMemory', {{ get: () => {random.choice([4, 8, 16])} }});
                 
@@ -549,12 +593,18 @@ class SharedPlaywrightManager:
                 if r.status_code == 200:
                     return r.text
                 return ""
-            result = await loop.run_in_executor(None, _sync_get)
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, _sync_get),
+                timeout=timeout + 5
+            )
             if result:
                 LOG.debug(f"[CLOUDSCRAPER] ✅ Success: {len(result)} bytes")
             else:
                 LOG.debug("[CLOUDSCRAPER] ⚠️ Empty result")
             return result
+        except asyncio.TimeoutError:
+            LOG.debug("[CLOUDSCRAPER] ❌ Timeout")
+            return ""
         except Exception as e:
             LOG.debug(f"[CLOUDSCRAPER] ❌ Failed: {e}")
             return ""
@@ -565,13 +615,16 @@ class SharedPlaywrightManager:
         headers = {"User-Agent": random.choice(self._cfg["user_agent_list"])}
         try:
             async with aiohttp.ClientSession(headers=headers) as session:
-                async with session.get(url, timeout=timeout) as resp:
-                    if resp.status == 200:
-                        result = await resp.text()
-                        LOG.debug(f"[AIOHTTP] ✅ Success: {len(result)} bytes")
-                        return result
-                    else:
-                        LOG.debug(f"[AIOHTTP] ⚠️ Status {resp.status}")
+                async with asyncio.timeout(timeout):
+                    async with session.get(url, timeout=timeout) as resp:
+                        if resp.status == 200:
+                            result = await resp.text()
+                            LOG.debug(f"[AIOHTTP] ✅ Success: {len(result)} bytes")
+                            return result
+                        else:
+                            LOG.debug(f"[AIOHTTP] ⚠️ Status {resp.status}")
+        except asyncio.TimeoutError:
+            LOG.debug("[AIOHTTP] ❌ Timeout")
         except Exception as e:
             LOG.debug(f"[AIOHTTP] ❌ Failed: {e}")
         return ""
@@ -623,7 +676,7 @@ class SharedPlaywrightManager:
         scroll_to_load: bool = False,
         timeout: Optional[int] = None,
         partial_on_timeout: bool = True,
-        recreate_on_block: bool = True,  # NEW: Auto-recreate browser if blocked
+        recreate_on_block: bool = True,
     ) -> str:
         """
         Fetch HTML with Playwright.
@@ -634,14 +687,18 @@ class SharedPlaywrightManager:
         # Ensure browser exists
         await self._ensure_browser()
         
-        # Create fresh page
+        # Create fresh page with timeout
         LOG.info("[FETCH_HTML] 📄 Creating fresh page...")
+        page = None
         try:
-            page = await self._context.new_page()
+            page = await asyncio.wait_for(self._context.new_page(), timeout=15)
             await self._setup_page(page)
             self._active_page = page
             self._browser_uses += 1
             LOG.info(f"[FETCH_HTML] ✅ Page created (browser_uses={self._browser_uses})")
+        except asyncio.TimeoutError:
+            LOG.error("[FETCH_HTML] ❌ Page creation timeout")
+            return ""
         except Exception as e:
             LOG.error(f"[FETCH_HTML] ❌ Page creation failed: {e}")
             return ""
@@ -698,8 +755,9 @@ class SharedPlaywrightManager:
                         if recreate_on_block:
                             LOG.warning(f"[FETCH_HTML] ♻️ RECREATING browser to bypass block...")
                             
+                            # Close page first with timeout
                             try:
-                                await page.close()
+                                await asyncio.wait_for(page.close(), timeout=5)
                             except Exception:
                                 pass
                                 
@@ -708,24 +766,25 @@ class SharedPlaywrightManager:
                             delay = random.uniform(3, 7)
                             LOG.info(f"[FETCH_HTML] ⏳ Waiting {delay:.1f}s before retry...")
                             await asyncio.sleep(delay)
-                                # Try again with fresh browser
+                            
+                            # Try again with fresh browser
                             LOG.info(f"[FETCH_HTML] 🔄 Retrying with fresh browser...")
                                 
                             try:
-                                page = await self._context.new_page()
+                                page = await asyncio.wait_for(self._context.new_page(), timeout=15)
                                 await self._setup_page(page)
+                                self._active_page = page
                                 page.on("response", _on_response)
                                     
                                 await page.goto(url, wait_until=wait_until, timeout=goto_timeout)
                                 await page.wait_for_timeout(2000)
                                     
-                                    # Check again
+                                # Check again
                                 retry_title = await page.title()
                                 retry_body = await page.evaluate("() => document.body?.innerText || ''")
                                     
                                 if self._is_cloudflare_blocked(200, retry_title, retry_body):
                                     LOG.error(f"[FETCH_HTML] ❌ Still blocked after browser recreation")
-                                        # Wait one more time
                                     return ""
                                 else:
                                     LOG.info(f"[FETCH_HTML] ✅ Retry successful - block bypassed!")
@@ -805,15 +864,18 @@ class SharedPlaywrightManager:
             except Exception:
                 pass
             
-            # Close page
+            # Close page with timeout protection
             try:
                 if page and not page.is_closed():
-                    await page.close()
+                    await asyncio.wait_for(page.close(), timeout=5)
                     LOG.debug("[FETCH_HTML] Page closed")
+            except asyncio.TimeoutError:
+                LOG.warning("[FETCH_HTML] ⚠️ Page close timeout")
             except Exception:
                 pass
             
-            self._active_page = None
+            if self._active_page is page:
+                self._active_page = None
 
     async def smart_fetch(
         self,
@@ -848,7 +910,7 @@ class SharedPlaywrightManager:
                 scroll_to_load=scroll_to_load,
                 timeout=play_timeout,
                 partial_on_timeout=partial_on_timeout,
-                recreate_on_block=True  # Auto-recreate if blocked
+                recreate_on_block=True
             )
             LOG.info(f"[SMART_FETCH] ✅ Playwright returned {len(result)} bytes")
             return result
@@ -963,10 +1025,18 @@ class SharedPlaywrightManager:
                     LOG.info(f"[run_concurrent] ⏳ Waiting {delay:.1f}s before next URL...")
                     await asyncio.sleep(delay)
             
-            # Cleanup browser after batch
+            # Cleanup browser after batch with timeout protection
             if self._browser:
                 LOG.info(f"[run_concurrent] 🧹 Cleaning up browser (used {self._browser_uses} times)...")
-                await self._cleanup_browser()
+                try:
+                    await asyncio.wait_for(self._cleanup_browser(), timeout=30)
+                except asyncio.TimeoutError:
+                    LOG.error("[run_concurrent] ⚠️ Browser cleanup timeout, forcing...")
+                    # Force cleanup
+                    self._browser = None
+                    self._context = None
+                    self._active_page = None
+                    self._browser_uses = 0
             
             # Summary
             success_count = sum(1 for _, html in results if html and len(html) > 800)
@@ -976,29 +1046,40 @@ class SharedPlaywrightManager:
             
         except Exception as e:
             LOG.error(f"[run_concurrent] 💥 FATAL: {e}")
-            await self._cleanup_browser()
+            # Emergency cleanup
+            try:
+                await asyncio.wait_for(self._cleanup_browser(), timeout=10)
+            except Exception:
+                self._browser = None
+                self._context = None
+                self._active_page = None
             raise
 
     async def cleanup(self):
         """Full cleanup."""
         LOG.info("[CLEANUP] 🧹 Full cleanup...")
         
-        await self._cleanup_browser()
+        try:
+            await asyncio.wait_for(self._cleanup_browser(), timeout=30)
+        except asyncio.TimeoutError:
+            LOG.error("[CLEANUP] ⚠️ Browser cleanup timeout")
         
         if self._playwright:
             try:
-                await self._playwright.stop()
+                await asyncio.wait_for(self._playwright.stop(), timeout=10)
                 LOG.info("[CLEANUP] ✅ Playwright stopped")
+            except asyncio.TimeoutError:
+                LOG.warning("[CLEANUP] ⚠️ Playwright stop timeout")
             except Exception as e:
                 LOG.warning(f"[CLEANUP] ⚠️ Playwright stop error: {e}")
-            self._playwright = None
+            finally:
+                self._playwright = None
         
         self._initialized = False
         LOG.info("[CLEANUP] ✅ Complete")
 
 # Global instance
 shared_playwright = SharedPlaywrightManager()
-
 
 async def fetch_with_playwright_aggressive(
     url: str,
