@@ -1379,7 +1379,6 @@ async def fetch_with_playwright_aggressive(
 # ═══════════════════════════════════════════════════════════════════════════
 # ULTIMATE FETCH
 # ═══════════════════════════════════════════════════════════════════════════
-
 async def fetch_html_ultimate(url: str) -> str:
     """Fetch HTML with semaphore-controlled concurrency."""
     domain = get_domain_from_url(url)
@@ -2844,6 +2843,327 @@ def _detect_block(soup: BeautifulSoup) -> Optional[str]:
         return "blocked_by_cloudflare"
     return None
 
+def analyze_fuel_html(html: str, url: str = "https://app.fuelpricewatch.com/") -> Dict[str, Any]:
+    """
+    Analyze HTML and log key findings vs expectations.
+    Returns both analysis results AND parsing result.
+    """
+    
+    LOG.info("="*80)
+    LOG.info("🔍 FUEL PAGE HTML ANALYSIS")
+    LOG.info("="*80)
+    
+    soup = BeautifulSoup(html, "lxml")
+    page_text = soup.get_text()
+    
+    analysis = {
+        "html_length": len(html),
+        "text_length": len(page_text),
+        "expectations_met": [],
+        "expectations_failed": [],
+        "found_elements": {},
+        "recommendations": []
+    }
+    
+    # ============================================================
+    # 1. BASIC PAGE INFO
+    # ============================================================
+    LOG.info(f"📄 HTML Length: {len(html):,} bytes")
+    LOG.info(f"📝 Text Length: {len(page_text):,} chars")
+    
+    title = soup.title.string if soup.title else "No title"
+    LOG.info(f"📋 Page Title: {title}")
+    
+    # ============================================================
+    # 2. EXPECTATION: Card elements should exist
+    # ============================================================
+    LOG.info("\n" + "─"*80)
+    LOG.info("✅ EXPECTATION #1: Card Elements (div.rounded-lg.border.bg-card)")
+    LOG.info("─"*80)
+    
+    expected_selector = 'div.rounded-lg.border.bg-card'
+    cards = soup.select(expected_selector)
+    
+    if cards:
+        LOG.info(f"✅ FOUND: {len(cards)} cards with exact selector")
+        analysis["expectations_met"].append("exact_card_selector")
+        analysis["found_elements"]["exact_cards"] = len(cards)
+        
+        # Show first card's text
+        first_card_text = cards[0].get_text(strip=True)[:150]
+        LOG.info(f"   First card text: {first_card_text}...")
+    else:
+        LOG.warning(f"❌ NOT FOUND: No elements match '{expected_selector}'")
+        analysis["expectations_failed"].append("exact_card_selector")
+        
+        # Try variations
+        LOG.info("   Trying variations...")
+        variations = [
+            ('div.rounded-lg', 'rounded cards'),
+            ('div.border', 'bordered divs'),
+            ('div.bg-card', 'bg-card divs'),
+            ('div[class*="rounded"]', 'divs with "rounded" in class'),
+        ]
+        
+        for var_selector, var_desc in variations:
+            var_elements = soup.select(var_selector)
+            if var_elements:
+                LOG.info(f"   ✓ Found {len(var_elements)} {var_desc} ({var_selector})")
+                analysis["found_elements"][var_desc] = len(var_elements)
+                
+                # Check first one for petrol text
+                if 'petrol' in var_elements[0].get_text().lower():
+                    LOG.info(f"      → First one contains 'petrol'!")
+                    analysis["recommendations"].append(f"Use selector: {var_selector}")
+            else:
+                LOG.info(f"   ✗ No {var_desc}")
+    
+    # ============================================================
+    # 3. EXPECTATION: "Average Petrol Price" text should exist
+    # ============================================================
+    LOG.info("\n" + "─"*80)
+    LOG.info("✅ EXPECTATION #2: Text 'Average Petrol Price' exists")
+    LOG.info("─"*80)
+    
+    key_phrases = [
+        "Average Petrol Price",
+        "average petrol price",
+        "AVERAGE PETROL PRICE",
+        "Petrol Price",
+        "PMS Price",
+    ]
+    
+    found_phrases = []
+    for phrase in key_phrases:
+        if phrase in page_text:
+            count = page_text.count(phrase)
+            LOG.info(f"✅ FOUND: '{phrase}' ({count}x)")
+            found_phrases.append(phrase)
+            
+            # Show context
+            idx = page_text.find(phrase)
+            context = page_text[max(0, idx-30):min(len(page_text), idx+80)]
+            LOG.info(f"   Context: ...{context}...")
+        else:
+            LOG.debug(f"   ✗ Not found: '{phrase}'")
+    
+    if found_phrases:
+        analysis["expectations_met"].append("petrol_text")
+        analysis["found_elements"]["petrol_phrases"] = found_phrases
+    else:
+        LOG.warning("❌ NOT FOUND: None of the expected petrol phrases found")
+        analysis["expectations_failed"].append("petrol_text")
+        
+        # Check for variations
+        if re.search(r'petrol', page_text, re.I):
+            LOG.info("   ⚠️ Found 'petrol' (case-insensitive) but not exact phrases")
+    
+    # ============================================================
+    # 4. EXPECTATION: Price in format ₦XXX.XX should exist
+    # ============================================================
+    LOG.info("\n" + "─"*80)
+    LOG.info("✅ EXPECTATION #3: Price pattern ₦XXX.XX (range 600-1500)")
+    LOG.info("─"*80)
+    
+    price_pattern = r'₦\s*([0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)'
+    price_matches = list(re.finditer(price_pattern, page_text))
+    
+    if price_matches:
+        LOG.info(f"✅ FOUND: {len(price_matches)} price patterns")
+        
+        # Categorize by range
+        valid_prices = []
+        invalid_prices = []
+        
+        for match in price_matches[:20]:  # Check first 20
+            price_str = match.group(1).replace(',', '')
+            try:
+                price_val = float(price_str)
+                if 600 <= price_val <= 1500:
+                    valid_prices.append(price_val)
+                else:
+                    invalid_prices.append(price_val)
+            except:
+                pass
+        
+        if valid_prices:
+            LOG.info(f"   ✅ {len(valid_prices)} prices in valid range (600-1500):")
+            for i, price in enumerate(valid_prices[:5], 1):
+                LOG.info(f"      {i}. ₦{price:,.2f}")
+            if len(valid_prices) > 5:
+                LOG.info(f"      ... and {len(valid_prices) - 5} more")
+            
+            analysis["expectations_met"].append("valid_price")
+            analysis["found_elements"]["valid_prices"] = valid_prices
+        else:
+            LOG.warning(f"   ⚠️ No prices in valid range (found {len(invalid_prices)} invalid)")
+            if invalid_prices:
+                LOG.info(f"   Invalid prices: {invalid_prices[:5]}")
+    else:
+        LOG.warning("❌ NOT FOUND: No ₦ price patterns found")
+        analysis["expectations_failed"].append("price_pattern")
+    
+    # ============================================================
+    # 5. EXPECTATION: Change indicators (% and ₦)
+    # ============================================================
+    LOG.info("\n" + "─"*80)
+    LOG.info("✅ EXPECTATION #4: Change indicators (%, ₦ today)")
+    LOG.info("─"*80)
+    
+    # Percentage change
+    perc_patterns = [
+        r'([+-]?\s*[0-9]+\.?[0-9]*\s*%)\s*from\s+last\s+period',
+        r'([+-]?\s*[0-9]+\.?[0-9]*\s*%)',
+    ]
+    
+    perc_found = False
+    for pattern in perc_patterns:
+        matches = re.findall(pattern, page_text, re.I)
+        if matches:
+            LOG.info(f"✅ FOUND: Percentage pattern - {matches[:3]}")
+            perc_found = True
+            analysis["found_elements"]["percent_changes"] = matches
+            break
+    
+    if not perc_found:
+        LOG.warning("❌ NOT FOUND: No percentage change pattern")
+    
+    # Absolute change
+    abs_patterns = [
+        r'([+-]?\s*₦\s*[0-9]+\.?[0-9]*)\s*today',
+        r'today[^\d₦]*([+-]?\s*₦\s*[0-9]+\.?[0-9]*)',
+    ]
+    
+    abs_found = False
+    for pattern in abs_patterns:
+        matches = re.findall(pattern, page_text, re.I)
+        if matches:
+            LOG.info(f"✅ FOUND: Absolute change pattern - {matches[:3]}")
+            abs_found = True
+            analysis["found_elements"]["absolute_changes"] = matches
+            break
+    
+    if not abs_found:
+        LOG.warning("❌ NOT FOUND: No '₦X today' pattern")
+    
+    if perc_found and abs_found:
+        analysis["expectations_met"].append("change_indicators")
+    else:
+        analysis["expectations_failed"].append("change_indicators")
+    
+    # ============================================================
+    # 6. ACTUAL CSS CLASSES FOUND
+    # ============================================================
+    LOG.info("\n" + "─"*80)
+    LOG.info("📊 ACTUAL CSS CLASSES IN PAGE (Top 15)")
+    LOG.info("─"*80)
+    
+    all_classes = []
+    for elem in soup.find_all(True)[:500]:  # First 500 elements
+        classes = elem.get('class', [])
+        all_classes.extend(classes)
+    
+    class_counter = Counter(all_classes)
+    top_classes = class_counter.most_common(15)
+    
+    for cls, count in top_classes:
+        LOG.info(f"   {cls}: {count}x")
+        
+    analysis["found_elements"]["top_css_classes"] = [cls for cls, _ in top_classes]
+    
+    # ============================================================
+    # 7. ELEMENTS WITH PRICE-RELATED CLASSES
+    # ============================================================
+    LOG.info("\n" + "─"*80)
+    LOG.info("💰 ELEMENTS WITH PRICE-RELATED CLASSES")
+    LOG.info("─"*80)
+    
+    price_class_patterns = ['price', 'Price', 'prc', 'amount', 'cost']
+    
+    for pattern in price_class_patterns:
+        selector = f'[class*="{pattern}"]'
+        elements = soup.select(selector)
+        
+        if elements:
+            LOG.info(f"✅ Found {len(elements)} elements with '{pattern}' in class")
+            # Show first one
+            first_text = elements[0].get_text(strip=True)[:100]
+            first_classes = elements[0].get('class', [])
+            LOG.info(f"   First: {first_text}...")
+            LOG.info(f"   Classes: {first_classes}")
+            
+            analysis["found_elements"][f"class_{pattern}"] = len(elements)
+        else:
+            LOG.debug(f"   ✗ No elements with '{pattern}' in class")
+    
+    # ============================================================
+    # 8. STRUCTURAL ANALYSIS
+    # ============================================================
+    LOG.info("\n" + "─"*80)
+    LOG.info("🏗️  PAGE STRUCTURE")
+    LOG.info("─"*80)
+    
+    total_divs = len(soup.find_all('div'))
+    total_sections = len(soup.find_all('section'))
+    total_articles = len(soup.find_all('article'))
+    
+    LOG.info(f"   <div>: {total_divs}")
+    LOG.info(f"   <section>: {total_sections}")
+    LOG.info(f"   <article>: {total_articles}")
+    
+    # Check for common layout patterns
+    has_main = bool(soup.find('main'))
+    has_header = bool(soup.find('header'))
+    has_nav = bool(soup.find('nav'))
+    
+    LOG.info(f"   <main>: {'✓' if has_main else '✗'}")
+    LOG.info(f"   <header>: {'✓' if has_header else '✗'}")
+    LOG.info(f"   <nav>: {'✓' if has_nav else '✗'}")
+    
+    # ============================================================
+    # 9. FINAL RECOMMENDATIONS
+    # ============================================================
+    LOG.info("\n" + "="*80)
+    LOG.info("💡 RECOMMENDATIONS")
+    LOG.info("="*80)
+    
+    if not analysis["expectations_failed"]:
+        LOG.info("✅ All expectations met! Original selectors should work.")
+    else:
+        LOG.warning(f"⚠️ {len(analysis['expectations_failed'])} expectations failed:")
+        for failed in analysis["expectations_failed"]:
+            LOG.warning(f"   - {failed}")
+        
+        LOG.info("\n📝 Recommended fixes:")
+        
+        # Recommendation 1: Use what we found
+        if "valid_prices" in analysis["found_elements"]:
+            LOG.info("   1. ✅ Valid prices exist - use text-based extraction fallback")
+        
+        # Recommendation 2: Selector alternatives
+        if analysis["recommendations"]:
+            LOG.info("   2. Try these alternative selectors:")
+            for rec in analysis["recommendations"]:
+                LOG.info(f"      - {rec}")
+        
+        # Recommendation 3: Lenient parser
+        LOG.info("   3. Consider using the lenient parser (4 fallback strategies)")
+    
+    # ============================================================
+    # 10. SUMMARY
+    # ============================================================
+    LOG.info("\n" + "="*80)
+    LOG.info("📊 ANALYSIS SUMMARY")
+    LOG.info("="*80)
+    LOG.info(f"✅ Expectations Met: {len(analysis['expectations_met'])}")
+    LOG.info(f"❌ Expectations Failed: {len(analysis['expectations_failed'])}")
+    LOG.info(f"💡 Recommendations: {len(analysis['recommendations'])}")
+    LOG.info("="*80 + "\n")
+    
+    return analysis
+
+
+
 def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/") -> Dict[str, Any]:
     """
     Parse Fuel Price Watch app structure based on 2026-02-11 analysis.
@@ -2860,6 +3180,9 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
         Dict with keys: source, price_raw, price_str, change_percent, change_absolute, last_updated
         Or dict with "error" key if parsing fails
     """
+    
+    analysis = analyze_fuel_html(html, url)
+    
     soup = BeautifulSoup(html, "lxml")
     
     LOG.debug("[FuelPriceWatch] Starting parse with %d chars of HTML", len(html))
@@ -3042,6 +3365,7 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
         "change_percent": change_percent,
         "change_absolute": change_absolute,
         "last_updated": "Live data",
+        "analysis": analysis,
     }
 
 @retry(max_attempts=3, backoff=1.5)
@@ -3083,6 +3407,7 @@ async def scrape_fuel_prices() -> Dict[str, Any]:
         LOG.info(f"[FuelPrices] ✓ Playwright fetch success: {len(html)} bytes")
         
         result = _parse_fuelpricewatch(html, url=app_url)
+        analysis = analyze_fuel_html(html, url)
         
         if result.get("price_raw") is not None:
             LOG.info("[FuelPrices] ✅ Method 1 SUCCESS - Live app data extracted")
@@ -3108,8 +3433,6 @@ async def scrape_fuel_prices() -> Dict[str, Any]:
     
     try:
         LOG.info("[FuelPrices] Method 2: Fetching static index page...")
-        
-        from . import _fetch_html  # Adjust import as needed
         
         index_html = await _fetch_html(index_url)
         LOG.info(f"[FuelPrices] ✓ Index fetch success: {len(index_html)} bytes")
