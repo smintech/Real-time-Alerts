@@ -111,7 +111,7 @@ DEFAULT_SCHOOL_SOURCES = {
         "https://myschool.ng/news"
     ],
     "Punch Education": [
-        "https://punchng.com"
+        "https://punchng.com/topics/education/"
     ],
 
     #"Lagos State Education": [
