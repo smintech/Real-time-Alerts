@@ -1338,15 +1338,209 @@ def parse_myschool_date(date_str: str) -> Optional[datetime]:
     return None
 
 def parse_punch_date(date_str: str) -> Optional[datetime]:
-    if not date_str:
+    """
+    Parse Punch.ng date strings into datetime objects.
+    
+    Handles multiple formats:
+    - "February 9, 2026 8:40 pm"
+    - "February 9, 2026"
+    - "Feb 9, 2026 8:40 pm"
+    - "2026-02-09T16:04:46+00:00" (ISO 8601 from JSON-LD)
+    - "Monday, February 09, 2026"
+    
+    Args:
+        date_str: Date string from Punch article
+        
+    Returns:
+        datetime object or None if parsing fails
+    """
+    if not date_str or not isinstance(date_str, str):
         return None
-    date_formats_with_time = ['%B %d, %Y %I:%M %p', '%b %d, %Y %I:%M %p']
-    date_formats_no_time = ['%B %d, %Y', '%b %d, %Y']
-    for fmt in date_formats_with_time + date_formats_no_time:
+    
+    # Clean the string
+    date_str = date_str.strip()
+    
+    # Remove day of week if present (e.g., "Monday, ")
+    date_str = re.sub(r'^(Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday),\s*', '', date_str, flags=re.I)
+    
+    # List of formats to try, in order of likelihood
+    date_formats = [
+        # With time (12-hour format with am/pm)
+        '%B %d, %Y %I:%M %p',      # February 9, 2026 8:40 pm
+        '%b %d, %Y %I:%M %p',      # Feb 9, 2026 8:40 pm
+        '%B %d, %Y %I:%M%p',       # February 9, 2026 8:40pm (no space)
+        '%b %d, %Y %I:%M%p',       # Feb 9, 2026 8:40pm
+        
+        # With time (24-hour format)
+        '%B %d, %Y %H:%M',         # February 9, 2026 16:04
+        '%b %d, %Y %H:%M',         # Feb 9, 2026 16:04
+        
+        # Date only
+        '%B %d, %Y',               # February 9, 2026
+        '%b %d, %Y',               # Feb 9, 2026
+        '%B %d %Y',                # February 9 2026 (no comma)
+        '%b %d %Y',                # Feb 9 2026
+        
+        # ISO 8601 (from JSON-LD)
+        '%Y-%m-%dT%H:%M:%S%z',     # 2026-02-09T16:04:46+00:00
+        '%Y-%m-%dT%H:%M:%S.%f%z',  # 2026-02-09T16:04:46.123+00:00
+        '%Y-%m-%dT%H:%M:%SZ',      # 2026-02-09T16:04:46Z
+        '%Y-%m-%dT%H:%M:%S',       # 2026-02-09T16:04:46
+        
+        # Alternative formats
+        '%d %B, %Y',               # 9 February, 2026
+        '%d %b, %Y',               # 9 Feb, 2026
+        '%d/%m/%Y',                # 09/02/2026
+        '%Y-%m-%d',                # 2026-02-09
+    ]
+    
+    # Try each format
+    for fmt in date_formats:
         try:
-            return datetime.strptime(date_str, fmt)
-        except:
+            dt = datetime.strptime(date_str, fmt)
+            LOG.debug(f"[parse_punch_date] Parsed '{date_str}' using format '{fmt}'")
+            return dt
+        except ValueError:
             continue
+    
+    # Special handling for ISO 8601 with 'Z' timezone
+    if 'T' in date_str and date_str.endswith('Z'):
+        try:
+            # Replace Z with +00:00
+            iso_str = date_str.replace('Z', '+00:00')
+            dt = datetime.fromisoformat(iso_str)
+            LOG.debug(f"[parse_punch_date] Parsed '{date_str}' using fromisoformat")
+            return dt
+        except Exception:
+            pass
+    
+    # Special handling for timezone offsets like +00:00
+    if 'T' in date_str and ('+' in date_str or date_str.count('-') > 2):
+        try:
+            dt = datetime.fromisoformat(date_str)
+            LOG.debug(f"[parse_punch_date] Parsed '{date_str}' using fromisoformat")
+            return dt
+        except Exception:
+            pass
+    
+    LOG.warning(f"[parse_punch_date] Failed to parse date: '{date_str}'")
+    return None
+
+def extract_punch_date_from_html(soup, url: str = "") -> Optional[datetime]:
+    """
+    Extract date from Punch article HTML using multiple strategies.
+    
+    Tries in order:
+    1. JSON-LD structured data (most reliable)
+    2. HTML meta tags
+    3. Visible date elements
+    4. Text pattern matching
+    
+    Args:
+        soup: BeautifulSoup object of article page
+        url: Article URL (for logging)
+        
+    Returns:
+        datetime object or None
+    """
+    # Strategy 1: JSON-LD (most reliable)
+    LOG.debug(f"[extract_punch_date] Strategy 1: Trying JSON-LD for {url[:60]}")
+    for script in soup.find_all("script", type="application/ld+json"):
+        try:
+            data = json.loads(script.string or "{}")
+            
+            # Handle both single object and @graph array
+            items = data.get("@graph", [data]) if isinstance(data, dict) else [data]
+            
+            for item in items:
+                if item.get("@type") == "Article":
+                    # Try datePublished first
+                    date_str = item.get("datePublished")
+                    if date_str:
+                        dt = parse_punch_date(date_str)
+                        if dt:
+                            LOG.info(f"[extract_punch_date] ✅ Found via JSON-LD: {dt}")
+                            return dt
+                    
+                    # Fallback to dateModified
+                    date_str = item.get("dateModified")
+                    if date_str:
+                        dt = parse_punch_date(date_str)
+                        if dt:
+                            LOG.info(f"[extract_punch_date] ✅ Found via JSON-LD (modified): {dt}")
+                            return dt
+        except Exception as e:
+            LOG.debug(f"[extract_punch_date] JSON-LD parse error: {e}")
+            continue
+    
+    # Strategy 2: Meta tags
+    LOG.debug(f"[extract_punch_date] Strategy 2: Trying meta tags")
+    meta_selectors = [
+        'meta[property="article:published_time"]',
+        'meta[property="og:published_time"]',
+        'meta[name="article:published_time"]',
+        'meta[name="pubdate"]',
+    ]
+    
+    for selector in meta_selectors:
+        try:
+            elem = soup.select_one(selector)
+            if elem:
+                date_str = elem.get('content', '')
+                if date_str:
+                    dt = parse_punch_date(date_str)
+                    if dt:
+                        LOG.info(f"[extract_punch_date] ✅ Found via meta tag: {dt}")
+                        return dt
+        except Exception:
+            continue
+    
+    # Strategy 3: HTML date elements
+    LOG.debug(f"[extract_punch_date] Strategy 3: Trying HTML elements")
+    date_selectors = [
+        'span.text-gray-500',           # New 2026 structure
+        'span.post-date',               # Traditional structure
+        'time',                         # HTML5 time element
+        'div.flex.items-center span',  # Date container
+        '.entry-date',
+        '.published',
+    ]
+    
+    for selector in date_selectors:
+        try:
+            elem = soup.select_one(selector)
+            if elem:
+                # Try datetime attribute first (for <time> tags)
+                date_str = elem.get('datetime', '')
+                if not date_str:
+                    date_str = elem.get_text(strip=True)
+                
+                if date_str:
+                    dt = parse_punch_date(date_str)
+                    if dt:
+                        LOG.info(f"[extract_punch_date] ✅ Found via {selector}: {dt}")
+                        return dt
+        except Exception:
+            continue
+    
+    # Strategy 4: Text pattern matching (last resort)
+    LOG.debug(f"[extract_punch_date] Strategy 4: Trying text patterns")
+    try:
+        page_text = soup.get_text()
+        
+        # Pattern 1: "February 9, 2026 8:40 pm"
+        pattern1 = r'((?:January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}(?:\s+\d{1,2}:\d{2}\s*(?:am|pm)?)?)'
+        match = re.search(pattern1, page_text, re.IGNORECASE)
+        if match:
+            date_str = match.group(1)
+            dt = parse_punch_date(date_str)
+            if dt:
+                LOG.info(f"[extract_punch_date] ✅ Found via text pattern: {dt}")
+                return dt
+    except Exception:
+        pass
+    
+    LOG.warning(f"[extract_punch_date] ❌ All strategies failed for {url[:60]}")
     return None
 
 def parse_nuc_date(date_str: str) -> Optional[datetime]:
@@ -2763,7 +2957,14 @@ async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news
     return []
 
 async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> List[str]:
-    """Get recent Punch education articles - ENHANCED LOGGING"""
+    """
+    Get recent Punch education articles - FIXED SELECTORS
+    
+    Correct selectors based on actual HTML structure:
+    - Featured articles: h2.text-xl.font-bold.leading-tight a
+    - Regular articles: h3.text-sm.font-semibold.leading-snug.punch-clamp-2 a
+    - Dates: div.flex.items-center span.text-gray-500 or span.post-date
+    """
     LOG.info(f"[Punch Listing] 🔍 Starting extraction from {base_url}")
     
     listing_url = f"{base_url}/topics/education/"
@@ -2785,35 +2986,83 @@ async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> Li
         soup = BeautifulSoup(listing_html, 'lxml')
         articles_with_dates = []
         
-        article_elements = soup.select('article.entry-item-simple')
-        LOG.info(f"[Punch Listing] 🔎 Found {len(article_elements)} article elements")
+        # ✅ FIX: Use correct selectors based on actual HTML structure
+        # Articles are in <h3> tags with specific classes, containing <a> links
+        article_links = soup.select('h3.text-sm.font-semibold.leading-snug.punch-clamp-2 a[href*="punchng.com"]')
         
-        for idx, article in enumerate(article_elements, 1):
-            link = article.select_one('a[href*="punchng.com"]')
-            if not link:
-                LOG.debug(f"[Punch Listing]   Article [{idx}]: No link found")
+        # Also get featured article (larger font, different class)
+        featured_links = soup.select('h2.text-xl.font-bold.leading-tight a[href*="punchng.com"]')
+        
+        all_links = featured_links + article_links
+        
+        LOG.info(f"[Punch Listing] 🔎 Found {len(all_links)} article links ({len(featured_links)} featured + {len(article_links)} regular)")
+        
+        seen_urls = set()
+        
+        for idx, link in enumerate(all_links, 1):
+            href = link.get('href', '')
+            if not href:
+                continue
+                
+            # Filter out non-article URLs
+            if any(bad in href for bad in [
+                '/topics/', '/category/', '/tag/', '/author/',
+                'advertise', '#', '?feed=', '?share='
+            ]):
+                LOG.debug(f"[Punch Listing]   Link [{idx}]: Filtered non-article URL")
                 continue
             
-            full_url = urljoin(base_url, link.get('href', ''))
-            date_elem = article.select_one('.post-date')
-            date_str = date_elem.get_text(strip=True) if date_elem else ""
-            date_obj = parse_punch_date(date_str)
+            full_url = urljoin(base_url, href)
             
-            LOG.debug(f"[Punch Listing]   Article [{idx}]: {full_url[:60]}... | Date: {date_str}")
+            # Deduplicate
+            if full_url in seen_urls:
+                continue
+            seen_urls.add(full_url)
+            
+            # Try to find associated date
+            # Dates are in sibling/parent containers with class 'flex items-center text-[11px] text-[#d71920]'
+            date_str = ""
+            date_obj = None
+            
+            # Look for date in nearby elements (traverse up parent tree)
+            parent = link.parent
+            attempts = 0
+            while parent and not date_str and attempts < 5:
+                # Try multiple date selectors
+                date_elem = parent.select_one(
+                    'div.flex.items-center span.text-gray-500, '
+                    'span.post-date, '
+                    'time, '
+                    'div[class*="text-gray-500"]'
+                )
+                if date_elem:
+                    date_str = date_elem.get_text(strip=True)
+                    date_obj = parse_punch_date(date_str)
+                    break
+                parent = parent.parent
+                attempts += 1
+                # Don't go too far up
+                if parent and parent.name in ['body', 'html']:
+                    break
+            
+            LOG.debug(f"[Punch Listing]   Article [{idx}]: {full_url[:60]}... | Date: {date_str or 'Not found'}")
             
             articles_with_dates.append({
                 'url': full_url,
-                'date_obj': date_obj or datetime.min
+                'date_obj': date_obj or datetime.now(),  # Default to now if no date found
+                'title': link.get_text(strip=True)[:60]
             })
         
+        # Sort by date (most recent first)
         articles_with_dates.sort(key=lambda x: x['date_obj'], reverse=True)
         urls = [a['url'] for a in articles_with_dates[:15]]
         
         LOG.info(f"[Punch Listing] ✅ Extracted {len(urls)} article URLs")
         if urls:
-            LOG.info(f"[Punch Listing] 📌 Sample URLs:")
-            for sample_url in urls[:3]:
-                LOG.info(f"[Punch Listing]    - {sample_url}")
+            LOG.info(f"[Punch Listing] 📌 Sample URLs (with titles):")
+            for idx, a in enumerate(articles_with_dates[:3], 1):
+                LOG.info(f"[Punch Listing]    {idx}. {a['title']}")
+                LOG.info(f"[Punch Listing]       URL: {a['url']}")
         
         return urls
         
@@ -3153,6 +3402,7 @@ def extract_punch_content(html: str, url: str) -> Dict[str, Any]:
         soup = BeautifulSoup(html, 'lxml')
 
         title_selectors = [
+             'h1.text-3xl',
             'h1.post-title',
             '.post-title',
             'h1.entry-title',
@@ -3170,12 +3420,14 @@ def extract_punch_content(html: str, url: str) -> Dict[str, Any]:
             date_elem = None
         if date_elem:
             date_str = _safe_get_text(date_elem)
-            result['date_obj'] = _safe_parse_date(parse_punch_date, date_str)
-            result['date_str'] = date_str
+            result['date_obj'] = extract_punch_date_from_html(soup, url)
+            if result['date_obj']:
+                result['date_str'] = result['date_obj'].strftime('%B %d, %Y %I:%M %p')
 
         # Content extraction
         content_selectors = [
             'div.post-content',
+            'article.prose',
             '.entry-content',
             'article',
             'main'
