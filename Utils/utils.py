@@ -3162,8 +3162,6 @@ def analyze_fuel_html(html: str, url: str = "https://app.fuelpricewatch.com/") -
     
     return analysis
 
-
-
 def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/") -> Dict[str, Any]:
     """
     Parse Fuel Price Watch - handles concatenated text with NO spaces between elements.
@@ -3243,29 +3241,13 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
     
     # The pattern for concatenated format: "Average Petrol Price₦873.88+0.5% from last period+₦5.00 today"
     petrol_pattern = r'Average\s+Petrol\s+Price\s*(₦\s*\d{3,4}(?:\.\dparse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/") -> Dict[str, Any]:
-    """
-    Parse Fuel Price Watch - handles concatenated text with NO spaces between elements.
-    Includes detailed element logging for debugging.
-    """
+
     soup = BeautifulSoup(html, "lxml")
     LOG.debug("[FuelPriceWatch] Starting parse with %d chars of HTML", len(html))
     
     # ═══════════════════════════════════════════════════════════════════════
     # ELEMENT LOGGING: Inspect actual DOM elements, not just counts
     # ═══════════════════════════════════════════════════════════════════════
-    
-    def log_element_details(element: BeautifulSoup, context: str = "") -> None:
-        """Log detailed info about a specific element."""
-        tag_name = element.name or "text"
-        element_id = element.get('id', 'no-id')
-        classes = ' '.join(element.get('class', [])) or 'no-class'
-        text_preview = element.get_text(strip=True)[:100].replace('\n', ' ')
-        
-        LOG.debug(
-            "[FuelPriceWatch] %s Element: <%s id='%s' class='%s'> | Text: '%s...'",
-            context, tag_name, element_id, classes, text_preview
-        )
-    
     # Log the specific card structure your analysis found
     target_card = soup.find('div', class_=lambda x: x and 'gumroad-card' in str(x))
     if target_card:
