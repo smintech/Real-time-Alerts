@@ -3144,7 +3144,7 @@ async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news
 
 async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> List[str]:
     """
-    Get recent Punch education articles - DEBUGGING VERSION WITH DETAILED LOGS
+    Get recent Punch education articles - FIXED FOR COMPRESSED RESPONSES
     """
     LOG.info(f"[Punch Listing] 🔍 Starting extraction from {base_url}")
     
@@ -3164,6 +3164,46 @@ async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> Li
             LOG.error("[Punch Listing] ❌ No HTML returned from listing page")
             return []
         
+        # ✅ FIX: Check if HTML is compressed/binary and handle it
+        if isinstance(listing_html, bytes):
+            LOG.info("[Punch Listing] ⚠️ Received bytes, attempting decompression...")
+            try:
+                # Try to decode as UTF-8 first
+                listing_html = listing_html.decode('utf-8')
+                LOG.info("[Punch Listing] ✅ Successfully decoded bytes to UTF-8")
+            except UnicodeDecodeError:
+                # If that fails, try decompressing
+                import gzip
+                import brotli
+                try:
+                    # Try Brotli first (common for modern sites)
+                    listing_html = brotli.decompress(listing_html).decode('utf-8')
+                    LOG.info("[Punch Listing] ✅ Decompressed with Brotli")
+                except Exception:
+                    try:
+                        # Try gzip
+                        listing_html = gzip.decompress(listing_html).decode('utf-8')
+                        LOG.info("[Punch Listing] ✅ Decompressed with gzip")
+                    except Exception as decomp_err:
+                        LOG.error(f"[Punch Listing] ❌ Failed to decompress: {decomp_err}")
+                        return []
+        
+        # ✅ Additional check: if it still looks like binary, force Playwright
+        if not listing_html.strip().startswith('<') and '<html' not in listing_html[:1000]:
+            LOG.warning("[Punch Listing] ⚠️ HTML doesn't start with <, likely still compressed. Forcing Playwright...")
+            listing_html = await shared_playwright.smart_fetch(
+                listing_url,
+                prefer_http=False,  # Force Playwright
+                allow_playwright=True,
+            )
+            if isinstance(listing_html, bytes):
+                listing_html = listing_html.decode('utf-8', errors='ignore')
+        
+        # ✅ Verify we have valid HTML
+        if '<html' not in listing_html and '<!DOCTYPE' not in listing_html:
+            LOG.error(f"[Punch Listing] ❌ Invalid HTML content. First 200 chars: {listing_html[:200]}")
+            return []
+        
         soup = BeautifulSoup(listing_html, 'lxml')
         
         # ✅ DEBUG: Log HTML structure first
@@ -3171,11 +3211,11 @@ async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> Li
         LOG.info("🔍 DEBUGGING HTML STRUCTURE")
         LOG.info("=" * 80)
         
-        # 1. Log the first 5000 chars of HTML to see structure
-        LOG.info("[DEBUG] First 5000 characters of HTML:")
-        LOG.info(listing_html[:5000])
+        # Log first 1000 chars of decoded HTML
+        LOG.info("[DEBUG] First 1000 characters of HTML:")
+        LOG.info(listing_html[:1000])
         
-        # 2. Log all links found in the page
+        # 1. Log all links found in the page
         LOG.info("=" * 80)
         LOG.info("[DEBUG] ALL LINKS FOUND IN PAGE:")
         all_links = soup.find_all('a', href=True)
@@ -3205,12 +3245,11 @@ async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> Li
             LOG.info(f"    Text: {text}")
             LOG.info(f"    URL: {href}")
             LOG.info(f"    Parent: {parent}, Classes: {parent_classes}")
-            LOG.info(f"    Parent full tag: {str(link.parent)[:200] if link.parent else 'No parent'}")
             
             if is_article_candidate:
                 article_candidates.append(link)
         
-        # 3. Log all heading elements (h1-h6)
+        # 2. Log all heading elements (h1-h6)
         LOG.info("=" * 80)
         LOG.info("[DEBUG] ALL HEADING ELEMENTS:")
         for i in range(1, 7):
@@ -3224,7 +3263,7 @@ async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> Li
                 for link in links_in_h:
                     LOG.info(f"    → Link: {link.get('href')}")
         
-        # 4. Log all divs with classes that might contain articles
+        # 3. Log all divs with classes that might contain articles
         LOG.info("=" * 80)
         LOG.info("[DEBUG] DIV ELEMENTS WITH COMMON ARTICLE CLASSES:")
         article_class_patterns = ['article', 'card', 'post', 'news', 'story', 'content', 'entry', 'item']
@@ -3241,7 +3280,7 @@ async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> Li
                 for link in links[:3]:  # First 3 links
                     LOG.info(f"    → {link.get('href')[:80]}")
         
-        # 5. Log all elements with article-like structure (based on analysis)
+        # 4. Log all elements with article-like structure (based on analysis)
         LOG.info("=" * 80)
         LOG.info("[DEBUG] ELEMENTS WITH SPECIFIC CLASSES FROM ANALYSIS:")
         
