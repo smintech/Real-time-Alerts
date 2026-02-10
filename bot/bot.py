@@ -1375,7 +1375,6 @@ async def run_bot():
                 #name="price_checker"
             #)
             application.job_queue.run_repeating(
-            #application.job_queue.run_repeating(
                 callback=check_and_post_channel_deals,
                 interval=CHECK_INTERVAL_SECONDS,
                 #first=10,
@@ -1395,13 +1394,13 @@ async def run_bot():
                 #first=3600,
                 #name="trial_checker"
             #)
-            application.job_queue.run_repeating(
-                callback=check_and_post_school_updates,
-                interval=CHECK_INTERVAL_SECONDS,  # 6 hours
-                first=30,
+            #application.job_queue.run_repeating(
+                #callback=check_and_post_school_updates,
+                #interval=CHECK_INTERVAL_SECONDS,  # 6 hours
+                #first=30,
                 #time=time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
-                name="school_updates_poster",
-            )
+                #name="school_updates_poster",
+            # )
             # Cleanup job
             application.job_queue.run_daily(
                 callback=lambda ctx: cleanup_all_expired(),
