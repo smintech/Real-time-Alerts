@@ -13,7 +13,7 @@ from http import HTTPStatus
 import asyncio
 import requests
 import shutil
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from functools import wraps
 from urllib.parse import urlparse, urljoin
 from bs4 import BeautifulSoup, Tag
@@ -579,7 +579,7 @@ class SharedPlaywrightManager:
         LOG.debug("[SETUP_PAGE] ✅ Resource blocking configured")
 
     async def _cloudscraper_fetch(self, url: str, timeout: int = 20) -> str:
-        """Fetch using cloudscraper (runs in executor)."""
+        """Fetch using cloudscraper with realistic browser headers."""
         if cloudscraper is None:
             LOG.debug("[CLOUDSCRAPER] ℹ️  Module not available")
             return ""
@@ -587,46 +587,144 @@ class SharedPlaywrightManager:
         LOG.debug(f"[CLOUDSCRAPER] 📡 Fetching {url[:60]}...")
         try:
             loop = asyncio.get_running_loop()
+            
             def _sync_get():
-                s = cloudscraper.create_scraper()
-                r = s.get(url, timeout=timeout)
+                # Create scraper with browser emulation
+                s = cloudscraper.create_scraper(
+                    browser={
+                        'browser': 'chrome',
+                        'platform': random.choice(['windows', 'darwin', 'linux']),
+                        'mobile': False
+                    }
+                )
+                
+                # Comprehensive headers that mimic real browser
+                parsed = urlparse(url)
+                domain = parsed.netloc
+                
+                headers = {
+                    'User-Agent': random.choice(self._cfg["user_agent_list"]),
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+                    'Accept-Language': 'en-US,en;q=0.9',
+                    'Accept-Encoding': 'gzip, deflate, br, zstd',
+                    'Cache-Control': 'max-age=0',
+                    'Connection': 'keep-alive',
+                    'DNT': '1',
+                    'Upgrade-Insecure-Requests': '1',
+                    'Sec-Fetch-Dest': 'document',
+                    'Sec-Fetch-Mode': 'navigate',
+                    'Sec-Fetch-Site': 'none',
+                    'Sec-Fetch-User': '?1',
+                    'Sec-CH-UA': '"Not A(Brand";v="99", "Google Chrome";v="121", "Chromium";v="121"',
+                    'Sec-CH-UA-Mobile': '?0',
+                    'Sec-CH-UA-Platform': '"Windows"',
+                }
+                
+                # Add random referer for non-direct visits (looks more natural)
+                if random.random() > 0.3:  # 70% of time add referer
+                    referers = [
+                        'https://www.google.com/',
+                        'https://www.bing.com/',
+                        f'https://{domain}/',
+                    ]
+                    headers['Referer'] = random.choice(referers)
+                
+                r = s.get(url, headers=headers, timeout=timeout)
                 if r.status_code == 200:
                     return r.text
                 return ""
+            
             result = await asyncio.wait_for(
                 loop.run_in_executor(None, _sync_get),
                 timeout=timeout + 5
             )
+            
             if result:
                 LOG.debug(f"[CLOUDSCRAPER] ✅ Success: {len(result)} bytes")
             else:
                 LOG.debug("[CLOUDSCRAPER] ⚠️ Empty result")
             return result
+            
         except asyncio.TimeoutError:
             LOG.debug("[CLOUDSCRAPER] ❌ Timeout")
             return ""
         except Exception as e:
             LOG.debug(f"[CLOUDSCRAPER] ❌ Failed: {e}")
             return ""
-
+    
     async def _aiohttp_fetch(self, url: str, timeout: int = 20) -> str:
-        """Fetch using aiohttp."""
+        """Fetch using aiohttp with comprehensive browser headers."""
         LOG.debug(f"[AIOHTTP] 📡 Fetching {url[:60]}...")
-        headers = {"User-Agent": random.choice(self._cfg["user_agent_list"])}
+        
+        # Parse URL for domain-specific headers
+        parsed = urlparse(url)
+        domain = parsed.netloc
+        
+        # Comprehensive browser headers
+        headers = {
+            'User-Agent': random.choice(self._cfg["user_agent_list"]),
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
+            'Accept-Language': 'en-US,en;q=0.9,en-GB;q=0.8',
+            'Accept-Encoding': 'gzip, deflate, br, zstd',
+            'Cache-Control': 'max-age=0',
+            'Connection': 'keep-alive',
+            'DNT': '1',
+            'Upgrade-Insecure-Requests': '1',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Sec-CH-UA': '"Chromium";v="122", "Not(A:Brand";v="24", "Google Chrome";v="122"',
+            'Sec-CH-UA-Mobile': '?0',
+            'Sec-CH-UA-Platform': '"Windows"',
+            'Sec-CH-UA-Platform-Version': '"15.0.0"',
+        }
+        
+        # Add random referer for credibility (70% of time)
+        if random.random() > 0.3:
+            referers = [
+                'https://www.google.com/',
+                'https://www.google.com.ng/',  # Nigerian Google
+                'https://www.bing.com/',
+                f'https://{domain}/',
+            ]
+            headers['Referer'] = random.choice(referers)
+        
         try:
-            async with aiohttp.ClientSession(headers=headers) as session:
-                async with asyncio.timeout(timeout):
-                    async with session.get(url, timeout=timeout) as resp:
-                        if resp.status == 200:
-                            result = await resp.text()
-                            LOG.debug(f"[AIOHTTP] ✅ Success: {len(result)} bytes")
-                            return result
-                        else:
-                            LOG.debug(f"[AIOHTTP] ⚠️ Status {resp.status}")
+            # Use TCPConnector with better settings
+            connector = aiohttp.TCPConnector(
+                limit=10,
+                limit_per_host=5,
+                ttl_dns_cache=300,
+                ssl=False,  # Disable SSL verification for problematic sites
+            )
+            
+            client_timeout = aiohttp.ClientTimeout(
+                total=timeout,
+                connect=10,
+                sock_read=timeout
+            )
+            
+            async with aiohttp.ClientSession(
+                headers=headers,
+                connector=connector,
+                timeout=client_timeout
+            ) as session:
+                async with session.get(url) as resp:
+                    if resp.status == 200:
+                        result = await resp.text()
+                        LOG.debug(f"[AIOHTTP] ✅ Success: {len(result)} bytes")
+                        return result
+                    else:
+                        LOG.debug(f"[AIOHTTP] ⚠️ Status {resp.status}")
+                        
         except asyncio.TimeoutError:
             LOG.debug("[AIOHTTP] ❌ Timeout")
+        except aiohttp.ClientError as e:
+            LOG.debug(f"[AIOHTTP] ❌ Client error: {type(e).__name__}: {str(e)[:100]}")
         except Exception as e:
-            LOG.debug(f"[AIOHTTP] ❌ Failed: {e}")
+            LOG.debug(f"[AIOHTTP] ❌ Failed: {type(e).__name__}: {str(e)[:100]}")
+        
         return ""
 
     async def _wait_for_cloudflare_clearance(self, page: Page, timeout: int = 20000) -> bool:
@@ -1638,7 +1736,14 @@ def parse_nuc_date(date_str: str) -> Optional[datetime]:
 def is_recent_date(date_obj: Optional[datetime]) -> bool:
     if not date_obj:
         return False
-    cutoff_date = datetime.now() - timedelta(days=MAX_ARTICLE_AGE_DAYS)
+    
+    # Make cutoff timezone-aware
+    cutoff_date = datetime.now(timezone.utc) - timedelta(days=MAX_ARTICLE_AGE_DAYS)
+    
+    # If date_obj is naive, make it UTC-aware
+    if date_obj.tzinfo is None:
+        date_obj = date_obj.replace(tzinfo=timezone.utc)
+    
     return date_obj >= cutoff_date
 
 def normalize_product_key(scrape_result: Dict[str, Any]) -> str:
@@ -3069,11 +3174,15 @@ async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> Li
         
         # ✅ FIX: Use correct selectors based on actual HTML structure
         # Articles are in <h3> tags with specific classes, containing <a> links
-        article_links = soup.select('h3.text-sm.font-semibold.leading-snug.punch-clamp-2 a[href*="punchng.com"]')
+        article_links = soup.select('h3[class*="punch-clamp-2"] a[href*="punchng.com"]')
+        featured_links = soup.select('h2[class*="punch-clamp-3"] a[href*="punchng.com"]')
         
-        # Also get featured article (larger font, different class)
-        featured_links = soup.select('h2.text-xl.font-bold.leading-tight a[href*="punchng.com"]')
-        
+        LOG.info(f"DEBUG: Sample article elements:")
+        for idx, link in enumerate(article_links[:3], 1):
+            LOG.info(f"  {idx}. Text: {link.get_text(strip=True)[:50]}")
+            LOG.info(f"     URL: {link.get('href')}")
+            LOG.info(f"     Parent classes: {link.parent.get('class')}")
+            
         all_links = featured_links + article_links
         
         LOG.info(f"[Punch Listing] 🔎 Found {len(all_links)} article links ({len(featured_links)} featured + {len(article_links)} regular)")
