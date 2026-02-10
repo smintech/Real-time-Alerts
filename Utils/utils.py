@@ -3166,194 +3166,191 @@ def analyze_fuel_html(html: str, url: str = "https://app.fuelpricewatch.com/") -
 
 def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/") -> Dict[str, Any]:
     """
-    Parse Fuel Price Watch app structure based on 2026-02-11 analysis.
-    
-    Structure identified:
-    - Cards: div.rounded-lg.border.bg-card.text-card-foreground.shadow-sm
-    - Card header: h3 or element with class text-sm (contains "Average Petrol Price")
-    - Price: div with classes text-xl sm:text-2xl font-bold (₦873.88)
-    - Changes: p.text-xs elements in same card:
-      * "+0.5% from last period"
-      * "+₦5.00 today"
-    
-    Returns:
-        Dict with keys: source, price_raw, price_str, change_percent, change_absolute, last_updated
-        Or dict with "error" key if parsing fails
+    Parse Fuel Price Watch - handles concatenated text with NO spaces between elements.
+    Includes detailed element logging for debugging.
     """
-    
-    analysis = analyze_fuel_html(html, url)
-    
     soup = BeautifulSoup(html, "lxml")
-    
     LOG.debug("[FuelPriceWatch] Starting parse with %d chars of HTML", len(html))
     
-    # Strategy 1: Find "Average Petrol Price" card by header text
-    petrol_card = None
+    # ═══════════════════════════════════════════════════════════════════════
+    # ELEMENT LOGGING: Inspect actual DOM elements, not just counts
+    # ═══════════════════════════════════════════════════════════════════════
     
-    # Try finding by header in card
-    for card in soup.select('div.rounded-lg.border.bg-card'):
-        # Look for header with "petrol" in text
-        header = card.select_one('h3, .text-sm, [class*="font-semibold"]')
-        if header and 'petrol' in header.get_text(strip=True).lower():
-            petrol_card = card
-            LOG.debug("[FuelPriceWatch] ✓ Found petrol card via header")
-            break
-    
-    # Fallback Strategy 2: Search by text content
-    if not petrol_card:
-        LOG.debug("[FuelPriceWatch] Header search failed, trying text content search...")
-        page_text = soup.get_text()
+    def log_element_details(element: BeautifulSoup, context: str = "") -> None:
+        """Log detailed info about a specific element."""
+        tag_name = element.name or "text"
+        element_id = element.get('id', 'no-id')
+        classes = ' '.join(element.get('class', [])) or 'no-class'
+        text_preview = element.get_text(strip=True)[:100].replace('\n', ' ')
         
-        if "Average Petrol Price" in page_text:
-            # Find any container with this text
-            for elem in soup.find_all(['div', 'article', 'section']):
-                elem_text = elem.get_text()
-                if "Average Petrol Price" in elem_text and "₦" in elem_text:
-                    # Check if this looks like a card (has price and changes)
-                    if re.search(r'₦\s*\d{3}', elem_text):
-                        petrol_card = elem
-                        LOG.debug("[FuelPriceWatch] ✓ Found petrol card via text search")
-                        break
+        LOG.debug(
+            "[FuelPriceWatch] %s Element: <%s id='%s' class='%s'> | Text: '%s...'",
+            context, tag_name, element_id, classes, text_preview
+        )
     
-    # Fallback Strategy 3: Look for first price in expected range
-    if not petrol_card:
-        LOG.debug("[FuelPriceWatch] Text search failed, trying price-based search...")
-        page_text = soup.get_text()
+    # Log the specific card structure your analysis found
+    target_card = soup.find('div', class_=lambda x: x and 'gumroad-card' in str(x))
+    if target_card:
+        LOG.info("[FuelPriceWatch] 🎯 Found target card with 'gumroad-card' class")
+        log_element_details(target_card, "TARGET")
         
-        # Find all prices in page
-        price_matches = re.finditer(r'₦\s*([0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)', page_text)
-        for match in price_matches:
-            price_str = match.group(1).replace(",", "")
-            try:
-                price_val = float(price_str)
-                # Petrol price range: 600-1500 NGN/liter
-                if 600 <= price_val <= 1500:
-                    # Find the element containing this price
-                    for elem in soup.find_all(['div', 'span', 'p']):
-                        if match.group(0) in elem.get_text():
-                            # Try to find parent card
-                            parent = elem
-                            for _ in range(5):  # Check up to 5 levels up
-                                if parent and 'rounded' in str(parent.get('class', '')):
-                                    petrol_card = parent
-                                    LOG.debug("[FuelPriceWatch] ✓ Found petrol card via price range")
-                                    break
-                                parent = parent.parent if parent else None
-                            if petrol_card:
-                                break
-                    if petrol_card:
-                        break
-            except ValueError:
-                continue
+        # Log all children of the target card
+        for i, child in enumerate(target_card.find_all(recursive=False)):
+            log_element_details(child, f"  CHILD[{i}]")
+    else:
+        LOG.warning("[FuelPriceWatch] ⚠️ No 'gumroad-card' found, trying alternatives")
+        # Log what cards ARE present
+        all_cards = soup.find_all('div', class_=lambda x: x and 'card' in str(x).lower())
+        for i, card in enumerate(all_cards[:5]):  # First 5 only
+            log_element_details(card, f"  ALT-CARD[{i}]")
     
-    if not petrol_card:
-        LOG.warning("[FuelPriceWatch] ❌ Could not find petrol price card with any strategy")
-        return {"error": "no_petrol_card"}
+    # ═══════════════════════════════════════════════════════════════════════
+    # STRATEGY: Extract from specific element structure
+    # ═══════════════════════════════════════════════════════════════════════
     
-    LOG.debug("[FuelPriceWatch] Card found, extracting data...")
+    # Try to find the exact element containing "₦873.88" (from your analysis)
+    price_element = None
+    for elem in soup.find_all(text=re.compile(r'₦\s*\d{3,4}\.\d{2}')):
+        parent = elem.parent
+        if parent:
+            log_element_details(parent, f"PRICE-PARENT({elem.strip()})")
+            # Check if this parent contains "Average Petrol Price"
+            parent_text = parent.get_text(strip=True)
+            if 'petrol' in parent_text.lower():
+                price_element = parent
+                LOG.info("[FuelPriceWatch] ✓ Found price element in petrol context")
+                break
     
-    # Extract price from card
-    price_raw = None
+    # ═══════════════════════════════════════════════════════════════════════
+    # EXTRACTION: Parse the concatenated text
+    # ═══════════════════════════════════════════════════════════════════════
     
-    # Try specific price element selectors
-    price_selectors = [
-        'div.text-xl',
-        'div[class*="text-2xl"]',
-        '.font-bold',
-        'div[class*="font-bold"]',
-    ]
-    
-    for selector in price_selectors:
-        price_elem = petrol_card.select_one(selector)
-        if price_elem:
-            price_text = price_elem.get_text(strip=True)
-            LOG.debug(f"[FuelPriceWatch] Found price element with selector '{selector}': '{price_text}'")
+    if price_element:
+        # Get the full text from this element and its siblings/parent
+        container = price_element.find_parent('div', class_=lambda x: x and 'card' in str(x).lower())
+        if not container:
+            container = price_element
             
-            # Extract number from ₦873.88 format
-            price_match = re.search(r'₦\s*([0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)', price_text)
-            if price_match:
-                price_str = price_match.group(1).replace(",", "")
-                try:
-                    price_raw = float(price_str)
-                    LOG.debug(f"[FuelPriceWatch] ✓ Extracted price: ₦{price_raw}")
-                    break
-                except ValueError:
-                    LOG.warning(f"[FuelPriceWatch] Failed to parse price: '{price_str}'")
+        raw_text = container.get_text(separator=' ', strip=True)
+        LOG.debug("[FuelPriceWatch] Raw container text: %s", raw_text[:200])
+    else:
+        # Fallback to full page text
+        raw_text = soup.get_text(" ", strip=True)
+        LOG.debug("[FuelPriceWatch] Using full page text")
     
-    # Fallback: Get any price from card text
-    if price_raw is None:
-        card_text = petrol_card.get_text()
-        price_match = re.search(r'₦\s*([0-9]{1,4}(?:,[0-9]{3})*(?:\.[0-9]{1,2})?)', card_text)
-        if price_match:
-            price_str = price_match.group(1).replace(",", "")
-            try:
-                price_raw = float(price_str)
-                LOG.debug(f"[FuelPriceWatch] ✓ Extracted price (fallback): ₦{price_raw}")
-            except ValueError:
-                pass
+    # Log the exact text being parsed (critical for debugging)
+    LOG.info("[FuelPriceWatch] 🔍 Parsing text: %s", raw_text[:150])
     
-    if price_raw is None:
-        LOG.warning("[FuelPriceWatch] ❌ Could not extract price from card")
-        return {"error": "no_price"}
+    # The pattern for concatenated format: "Average Petrol Price₦873.88+0.5% from last period+₦5.00 today"
+    petrol_pattern = r'Average\s+Petrol\s+Price\s*(₦\s*\d{3,4}(?:\.\dparse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/") -> Dict[str, Any]:
+    """
+    Parse Fuel Price Watch - handles concatenated text with NO spaces between elements.
+    Includes detailed element logging for debugging.
+    """
+    soup = BeautifulSoup(html, "lxml")
+    LOG.debug("[FuelPriceWatch] Starting parse with %d chars of HTML", len(html))
     
-    # Validate price range (petrol should be 600-1500 NGN/liter in 2026)
-    if not (600 <= price_raw <= 1500):
-        LOG.warning(f"[FuelPriceWatch] ⚠️ Price {price_raw} outside expected range [600-1500]")
-        # Don't fail, but log warning
+    # ═══════════════════════════════════════════════════════════════════════
+    # ELEMENT LOGGING: Inspect actual DOM elements, not just counts
+    # ═══════════════════════════════════════════════════════════════════════
+    
+    def log_element_details(element: BeautifulSoup, context: str = "") -> None:
+        """Log detailed info about a specific element."""
+        tag_name = element.name or "text"
+        element_id = element.get('id', 'no-id')
+        classes = ' '.join(element.get('class', [])) or 'no-class'
+        text_preview = element.get_text(strip=True)[:100].replace('\n', ' ')
+        
+        LOG.debug(
+            "[FuelPriceWatch] %s Element: <%s id='%s' class='%s'> | Text: '%s...'",
+            context, tag_name, element_id, classes, text_preview
+        )
+    
+    # Log the specific card structure your analysis found
+    target_card = soup.find('div', class_=lambda x: x and 'gumroad-card' in str(x))
+    if target_card:
+        LOG.info("[FuelPriceWatch] 🎯 Found target card with 'gumroad-card' class")
+        log_element_details(target_card, "TARGET")
+        
+        # Log all children of the target card
+        for i, child in enumerate(target_card.find_all(recursive=False)):
+            log_element_details(child, f"  CHILD[{i}]")
+    else:
+        LOG.warning("[FuelPriceWatch] ⚠️ No 'gumroad-card' found, trying alternatives")
+        # Log what cards ARE present
+        all_cards = soup.find_all('div', class_=lambda x: x and 'card' in str(x).lower())
+        for i, card in enumerate(all_cards[:5]):  # First 5 only
+            log_element_details(card, f"  ALT-CARD[{i}]")
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # STRATEGY: Extract from specific element structure
+    # ═══════════════════════════════════════════════════════════════════════
+    
+    # Try to find the exact element containing "₦873.88" (from your analysis)
+    price_element = None
+    for elem in soup.find_all(text=re.compile(r'₦\s*\d{3,4}\.\d{2}')):
+        parent = elem.parent
+        if parent:
+            log_element_details(parent, f"PRICE-PARENT({elem.strip()})")
+            # Check if this parent contains "Average Petrol Price"
+            parent_text = parent.get_text(strip=True)
+            if 'petrol' in parent_text.lower():
+                price_element = parent
+                LOG.info("[FuelPriceWatch] ✓ Found price element in petrol context")
+                break
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # EXTRACTION: Parse the concatenated text
+    # ═══════════════════════════════════════════════════════════════════════
+    
+    if price_element:
+        # Get the full text from this element and its siblings/parent
+        container = price_element.find_parent('div', class_=lambda x: x and 'card' in str(x).lower())
+        if not container:
+            container = price_element
+            
+        raw_text = container.get_text(separator=' ', strip=True)
+        LOG.debug("[FuelPriceWatch] Raw container text: %s", raw_text[:200])
+    else:
+        # Fallback to full page text
+        raw_text = soup.get_text(" ", strip=True)
+        LOG.debug("[FuelPriceWatch] Using full page text")
+    
+    # Log the exact text being parsed (critical for debugging)
+    LOG.info("[FuelPriceWatch] 🔍 Parsing text: %s", raw_text[:150])
+    
+    # The pattern for concatenated format: "Average Petrol Price₦873.88+0.5% from last period+₦5.00 today"
+    petrol_pattern = r'Average\s+Petrol\s+Price\s*(₦\s*\d{3,4}(?:\.\d+)?)\s*([+\-]\d+\.?\d*)\s*%?\s*from\s+last\s+period\s*([+\-]?\s*₦?\s*\d+\.?\d*)\s*today'
+    
+    match = re.search(petrol_pattern, raw_text, re.IGNORECASE)
+    
+    if not match:
+        LOG.warning("[FuelPriceWatch] ❌ Pattern failed. Raw text sample: %s", raw_text[:300])
+        return {"error": "no_petrol_pattern", "raw_sample": raw_text[:200]}
+    
+    price_raw_str, change_percent_str, change_absolute_str = match.groups()
+    
+    # Parse components with validation logging
+    try:
+        price_raw = float(re.search(r'\d+\.?\d*', price_raw_str).group())
+        LOG.debug("[FuelPriceWatch] Parsed price: %s → %f", price_raw_str, price_raw)
+    except (ValueError, AttributeError) as e:
+        LOG.error("[FuelPriceWatch] Failed to parse price from '%s': %s", price_raw_str, e)
+        return {"error": "price_parse_failed", "price_str": price_raw_str}
     
     price_formatted = f"₦{price_raw:,.2f}"
+    change_percent = f"{change_percent_str}%"
     
-    # Extract changes from same card
-    change_percent = "N/A"
-    change_absolute = "N/A"
+    # Parse absolute change with detailed logging
+    abs_val = change_absolute_str.strip()
+    abs_num_match = re.search(r'\d+\.?\d*', abs_val)
+    if not abs_num_match:
+        LOG.error("[FuelPriceWatch] Failed to extract number from '%s'", abs_val)
+        return {"error": "abs_change_parse_failed", "abs_str": change_absolute_str}
     
-    card_text = petrol_card.get_text()
-    LOG.debug(f"[FuelPriceWatch] Card text sample: {card_text[:200]}...")
-    
-    # Look for percentage change: "+0.5% from last period"
-    perc_patterns = [
-        r'([+-]?\s*[\d\.]+\s*%)\s*from\s+last\s+period',
-        r'([+-]?\s*[\d\.]+\s*%)\s*from\s+previous',
-        r'([+-]?\s*[\d\.]+\s*%)\s*change',
-    ]
-    
-    for pattern in perc_patterns:
-        perc_match = re.search(pattern, card_text, re.I)
-        if perc_match:
-            change_percent = perc_match.group(1).strip()
-            LOG.debug(f"[FuelPriceWatch] ✓ Found percent change: '{change_percent}'")
-            break
-    
-    # Look for absolute change: "+₦5.00 today"
-    abs_patterns = [
-        r'([+-]?\s*₦\s*[\d\.,]+\.?\d*)\s*today',
-        r'today[:\s]*([+-]?\s*₦\s*[\d\.,]+)',
-    ]
-    
-    for pattern in abs_patterns:
-        abs_match = re.search(pattern, card_text, re.I)
-        if abs_match:
-            change_absolute = abs_match.group(1).strip()
-            LOG.debug(f"[FuelPriceWatch] ✓ Found absolute change: '{change_absolute}'")
-            break
-    
-    # Additional fallback: Look for any % and ₦ in card if still N/A
-    if change_percent == "N/A":
-        perc_match = re.search(r'([+-]?\s*[\d\.]+\s*%)', card_text)
-        if perc_match:
-            change_percent = perc_match.group(1).strip()
-            LOG.debug(f"[FuelPriceWatch] ✓ Found percent change (fallback): '{change_percent}'")
-    
-    if change_absolute == "N/A":
-        # Look for ₦ followed by number, near "today"
-        abs_match = re.search(r'([+-]?\s*₦\s*[\d\.]+)', card_text)
-        if abs_match:
-            # Check if "today" appears near this match
-            match_pos = abs_match.start()
-            nearby_text = card_text[max(0, match_pos-30):match_pos+50]
-            if 'today' in nearby_text.lower():
-                change_absolute = abs_match.group(1).strip()
-                LOG.debug(f"[FuelPriceWatch] ✓ Found absolute change (fallback): '{change_absolute}'")
+    abs_num = abs_num_match.group()
+    abs_sign = '-' if '-' in abs_val else '+'
+    change_absolute = f"{abs_sign}₦{abs_num}"
     
     LOG.info("[FuelPriceWatch] ✅ SUCCESS → Price: %s | Period: %s | Today: %s", 
              price_formatted, change_percent, change_absolute)
@@ -3365,7 +3362,7 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
         "change_percent": change_percent,
         "change_absolute": change_absolute,
         "last_updated": "Live data",
-        "analysis": analysis,
+        "parsed_from": raw_text[:100],  # Include source text for verification
     }
 
 @retry(max_attempts=3, backoff=1.5)
