@@ -606,7 +606,8 @@ class SharedPlaywrightManager:
                     'User-Agent': random.choice(self._cfg["user_agent_list"]),
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8,application/signed-exchange;v=b3;q=0.7',
                     'Accept-Language': 'en-US,en;q=0.9',
-                    'Accept-Encoding': 'gzip, deflate, br, zstd',
+                    # ✅ FIX: Don't request Brotli (br) - only gzip/deflate which are reliably handled
+                    'Accept-Encoding': 'gzip, deflate',
                     'Cache-Control': 'max-age=0',
                     'Connection': 'keep-alive',
                     'DNT': '1',
@@ -630,14 +631,48 @@ class SharedPlaywrightManager:
                     headers['Referer'] = random.choice(referers)
                 
                 r = s.get(url, headers=headers, timeout=timeout)
+                
+                # ✅ FIX: Handle potential binary/compressed responses
                 if r.status_code == 200:
-                    return r.text
+                    content = r.content  # Get raw bytes first
+                    
+                    # Check if it's already text
+                    if isinstance(content, str):
+                        return content
+                    
+                    # Try to detect encoding and decode
+                    encoding = r.encoding
+                    if encoding:
+                        try:
+                            return content.decode(encoding)
+                        except (UnicodeDecodeError, LookupError):
+                            pass
+                    
+                    # Try common encodings
+                    for enc in ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']:
+                        try:
+                            return content.decode(enc)
+                        except UnicodeDecodeError:
+                            continue
+                    
+                    # If all else fails, use errors='replace'
+                    return content.decode('utf-8', errors='replace')
+                
                 return ""
             
             result = await asyncio.wait_for(
                 loop.run_in_executor(None, _sync_get),
                 timeout=timeout + 5
             )
+            
+            # ✅ Additional safety check for binary data
+            if result and isinstance(result, str):
+                # Check if it looks like binary (high ratio of non-printable chars)
+                sample = result[:1000]
+                non_printable = sum(1 for c in sample if ord(c) < 32 and c not in '\n\r\t')
+                if non_printable > len(sample) * 0.1:  # More than 10% non-printable
+                    LOG.warning(f"[CLOUDSCRAPER] ⚠️ Response appears to be binary ({non_printable} non-printable chars)")
+                    return ""
             
             if result:
                 LOG.debug(f"[CLOUDSCRAPER] ✅ Success: {len(result)} bytes")
