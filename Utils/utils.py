@@ -3407,7 +3407,7 @@ async def scrape_fuel_prices() -> Dict[str, Any]:
         LOG.info(f"[FuelPrices] ✓ Playwright fetch success: {len(html)} bytes")
         
         result = _parse_fuelpricewatch(html, url=app_url)
-        analysis = analyze_fuel_html(html, app_url)
+        analysis = analyze_fuel_html(html, url=app_url)
         
         if result.get("price_raw") is not None:
             LOG.info("[FuelPrices] ✅ Method 1 SUCCESS - Live app data extracted")
