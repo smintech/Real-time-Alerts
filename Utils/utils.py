@@ -11,6 +11,7 @@ import random
 import pathlib
 from http import HTTPStatus
 import asyncio
+from dataclasses import dataclass
 import requests
 import shutil
 from datetime import datetime, timedelta, timezone
