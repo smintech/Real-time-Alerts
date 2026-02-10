@@ -107,9 +107,9 @@ DEFAULT_SCHOOL_SOURCES = {
         "https://www.nuc.edu.ng/"
     ],
     # --- Reliable Education News Aggregators (Best for "Daily" updates) ---
-    "MySchool.ng": [
-        "https://myschool.ng/news"
-    ],
+    #"MySchool.ng": [
+      #  "https://myschool.ng/news"
+    #],
     "Punch Education": [
         "https://punchng.com"
     ],
