@@ -3144,7 +3144,7 @@ async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news
 
 async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> List[str]:
     """
-    Get recent Punch education articles - UPDATED FOR CURRENT STRUCTURE
+    Get recent Punch education articles - DEBUGGING VERSION WITH DETAILED LOGS
     """
     LOG.info(f"[Punch Listing] 🔍 Starting extraction from {base_url}")
     
@@ -3165,154 +3165,298 @@ async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> Li
             return []
         
         soup = BeautifulSoup(listing_html, 'lxml')
+        
+        # ✅ DEBUG: Log HTML structure first
+        LOG.info("=" * 80)
+        LOG.info("🔍 DEBUGGING HTML STRUCTURE")
+        LOG.info("=" * 80)
+        
+        # 1. Log the first 5000 chars of HTML to see structure
+        LOG.info("[DEBUG] First 5000 characters of HTML:")
+        LOG.info(listing_html[:5000])
+        
+        # 2. Log all links found in the page
+        LOG.info("=" * 80)
+        LOG.info("[DEBUG] ALL LINKS FOUND IN PAGE:")
+        all_links = soup.find_all('a', href=True)
+        LOG.info(f"Total links found: {len(all_links)}")
+        
+        article_candidates = []
+        for idx, link in enumerate(all_links[:50], 1):  # First 50 links
+            href = link.get('href', '')
+            text = link.get_text(strip=True)[:80]
+            parent = link.parent.name if link.parent else 'No parent'
+            parent_classes = link.parent.get('class', []) if link.parent and link.parent.get('class') else []
+            
+            # Check if this looks like an article link
+            is_article_candidate = (
+                'punchng.com' in href and 
+                '/topics/' not in href and 
+                '/category/' not in href and
+                '/tag/' not in href and
+                '/author/' not in href and
+                'advertise' not in href.lower() and
+                len(text) > 20  # Article titles are usually longer
+            )
+            
+            status = "✅ ARTICLE CANDIDATE" if is_article_candidate else "❌ NOT ARTICLE"
+            
+            LOG.info(f"[DEBUG Link {idx}] {status}")
+            LOG.info(f"    Text: {text}")
+            LOG.info(f"    URL: {href}")
+            LOG.info(f"    Parent: {parent}, Classes: {parent_classes}")
+            LOG.info(f"    Parent full tag: {str(link.parent)[:200] if link.parent else 'No parent'}")
+            
+            if is_article_candidate:
+                article_candidates.append(link)
+        
+        # 3. Log all heading elements (h1-h6)
+        LOG.info("=" * 80)
+        LOG.info("[DEBUG] ALL HEADING ELEMENTS:")
+        for i in range(1, 7):
+            headings = soup.find_all(f'h{i}')
+            LOG.info(f"h{i} tags found: {len(headings)}")
+            for idx, h in enumerate(headings[:10], 1):  # First 10 of each
+                text = h.get_text(strip=True)[:100]
+                LOG.info(f"  h{i}-{idx}: {text}")
+                # Check for links inside headings
+                links_in_h = h.find_all('a', href=True)
+                for link in links_in_h:
+                    LOG.info(f"    → Link: {link.get('href')}")
+        
+        # 4. Log all divs with classes that might contain articles
+        LOG.info("=" * 80)
+        LOG.info("[DEBUG] DIV ELEMENTS WITH COMMON ARTICLE CLASSES:")
+        article_class_patterns = ['article', 'card', 'post', 'news', 'story', 'content', 'entry', 'item']
+        for pattern in article_class_patterns:
+            divs = soup.find_all('div', class_=lambda x: x and pattern in str(x).lower())
+            LOG.info(f"Divs with '{pattern}' in class: {len(divs)}")
+            
+            for idx, div in enumerate(divs[:5], 1):  # First 5 of each pattern
+                # Get first 200 chars of text content
+                text = div.get_text(strip=True, separator=' ')[:200]
+                links = div.find_all('a', href=True)
+                LOG.info(f"  {pattern}-{idx}: Text preview: {text}")
+                LOG.info(f"    Links inside: {len(links)}")
+                for link in links[:3]:  # First 3 links
+                    LOG.info(f"    → {link.get('href')[:80]}")
+        
+        # 5. Log all elements with article-like structure (based on analysis)
+        LOG.info("=" * 80)
+        LOG.info("[DEBUG] ELEMENTS WITH SPECIFIC CLASSES FROM ANALYSIS:")
+        
+        # From your analysis, these are common classes
+        target_classes = [
+            'bg-white', 'rounded-xl', 'border', 'border-gray-200', 
+            'shadow-sm', 'flex', 'items-stretch', 'text-xl', 'font-bold'
+        ]
+        
+        for class_name in target_classes:
+            elements = soup.find_all(class_=class_name)
+            LOG.info(f"Elements with class '{class_name}': {len(elements)}")
+            
+            for idx, elem in enumerate(elements[:3], 1):  # First 3
+                # Get parent info
+                parent = elem.parent
+                parent_name = parent.name if parent else 'No parent'
+                parent_class = parent.get('class', []) if parent and parent.get('class') else []
+                
+                # Get text content
+                text = elem.get_text(strip=True, separator=' ')[:150]
+                
+                LOG.info(f"  {class_name}-{idx}:")
+                LOG.info(f"    Text: {text}")
+                LOG.info(f"    Parent: {parent_name}, Classes: {parent_class}")
+                
+                # Find links inside
+                links = elem.find_all('a', href=True)
+                for link_idx, link in enumerate(links[:2], 1):
+                    link_text = link.get_text(strip=True)[:50]
+                    link_href = link.get('href', '')
+                    LOG.info(f"    Link {link_idx}: {link_text} → {link_href[:80]}")
+        
+        # 6. Try to find the main content container
+        LOG.info("=" * 80)
+        LOG.info("[DEBUG] LOOKING FOR MAIN CONTENT CONTAINERS:")
+        
+        # Look for common content container IDs/classes
+        content_selectors = [
+            '#main', '#content', '.main-content', '.content-area',
+            '.posts', '.articles', '.news-list', '.archive'
+        ]
+        
+        for selector in content_selectors:
+            try:
+                containers = soup.select(selector)
+                LOG.info(f"Selector '{selector}': {len(containers)} found")
+                if containers:
+                    container = containers[0]
+                    # Count articles inside
+                    articles_in_container = container.find_all(['article', 'div'], class_=lambda x: x and any(
+                        cls in str(x) for cls in ['post', 'article', 'news', 'item']
+                    ))
+                    LOG.info(f"  Articles/divs inside: {len(articles_in_container)}")
+                    
+                    # Show first few links
+                    links = container.find_all('a', href=True)
+                    article_links = [l for l in links if 'punchng.com' in l.get('href', '') and '/topics/' not in l.get('href', '')]
+                    LOG.info(f"  Article links inside: {len(article_links)}")
+                    for link in article_links[:3]:
+                        LOG.info(f"    → {link.get_text(strip=True)[:50]} -> {link.get('href')[:80]}")
+            except Exception as e:
+                LOG.info(f"  Error with selector '{selector}': {e}")
+        
+        # Now try to extract articles using what we've learned
+        LOG.info("=" * 80)
+        LOG.info("[Punch Listing] 🚀 Starting article extraction...")
+        
         articles_with_dates = []
         seen_urls = set()
         
-        # ✅ UPDATED STRATEGY: Find ALL article links on the page
-        LOG.info(f"[Punch Listing] 🔎 Searching for article links...")
+        # Strategy: Collect from multiple sources
+        extraction_methods = []
         
-        # Strategy 1: Look for article links in h2/h3 tags (based on analysis)
-        article_links = []
-        
-        # Find all h2 and h3 elements that contain links
-        for tag_name in ['h2', 'h3']:
-            for heading in soup.find_all(tag_name):
-                link = heading.find('a', href=True)
-                if link:
-                    href = link.get('href', '')
-                    if href and 'punchng.com' in href and '/topics/education/' not in href:
-                        article_links.append({
-                            'url': href,
-                            'title': link.get_text(strip=True),
-                            'element': heading
-                        })
-        
-        # Strategy 2: Look for article cards with specific classes
-        article_cards = []
-        
-        # Look for divs with article-like classes (from analysis)
-        article_classes = [
-            'bg-white', 'rounded-xl', 'border', 'border-gray-200', 
-            'shadow-sm', 'flex', 'items-stretch'
-        ]
-        
-        for div in soup.find_all('div', class_=lambda x: x and any(cls in str(x) for cls in article_classes)):
-            # Find links within these divs
-            for link in div.find_all('a', href=True):
+        # Method 1: Links in headings
+        for h_tag in soup.find_all(['h2', 'h3', 'h4']):
+            for link in h_tag.find_all('a', href=True):
                 href = link.get('href', '')
-                if href and 'punchng.com' in href and not any(bad in href for bad in ['/topics/', '/category/', '/tag/', '/author/']):
-                    title = link.get_text(strip=True)
-                    if title and len(title) > 20:  # Likely an article title
-                        article_cards.append({
+                if href and 'punchng.com' in href:
+                    extraction_methods.append({
+                        'url': href,
+                        'title': link.get_text(strip=True),
+                        'source': f'heading-{h_tag.name}',
+                        'element': link
+                    })
+        
+        # Method 2: Links in article-like containers
+        article_containers = soup.find_all(['article', 'div'], class_=lambda x: x and any(
+            word in str(x).lower() for word in ['article', 'post', 'news', 'story', 'card', 'item']
+        ))
+        
+        for container in article_containers:
+            for link in container.find_all('a', href=True):
+                href = link.get('href', '')
+                if href and 'punchng.com' in href:
+                    text = link.get_text(strip=True)
+                    if text and len(text) > 20:  # Likely article title
+                        extraction_methods.append({
                             'url': href,
-                            'title': title,
-                            'element': div
+                            'title': text,
+                            'source': 'article-container',
+                            'element': link
                         })
         
-        LOG.info(f"[Punch Listing] Found {len(article_links)} links in headings, {len(article_cards)} links in cards")
+        # Method 3: Direct links with article-like patterns
+        for link in soup.find_all('a', href=True):
+            href = link.get('href', '')
+            if href and 'punchng.com' in href and href.endswith('/'):
+                text = link.get_text(strip=True)
+                # Check if this looks like an article title (not navigation, not short)
+                if text and len(text) > 30 and not any(nav in text.lower() for nav in ['home', 'about', 'contact', 'advertise', 'subscribe']):
+                    extraction_methods.append({
+                        'url': href,
+                        'title': text,
+                        'source': 'direct-link',
+                        'element': link
+                    })
         
-        # Combine and deduplicate
-        all_articles = article_links + article_cards
-        LOG.info(f"[Punch Listing] 📋 Processing {len(all_articles)} potential articles...")
+        LOG.info(f"[Punch Listing] 📋 Found {len(extraction_methods)} potential articles from all methods")
         
-        for idx, article in enumerate(all_articles, 1):
-            href = article['url']
+        # Process candidates
+        for idx, candidate in enumerate(extraction_methods, 1):
+            href = candidate['url']
             
-            # Filter out non-article URLs more aggressively
+            # Apply filters
             if any(bad in href for bad in [
                 '/topics/', '/category/', '/tag/', '/author/',
                 'advertise', '#', '?feed=', '?share=', '/videos/',
-                '/galleries/', '/podcasts/', 'punchng.com/contact-us',
-                'punchng.com/about-us', 'punchng.com/advertise'
+                '/galleries/', '/podcasts/', '/contact-us',
+                '/about-us', '/advertise', '/print-',
+                'punchng.com/#', 'punchng.com/?'
             ]):
-                LOG.debug(f"[Punch Listing]   Article [{idx}]: 🚫 Filtered non-article URL: {href[:80]}...")
+                LOG.debug(f"[Punch Listing]   Candidate [{idx}]: 🚫 Filtered: {href[:80]}...")
                 continue
             
-            # Skip homepage and section pages
-            if href in ['https://punchng.com', 'https://punchng.com/', 
-                       'https://punchng.com/education', 'https://punchng.com/topics/education']:
-                LOG.debug(f"[Punch Listing]   Article [{idx}]: 🚫 Filtered section/page URL")
-                continue
+            # Ensure it's a full URL
+            if not href.startswith('http'):
+                full_url = urljoin(base_url, href)
+            else:
+                full_url = href
             
-            full_url = urljoin(base_url, href) if not href.startswith('http') else href
-            full_url = full_url.split('?')[0]  # Remove query parameters
+            # Remove query parameters
+            full_url = full_url.split('?')[0]
+            
+            # Skip if not a punchng.com URL
+            if 'punchng.com' not in full_url:
+                LOG.debug(f"[Punch Listing]   Candidate [{idx}]: 🚫 Not punchng.com URL")
+                continue
             
             # Deduplicate
             if full_url in seen_urls:
-                LOG.debug(f"[Punch Listing]   Article [{idx}]: 🔄 Duplicate URL, skipping")
+                LOG.debug(f"[Punch Listing]   Candidate [{idx}]: 🔄 Duplicate")
                 continue
             seen_urls.add(full_url)
             
-            # Extract date - look near the article element
+            # Extract date if possible
             date_str = ""
             date_obj = None
-            element = article['element']
             
-            # Try to find date in the same container
-            # Look for spans with date patterns
-            parent = element.parent
-            for _ in range(3):  # Check up to 3 levels up
-                if parent:
-                    # Look for date spans with common classes
-                    date_spans = parent.find_all('span', class_=lambda x: x and any(cls in str(x) for cls in ['text-gray', 'text-[#', 'text-sm', 'text-xs']))
-                    for span in date_spans:
-                        text = span.get_text(strip=True)
-                        # Match various date formats
-                        date_patterns = [
-                            r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}',
-                            r'\d{1,2}\s+(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{4}',
-                            r'\d+hours?\s+ago',
-                            r'\d+days?\s+ago',
-                            r'\d{1,2}/\d{1,2}/\d{4}'
-                        ]
-                        for pattern in date_patterns:
-                            if re.search(pattern, text, re.IGNORECASE):
-                                date_str = text
-                                date_obj = parse_punch_date(date_str)
-                                LOG.debug(f"[Punch Listing]   Article [{idx}]: ✅ Found date: {date_str}")
-                                break
-                        if date_str:
+            # Look for date near the link
+            element = candidate['element']
+            for _ in range(5):  # Check element and parents
+                if element:
+                    # Look for date in sibling or child elements
+                    date_elements = element.find_all(['time', 'span', 'div'], class_=lambda x: x and any(
+                        word in str(x).lower() for word in ['date', 'time', 'ago', 'published']
+                    ))
+                    
+                    for date_elem in date_elements:
+                        text = date_elem.get_text(strip=True)
+                        if text and ('ago' in text.lower() or any(
+                            month in text for month in ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 
+                                                       'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec']
+                        )):
+                            date_str = text
+                            date_obj = parse_punch_date(date_str)
                             break
                 
                 if date_str:
                     break
-                parent = parent.parent if parent else None
+                element = element.parent if element else None
             
-            if not date_str:
-                LOG.debug(f"[Punch Listing]   Article [{idx}]: ⚠️ No date found, using current time")
-            
-            title = article['title']
-            LOG.info(f"[Punch Listing]   ✅ Article [{idx}]: {title[:50]}... | Date: {date_str or 'Not found'}")
-            LOG.debug(f"[Punch Listing]      URL: {full_url}")
+            title = candidate['title']
+            LOG.info(f"[Punch Listing]   ✅ Article [{idx}]: {title[:60]}...")
+            LOG.info(f"[Punch Listing]      Source: {candidate['source']}")
+            LOG.info(f"[Punch Listing]      Date: {date_str or 'Not found'}")
+            LOG.info(f"[Punch Listing]      URL: {full_url}")
             
             articles_with_dates.append({
                 'url': full_url,
                 'date_obj': date_obj or datetime.now(),
-                'title': title[:60],
+                'title': title[:80],
                 'order': idx
             })
             
-            # Limit to reasonable number
-            if len(articles_with_dates) >= 20:
-                LOG.info(f"[Punch Listing] ⏹️ Reached limit of 20 articles, stopping")
+            if len(articles_with_dates) >= 25:
+                LOG.info(f"[Punch Listing] ⏹️ Reached limit of 25 articles")
                 break
         
-        # Sort by original order
+        # Sort by order found
         articles_with_dates.sort(key=lambda x: x['order'])
         urls = [a['url'] for a in articles_with_dates[:15]]
         
-        LOG.info(f"[Punch Listing] ✅ Extracted {len(urls)} article URLs")
-        LOG.info(f"[Punch Listing] 📊 Processing summary:")
-        LOG.info(f"[Punch Listing]    - Total candidates found: {len(all_articles)}")
-        LOG.info(f"[Punch Listing]    - Unique articles extracted: {len(articles_with_dates)}")
-        LOG.info(f"[Punch Listing]    - Final URLs returned: {len(urls)}")
+        LOG.info("=" * 80)
+        LOG.info(f"[Punch Listing] ✅ FINAL RESULTS: Extracted {len(urls)} article URLs")
+        LOG.info(f"[Punch Listing] 📊 Summary:")
+        LOG.info(f"[Punch Listing]    - Total candidates analyzed: {len(extraction_methods)}")
+        LOG.info(f"[Punch Listing]    - After filtering: {len(articles_with_dates)}")
+        LOG.info(f"[Punch Listing]    - Final URLs: {len(urls)}")
         
         if urls:
-            LOG.info(f"[Punch Listing] 📌 Top articles:")
-            for idx, a in enumerate(articles_with_dates[:5], 1):
-                LOG.info(f"[Punch Listing]    {idx}. {a['title'][:50]}...")
-                LOG.info(f"[Punch Listing]       Date: {a['date_obj'].strftime('%Y-%m-%d %H:%M') if hasattr(a['date_obj'], 'strftime') else str(a['date_obj'])}")
-                LOG.info(f"[Punch Listing]       URL: {a['url'][:70]}...")
+            LOG.info(f"[Punch Listing] 📌 Articles found:")
+            for idx, a in enumerate(articles_with_dates[:10], 1):
+                LOG.info(f"[Punch Listing]    {idx}. {a['title']}")
+                LOG.info(f"[Punch Listing]       {a['url']}")
         
         return urls
         
