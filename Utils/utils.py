@@ -3144,12 +3144,7 @@ async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news
 
 async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> List[str]:
     """
-    Get recent Punch education articles - FIXED SELECTORS
-    
-    Correct selectors based on actual HTML structure:
-    - Featured articles: h2.text-xl.font-bold.leading-tight a
-    - Regular articles: h3.text-sm.font-semibold.leading-snug.punch-clamp-2 a
-    - Dates: div.flex.items-center span.text-gray-500 or span.post-date
+    Get recent Punch education articles - FIXED FOR MALFORMED CLASS ATTRIBUTES
     """
     LOG.info(f"[Punch Listing] 🔍 Starting extraction from {base_url}")
     
@@ -3171,88 +3166,120 @@ async def get_punch_recent_articles(base_url: str = "https://punchng.com") -> Li
         
         soup = BeautifulSoup(listing_html, 'lxml')
         articles_with_dates = []
-        
-        # ✅ FIX: Use correct selectors based on actual HTML structure
-        # Articles are in <h3> tags with specific classes, containing <a> links
-        article_links = soup.select('h3[class*="punch-clamp-2"] a[href*="punchng.com"]')
-        featured_links = soup.select('h2[class*="punch-clamp-3"] a[href*="punchng.com"]')
-        
-        LOG.info(f"DEBUG: Sample article elements:")
-        for idx, link in enumerate(article_links[:3], 1):
-            LOG.info(f"  {idx}. Text: {link.get_text(strip=True)[:50]}")
-            LOG.info(f"     URL: {link.get('href')}")
-            LOG.info(f"     Parent classes: {link.parent.get('class')}")
-            
-        all_links = featured_links + article_links
-        
-        LOG.info(f"[Punch Listing] 🔎 Found {len(all_links)} article links ({len(featured_links)} featured + {len(article_links)} regular)")
-        
         seen_urls = set()
         
-        for idx, link in enumerate(all_links, 1):
-            href = link.get('href', '')
-            if not href:
+        # ✅ FIX: Find article containers first, then extract links
+        # Article containers have these distinctive patterns
+        article_containers = []
+        
+        # Strategy 1: Find containers with article-like structure
+        # Look for divs that contain both h3 AND links to punchng.com
+        for div in soup.find_all('div', class_=True):
+            # Check if div contains an h3 with a link
+            h3 = div.find('h3')
+            if h3:
+                link = h3.find('a', href=True)
+                if link and 'punchng.com' in link.get('href', ''):
+                    article_containers.append(div)
+        
+        LOG.info(f"[Punch Listing] 🔎 Found {len(article_containers)} article containers")
+        
+        # ✅ Extract URLs from containers - PRESERVING TOP-TO-BOTTOM ORDER
+        LOG.info(f"[Punch Listing] 📋 Processing containers in page order...")
+        for idx, container in enumerate(article_containers, 1):
+            # Get the h3 link
+            h3 = container.find('h3')
+            if not h3:
+                LOG.debug(f"[Punch Listing]   Container [{idx}]: ❌ No h3 found, skipping")
                 continue
                 
+            link = h3.find('a', href=True)
+            if not link:
+                LOG.debug(f"[Punch Listing]   Container [{idx}]: ❌ No link found in h3, skipping")
+                continue
+            
+            href = link.get('href', '')
+            LOG.debug(f"[Punch Listing]   Container [{idx}]: Found href: {href[:80]}...")
+            
             # Filter out non-article URLs
             if any(bad in href for bad in [
                 '/topics/', '/category/', '/tag/', '/author/',
                 'advertise', '#', '?feed=', '?share='
             ]):
-                LOG.debug(f"[Punch Listing]   Link [{idx}]: Filtered non-article URL")
+                LOG.debug(f"[Punch Listing]   Container [{idx}]: 🚫 Filtered non-article URL (matched filter list)")
                 continue
             
             full_url = urljoin(base_url, href)
+            LOG.debug(f"[Punch Listing]   Container [{idx}]: Resolved URL: {full_url[:80]}...")
             
             # Deduplicate
             if full_url in seen_urls:
+                LOG.debug(f"[Punch Listing]   Container [{idx}]: 🔄 Duplicate URL, skipping")
                 continue
             seen_urls.add(full_url)
             
-            # Try to find associated date
-            # Dates are in sibling/parent containers with class 'flex items-center text-[11px] text-[#d71920]'
+            # Extract date from the same container
             date_str = ""
             date_obj = None
             
-            # Look for date in nearby elements (traverse up parent tree)
-            parent = link.parent
-            attempts = 0
-            while parent and not date_str and attempts < 5:
-                # Try multiple date selectors
-                date_elem = parent.select_one(
-                    'div.flex.items-center span.text-gray-500, '
-                    'span.post-date, '
-                    'time, '
-                    'div[class*="text-gray-500"]'
-                )
-                if date_elem:
-                    date_str = date_elem.get_text(strip=True)
+            # Look for date in span elements within this container
+            date_spans = container.find_all('span')
+            LOG.debug(f"[Punch Listing]   Container [{idx}]: Checking {len(date_spans)} span elements for date...")
+            
+            for span in date_spans:
+                text = span.get_text(strip=True)
+                # Match date patterns like "February 10, 2026 7:44 am"
+                if re.search(r'(January|February|March|April|May|June|July|August|September|October|November|December)\s+\d{1,2},\s+\d{4}', text):
+                    date_str = text
                     date_obj = parse_punch_date(date_str)
-                    break
-                parent = parent.parent
-                attempts += 1
-                # Don't go too far up
-                if parent and parent.name in ['body', 'html']:
+                    LOG.debug(f"[Punch Listing]   Container [{idx}]: ✅ Found date in span: {date_str}")
                     break
             
-            LOG.debug(f"[Punch Listing]   Article [{idx}]: {full_url[:60]}... | Date: {date_str or 'Not found'}")
+            # If no date found in container, try searching nearby
+            if not date_str:
+                LOG.debug(f"[Punch Listing]   Container [{idx}]: ⚠️ No date in container spans, checking nearby...")
+                # Look in previous sibling
+                prev = container.find_previous_sibling()
+                if prev:
+                    date_span = prev.find('span')
+                    if date_span:
+                        text = date_span.get_text(strip=True)
+                        if 'ago' in text.lower() or any(month in text for month in ['January', 'February', 'March', 'April', 'May', 'June', 'July', 'August', 'September', 'October', 'November', 'December']):
+                            date_str = text
+                            date_obj = parse_punch_date(date_str) if date_str else None
+                            LOG.debug(f"[Punch Listing]   Container [{idx}]: ✅ Found date in previous sibling: {date_str}")
+            
+            if not date_str:
+                LOG.debug(f"[Punch Listing]   Container [{idx}]: ⚠️ No date found, using current time")
+            
+            title = link.get_text(strip=True)
+            LOG.info(f"[Punch Listing]   ✅ Article [{idx}]: {title[:50]}... | Date: {date_str or 'Not found'}")
+            LOG.debug(f"[Punch Listing]      URL: {full_url}")
             
             articles_with_dates.append({
                 'url': full_url,
-                'date_obj': date_obj or datetime.now(),  # Default to now if no date found
-                'title': link.get_text(strip=True)[:60]
+                'date_obj': date_obj or datetime.now(),
+                'title': title[:60],
+                'order': idx  # ✅ PRESERVE ORIGINAL PAGE ORDER
             })
         
-        # Sort by date (most recent first)
-        articles_with_dates.sort(key=lambda x: x['date_obj'], reverse=True)
+        # ✅ Sort by original page order (top-to-bottom), NOT by date
+        # This preserves how they appear on the page
+        articles_with_dates.sort(key=lambda x: x['order'])
         urls = [a['url'] for a in articles_with_dates[:15]]
         
-        LOG.info(f"[Punch Listing] ✅ Extracted {len(urls)} article URLs")
+        LOG.info(f"[Punch Listing] ✅ Extracted {len(urls)} article URLs (preserving page order)")
+        LOG.info(f"[Punch Listing] 📊 Processing summary:")
+        LOG.info(f"[Punch Listing]    - Total containers found: {len(article_containers)}")
+        LOG.info(f"[Punch Listing]    - Unique articles extracted: {len(articles_with_dates)}")
+        LOG.info(f"[Punch Listing]    - Final URLs returned: {len(urls)}")
+        
         if urls:
-            LOG.info(f"[Punch Listing] 📌 Sample URLs (with titles):")
-            for idx, a in enumerate(articles_with_dates[:3], 1):
-                LOG.info(f"[Punch Listing]    {idx}. {a['title']}")
-                LOG.info(f"[Punch Listing]       URL: {a['url']}")
+            LOG.info(f"[Punch Listing] 📌 Top articles (in page order):")
+            for idx, a in enumerate(articles_with_dates[:5], 1):
+                LOG.info(f"[Punch Listing]    {idx}. {a['title'][:50]}...")
+                LOG.info(f"[Punch Listing]       Date: {a['date_obj'].strftime('%Y-%m-%d %H:%M') if hasattr(a['date_obj'], 'strftime') else str(a['date_obj'])}")
+                LOG.info(f"[Punch Listing]       URL: {a['url'][:70]}...")
         
         return urls
         
