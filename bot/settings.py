@@ -103,13 +103,13 @@ DEFAULT_FREE_LIMIT = MAX_WATCHES_FREE
 
 DEFAULT_SCHOOL_SOURCES = {
     # --- Higher Education Regulators ---
-   # "NUC (Universities)": [
-        #"https://www.nuc.edu.ng/"
-    #],
+    "NUC (Universities)": [
+        "https://www.nuc.edu.ng/"
+    ],
     # --- Reliable Education News Aggregators (Best for "Daily" updates) ---
-    #"MySchool.ng": [
-      #  "https://myschool.ng/news"
-    #],
+    "MySchool.ng": [
+        "https://myschool.ng/news"
+    ],
     "Punch Education": [
         "https://punchng.com"
     ],
