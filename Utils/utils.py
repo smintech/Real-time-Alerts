@@ -1219,25 +1219,27 @@ async def fetch_with_playwright_aggressive(
     url: str,
     retries: int = 3,
     return_visible_text: bool = False,
-    wait_for_selector: Optional[str] = None,  # NEW PARAMETER
-    wait_timeout: int = 15000  # NEW PARAMETER
+    wait_for_selector: Optional[str] = None,  # optional selector to wait for
+    wait_timeout: int = 15000,  # how long to wait for the selector (ms)
+    settle_after_selector_ms: int = 500  # NEW: small settle time after selector appears (ms)
 ) -> Union[str, Tuple[str, str]]:
     """
     PRODUCTION FETCH FUNCTION - OPTIMIZED FOR KONGA
     1. Extracts product ID from URL for validation
     2. Focuses on main product container
     3. Handles Konga's dynamic content loading
-    
-    NEW: Added wait_for_selector support for dynamic pages
+
+    NEW: Added wait_for_selector support for dynamic pages and an additional
+    small settle delay after selectors appear so dynamic content can finish rendering.
     """
     LOG.info("╔═══════════════════════════════════════════════════════════════════╗")
-    LOG.info("║ PRODUCTION FIXES (with wait_for_selector support)                ║")
+    LOG.info("║ PRODUCTION FIXES (with wait_for_selector & settle support)        ║")
     LOG.info("╚═══════════════════════════════════════════════════════════════════╝")
     LOG.info(f"🌐 {url[:80]}")
-    
+
     if wait_for_selector:
-        LOG.info(f"⏳ Will wait for selector: {wait_for_selector}")
-    
+        LOG.info(f"⏳ Will wait for selector: {wait_for_selector} (timeout={wait_timeout}ms)")
+
     # Extract product ID from URL for logging
     product_id = None
     if url:
@@ -1245,22 +1247,22 @@ async def fetch_with_playwright_aggressive(
         if id_match:
             product_id = int(id_match.group(1))
             LOG.info(f"🎯 Targeting Product ID: {product_id}")
-    
+
     is_konga = 'konga' in url.lower()
-    
+
     # Use semaphore to limit concurrent browser instances
     async with _BROWSER_SEMAPHORE:
         for attempt in range(1, retries + 1):
             LOG.info(f"┌── ATTEMPT {attempt}/{retries} ───────────────────────────────────────────────┐")
-            
+
             browser = None
             context = None
             page = None
-            
+
             try:
                 async with async_playwright() as p:
                     start = time.time()
-                    
+
                     # LAUNCH BROWSER (Production settings)
                     browser = await p.chromium.launch(
                         headless=True,
@@ -1281,7 +1283,7 @@ async def fetch_with_playwright_aggressive(
                         ],
                         timeout=60000
                     )
-                    
+
                     # CONTEXT (Konga-optimized)
                     context = await browser.new_context(
                         user_agent=random.choice(_USER_AGENTS),
@@ -1291,24 +1293,24 @@ async def fetch_with_playwright_aggressive(
                         java_script_enabled=True,
                         bypass_csp=True
                     )
-                    
+
                     context.set_default_timeout(30000)
                     context.set_default_navigation_timeout(30000)
-                    
+
                     page = await context.new_page()
-                    
+
                     # BLOCK UNNECESSARY RESOURCES
                     await page.route("**/*.{gif,webp,svg}", lambda route: route.abort())
                     await page.route("**/*.css", lambda route: route.abort())
                     await page.route("**/*.woff*", lambda route: route.abort())
-                    
+
                     # ANTI-DETECTION
                     await page.add_init_script("""
                         Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
                         Object.defineProperty(navigator, 'plugins', {get: () => [1,2,3,4,5]});
                         window.chrome = {runtime: {}};
                     """)
-                    
+
                     # NAVIGATE
                     try:
                         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
@@ -1317,59 +1319,88 @@ async def fetch_with_playwright_aggressive(
                         LOG.warning(f"Navigation timeout, trying load: {str(nav_error)[:60]}")
                         await page.goto(url, wait_until="load", timeout=20000)
                         LOG.info("  ✓ Navigation complete (load)")
-                    
-                    # WAIT FOR SELECTOR (NEW FUNCTIONALITY)
+
+                    # WAIT FOR SELECTOR (NEW FUNCTIONALITY) + settle
                     if wait_for_selector:
                         LOG.info(f"  ⏳ Waiting for selector: {wait_for_selector}")
                         try:
                             await page.wait_for_selector(wait_for_selector, timeout=wait_timeout)
                             LOG.info(f"  ✓ Selector found: {wait_for_selector}")
+                            # small settle to let any JS-driven rendering complete
+                            try:
+                                await page.wait_for_timeout(settle_after_selector_ms)
+                                LOG.debug(f"  ✓ Settled for {settle_after_selector_ms}ms after selector")
+                            except Exception:
+                                LOG.debug("  ⚠️ Failed to wait for settle timeout, continuing")
                         except Exception as wait_error:
                             LOG.warning(f"  ⚠️ Selector wait timeout ({wait_timeout}ms): {str(wait_error)[:60]}")
                             LOG.warning(f"  Continuing without selector match...")
-                    
+
                     # KONGA-SPECIFIC WAITING
                     if is_konga:
                         LOG.info("  🔍 Konga: Waiting for main product content...")
-                        
+
                         try:
                             await page.wait_for_selector(
                                 'div.productDetail_productDetailsContent__VV9__',
                                 timeout=8000
                             )
                             LOG.debug("✅ Main product container loaded")
+                            # small settle after main product container appears
+                            try:
+                                await page.wait_for_timeout(settle_after_selector_ms)
+                                LOG.debug(f"  ✓ Settled for {settle_after_selector_ms}ms after main container")
+                            except Exception:
+                                LOG.debug("  ⚠️ Failed to wait for settle timeout, continuing")
                         except Exception:
                             LOG.debug("Main container timeout, continuing...")
-                        
+
                         try:
                             await page.wait_for_selector(
                                 '.priceBox_priceBoxPrice__i7paS, div.shared_specialPrice__uIZ_i',
                                 timeout=5000
                             )
                             LOG.debug("✅ Price elements loaded")
-                        except:
+                            # small settle after price elements appear
+                            try:
+                                await page.wait_for_timeout(settle_after_selector_ms)
+                                LOG.debug(f"  ✓ Settled for {settle_after_selector_ms}ms after price elements")
+                            except Exception:
+                                LOG.debug("  ⚠️ Failed to wait for settle timeout, continuing")
+                        except Exception:
                             LOG.debug("Price elements timeout, continuing...")
-                        
-                        await page.wait_for_timeout(2000)
-                        
+
+                        # small additional pause to allow late micro-updates (images, scripts)
+                        try:
+                            await page.wait_for_timeout(max(300, settle_after_selector_ms))
+                        except Exception:
+                            pass
+
                         try:
                             await page.evaluate("window.scrollBy(0, 300)")
                             await asyncio.sleep(0.5)
                         except:
                             pass
-                    
+
+                    # FINAL small settle before grabbing content (helps SPAs that update after selector)
+                    try:
+                        await page.wait_for_timeout(max(250, settle_after_selector_ms // 2))
+                        LOG.debug("  ✓ Final settle before content extraction")
+                    except Exception:
+                        LOG.debug("  ⚠️ Final settle failed, continuing")
+
                     # EXTRACT CONTENT
                     html = await page.content()
                     visible_text = ""
-                    
+
                     if return_visible_text or is_konga:
                         visible_text = await get_visible_text_playwright(page)
-                    
+
                     duration = time.time() - start
                     LOG.info(f"└── SUCCESS {duration:.1f}s | HTML:{len(html)} | Text:{len(visible_text)} ───────────────────────────────┘")
-                    
+
                     return (html, visible_text) if return_visible_text else html
-                    
+
             except Exception as e:
                 error_type = type(e).__name__
                 if error_type == 'TargetClosedError':
@@ -1387,16 +1418,15 @@ async def fetch_with_playwright_aggressive(
                             await resource.close()
                         except:
                             pass
-                
+
                 if attempt < retries:
                     wait_time = min(2 ** attempt + random.uniform(0, 1), 10)
                     LOG.info(f"  ⏳ Waiting {wait_time:.1f} seconds before retry...")
                     await asyncio.sleep(wait_time)
                 else:
                     LOG.error(f"  ❌ All {retries} attempts exhausted")
-    
-    raise Exception(f"Failed to fetch {url} after {retries} attempts")
 
+    raise Exception(f"Failed to fetch {url} after {retries} attempts")
 # ═══════════════════════════════════════════════════════════════════════════
 # ULTIMATE FETCH
 # ═══════════════════════════════════════════════════════════════════════════
