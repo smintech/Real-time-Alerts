@@ -3189,7 +3189,7 @@ async def scrape_fuel_prices() -> Dict[str, Any]:
             app_url,
             retries=3,
             return_visible_text=False,
-            wait_for_selector='div.gumroad-card:has-text('\u20A6'), div[class*="bg-card"]',
+            wait_for_selector="div.gumroad-card:has-text('\u20A6'), div[class*="bg-card"]",
             wait_timeout=30000
         )
         fetch_time = time.time() - fetch_start
