@@ -3065,215 +3065,315 @@ class FoundElement:
         return " | ".join(parts)
 
 
+@dataclass
+class FoundElement:
+    """Structured logging for found elements"""
+    tag: str
+    classes: str
+    element_id: str
+    text_preview: str
+    price_found: Optional[str] = None
+    change_found: Optional[str] = None
+    
+    def __str__(self) -> str:
+        parts = [
+            f"[{self.tag}]",
+            f"Classes: {self.classes or 'none'}",
+            f"ID: {self.element_id or 'none'}",
+            f"Text: '{self.text_preview[:100]}...'"
+        ]
+        if self.price_found:
+            parts.append(f"💰 Price: {self.price_found}")
+        if self.change_found:
+            parts.append(f"📈 Change: {self.change_found}")
+        return " | ".join(parts)
+
+
 def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/") -> Dict[str, Any]:
     """
-    Parse Fuel Price Watch - Updated for 2026 Tailwind CSS structure.
-    
-    Based on analysis, the page uses:
-    - div.gumroad-card (with many Tailwind utility classes)
-    - Price format: <div class="text-xl sm:text-2xl font-bold text-foreground">₦873.88</div>
-    - Change format: <p class="text-xs text-red-500 flex items-center">+₦5.00 today</p>
-    - Percent format: +0.5% from last period
+    Parse Fuel Price Watch with comprehensive logging at every step.
     """
+    start_time = time.time()
+    parse_session_id = f"parse_{int(start_time)}"
+    
+    LOG.info(f"\n{'='*80}")
+    LOG.info(f"🔷 FUEL PRICE PARSE SESSION: {parse_session_id}")
+    LOG.info(f"{'='*80}\n")
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # STEP 0: HTML Validation
+    # ═══════════════════════════════════════════════════════════════════════
+    
+    LOG.info("📋 STEP 0: HTML Input Validation")
+    LOG.info(f"  ├─ HTML size: {len(html):,} bytes")
+    LOG.info(f"  ├─ Is gzip? {html[:2] == b'\\x1f\\x8b' if isinstance(html, bytes) else 'N/A'}")
+    LOG.info(f"  ├─ Encoding: {type(html).__name__}")
+    
+    # Check for critical characters
+    naira_in_html = '₦' in html
+    LOG.info(f"  ├─ Contains ₦ character: {'✓ YES' if naira_in_html else '✗ NO'}")
+    
+    # Sample of HTML
+    html_sample = html[:500] if isinstance(html, str) else html.decode('utf-8', errors='ignore')[:500]
+    LOG.debug(f"  └─ HTML preview: {html_sample}...\n")
+    
     soup = BeautifulSoup(html, "html.parser")
     found_elements: List[FoundElement] = []
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # STEP 1: Find the main container with fuel cards
-    # ═══════════════════════════════════════════════════════════════════════
-    
-    # Strategy A: Look for the specific card class combination
-    petrol_card = None
-    card_text = ""
-    selectors_used = []
-    
-    # The card has multiple classes: rounded-lg border bg-card text-card-foreground shadow-sm gumroad-card
-    card_selectors = [
-        ('div.gumroad-card', 'exact gumroad-card'),
-        ('div.rounded-lg.border.bg-card', 'rounded border bg-card'),
-        ('div[class*="gumroad-card"]', 'contains gumroad-card'),
-        ('div[class*="bg-card"]', 'contains bg-card'),
-        ('div.shadow-sm', 'shadow-sm card'),
-    ]
-    
-    for sel, desc in card_selectors:
-        try:
-            elems = soup.select(sel)
-            if elems:
-                # Find the one containing "Average Petrol Price"
-                for elem in elems:
-                    text = elem.get_text(" ", strip=True)
-                    if "Average Petrol" in text or "Petrol Price" in text:
-                        petrol_card = elem
-                        card_text = text
-                        selectors_used.append(f"{sel} (matched: {desc})")
-                        break
-                if petrol_card:
-                    break
-        except Exception as e:
-            LOG.debug(f"[FuelPriceWatch] Selector {sel} failed: {e}")
-            continue
-    
-    # Strategy B: Fallback - search for text containing "Average Petrol Price"
-    if petrol_card is None:
-        LOG.debug("[FuelPriceWatch] Trying text-based fallback...")
-        # Find all divs and check their text content
-        for div in soup.find_all(['div', 'section', 'article']):
-            text = div.get_text(" ", strip=True)
-            if "Average Petrol Price" in text and "₦" in text:
-                petrol_card = div
-                card_text = text
-                selectors_used.append("fallback:text_contains_Average_Petrol_Price")
-                break
-    
-    # Strategy C: Last resort - find by price pattern with nearby label
-    if petrol_card is None:
-        LOG.debug("[FuelPriceWatch] Trying price-pattern fallback...")
-        # Look for divs containing ₦ followed by numbers
-        for div in soup.find_all('div'):
-            text = div.get_text(" ", strip=True)
-            if re.search(r'₦\s*\d{3,4}\.\d{2}', text):
-                # Check if parent contains fuel type labels
-                parent = div.parent
-                if parent:
-                    parent_text = parent.get_text(" ", strip=True)
-                    if any(fuel in parent_text for fuel in ['Petrol', 'Diesel', 'Kerosene', 'PMS', 'AGO', 'DPK']):
-                        petrol_card = parent
-                        card_text = parent_text
-                        selectors_used.append("fallback:price_pattern_with_fuel_label")
-                        break
-    
-    # ═══════════════════════════════════════════════════════════════════════
-    # STEP 2: Extract structured data from the card
-    # ═══════════════════════════════════════════════════════════════════════
-    
     price_raw = None
     change_percent = None
     change_absolute = None
-    
-    if petrol_card:
-        # Get all text from the card for comprehensive parsing
-        full_text = petrol_card.get_text(" ", strip=True)
-        LOG.debug(f"[FuelPriceWatch] Card text sample: {full_text[:300]}...")
-        
-        # ─────────────────────────────────────────────────────────────────
-        # Extract Price: Look for ₦ followed by digits (e.g., ₦873.88)
-        # ─────────────────────────────────────────────────────────────────
-        # Pattern: ₦ followed by 3-4 digits, decimal, 2 digits
-        price_matches = re.findall(r'₦\s*(\d{3,4}\.\d{2})', full_text)
-        if price_matches:
-            try:
-                price_raw = float(price_matches[0])
-                LOG.debug(f"[FuelPriceWatch] Found price: ₦{price_raw}")
-            except ValueError:
-                pass
-        
-        # Alternative: any ₦ number pattern
-        if price_raw is None:
-            alt_matches = re.findall(r'₦\s*([\d,]+(?:\.\d+)?)', full_text)
-            for match in alt_matches:
-                try:
-                    clean = match.replace(",", "")
-                    val = float(clean)
-                    if 500 <= val <= 2000:  # Reasonable fuel price range
-                        price_raw = val
-                        LOG.debug(f"[FuelPriceWatch] Found price (alt): ₦{price_raw}")
-                        break
-                except ValueError:
-                    continue
-        
-        # ─────────────────────────────────────────────────────────────────
-        # Extract Percent Change: Look for pattern like +0.5% or -0.2%
-        # ─────────────────────────────────────────────────────────────────
-        pct_match = re.search(r'([+\-]\s*\d+(?:\.\d+)?)\s*%', full_text)
-        if pct_match:
-            try:
-                change_percent = float(pct_match.group(1).replace(" ", ""))
-                LOG.debug(f"[FuelPriceWatch] Found percent: {change_percent}%")
-            except ValueError:
-                pass
-        
-        # ─────────────────────────────────────────────────────────────────
-        # Extract Absolute Change: Look for +₦5.00 today or ₦-2.50 today
-        # ─────────────────────────────────────────────────────────────────
-        # Pattern 1: +₦5.00 today or -₦2.50 today
-        abs_match = re.search(r'([+\-])\s*₦\s*(\d+(?:\.\d+)?)\s*today', full_text, re.I)
-        if abs_match:
-            sign = abs_match.group(1)
-            amount = abs_match.group(2)
-            change_absolute = f"{sign}₦{amount}"
-            LOG.debug(f"[FuelPriceWatch] Found absolute change: {change_absolute}")
-        else:
-            # Pattern 2: ₦-2.50 today (sign after currency)
-            alt_abs_match = re.search(r'₦\s*([+\-]\s*\d+(?:\.\d+)?)\s*today', full_text, re.I)
-            if alt_abs_match:
-                val = alt_abs_match.group(1).replace(" ", "")
-                change_absolute = f"₦{val}"
-                LOG.debug(f"[FuelPriceWatch] Found absolute change (alt): {change_absolute}")
+    petrol_card = None
+    extraction_log = []  # Track what worked/failed
     
     # ═══════════════════════════════════════════════════════════════════════
-    # STEP 3: Page-level fallback parsing (if card extraction failed)
+    # STEP 1: Card Discovery
+    # ═══════════════════════════════════════════════════════════════════════
+    
+    LOG.info("🔍 STEP 1: Finding Petrol Price Card")
+    
+    # Strategy 1A: Look for gumroad-card divs
+    LOG.info("  ├─ Strategy 1A: Searching for gumroad-card elements...")
+    cards = soup.find_all("div", class_="gumroad-card")
+    LOG.info(f"  │  └─ Found {len(cards)} gumroad-card elements")
+    
+    for idx, card in enumerate(cards):
+        card_html = str(card)
+        card_text = card.get_text(" ", strip=True)
+        
+        LOG.debug(f"  │  Card #{idx+1}:")
+        LOG.debug(f"  │    ├─ HTML size: {len(card_html)} bytes")
+        LOG.debug(f"  │    ├─ Text size: {len(card_text)} bytes")
+        LOG.debug(f"  │    ├─ Text preview: {card_text[:100]}...")
+        LOG.debug(f"  │    └─ Contains 'Petrol': {'✓' if 'Petrol' in card_text else '✗'}")
+        
+        # Check if this card contains "Average Petrol Price" or just "Petrol Price"
+        if "Petrol" in card_text and "Price" in card_text:
+            petrol_card = card
+            LOG.info(f"  │  ✓ Card #{idx+1} matched! (contains 'Petrol' and 'Price')")
+            extraction_log.append("✓ Found petrol card via gumroad-card class")
+            break
+    
+    if not petrol_card:
+        LOG.info("  ├─ ✗ No gumroad-card elements matched\n")
+    else:
+        LOG.info()
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # STEP 2: Price Extraction from Card
+    # ═══════════════════════════════════════════════════════════════════════
+    
+    if petrol_card:
+        LOG.info("💰 STEP 2: Extracting Price Data from Card\n")
+        
+        # Get the full text of the card
+        full_text = petrol_card.get_text(" ", strip=True)
+        card_html_str = str(petrol_card)
+        
+        LOG.info(f"  Card text length: {len(full_text)} characters")
+        LOG.info(f"  Card HTML length: {len(card_html_str)} bytes")
+        LOG.info(f"  Card text preview: {full_text[:200]}...\n")
+        
+        # Check character encoding
+        LOG.info("  Character Encoding Checks:")
+        LOG.info(f"    ├─ Contains ₦ in HTML: {'✓ YES' if '₦' in card_html_str else '✗ NO'}")
+        LOG.info(f"    ├─ Contains ₦ in text: {'✓ YES' if '₦' in full_text else '✗ NO'}")
+        LOG.info(f"    └─ Contains 'Petrol': {'✓ YES' if 'Petrol' in full_text else '✗ NO'}\n")
+        
+        # ─────────────────────────────────────────────────────────────────
+        # Extract Price
+        # ─────────────────────────────────────────────────────────────────
+        
+        LOG.info("  🎯 Price Extraction:")
+        price_patterns = [
+            (r'₦\s*(\d+\.\d{2})', 'Pattern 1: ₦873.88'),
+            (r'₦\s*(\d+(?:,\d{3})*\.\d{2})', 'Pattern 2: ₦1,873.88 (with comma)'),
+            (r'(?:₦|Naira)\s*(\d+(?:\.\d+)?)', 'Pattern 3: Naira fallback'),
+        ]
+        
+        for pattern, description in price_patterns:
+            LOG.debug(f"    ├─ Trying {description}")
+            LOG.debug(f"    │  Pattern: {pattern}")
+            
+            matches = re.findall(pattern, full_text)
+            LOG.debug(f"    │  Matches: {matches}")
+            
+            if matches:
+                try:
+                    # Take first match, remove commas if present
+                    price_str = matches[0].replace(",", "")
+                    price_raw = float(price_str)
+                    
+                    LOG.info(f"    └─ ✓ SUCCESS on {description}")
+                    LOG.info(f"       Price extracted: ₦{price_raw:.2f}\n")
+                    extraction_log.append(f"✓ Price extracted: ₦{price_raw:.2f} (via {description})")
+                    break
+                except ValueError as e:
+                    LOG.debug(f"    │  ✗ ValueError: {e}")
+                    continue
+        
+        if price_raw is None:
+            LOG.warning("    └─ ✗ All price patterns failed\n")
+            extraction_log.append("✗ Price extraction failed - all patterns")
+        
+        # ─────────────────────────────────────────────────────────────────
+        # Extract Percent Change
+        # ─────────────────────────────────────────────────────────────────
+        
+        LOG.info("  📊 Percent Change Extraction:")
+        pct_pattern = r'([+\-]\s*\d+(?:\.\d+)?)\s*%'
+        LOG.debug(f"    ├─ Pattern: {pct_pattern}")
+        
+        pct_matches = re.findall(pct_pattern, full_text)
+        LOG.debug(f"    ├─ Matches: {pct_matches}")
+        
+        if pct_matches:
+            try:
+                change_percent = float(pct_matches[0].replace(" ", ""))
+                LOG.info(f"    └─ ✓ Percent found: {change_percent}%")
+                extraction_log.append(f"✓ Percent change: {change_percent}%")
+            except ValueError as e:
+                LOG.debug(f"    └─ ✗ ValueError: {e}")
+                extraction_log.append(f"✗ Percent parse error: {e}")
+        else:
+            LOG.warning("    └─ ✗ No percent change found\n")
+        
+        LOG.info()
+        
+        # ─────────────────────────────────────────────────────────────────
+        # Extract Absolute Change
+        # ─────────────────────────────────────────────────────────────────
+        
+        LOG.info("  💵 Absolute Change Extraction:")
+        abs_patterns = [
+            (r'([+\-])\s*₦\s*(\d+\.\d{2})\s*today', 'Pattern 1: +₦5.00 today'),
+            (r'₦\s*([+\-]\s*\d+\.\d{2})\s*today', 'Pattern 2: ₦-5.00 today'),
+            (r'([+\-])\s*₦\s*(\d+(?:\.\d+)?)', 'Pattern 3: +₦5 (no "today")'),
+        ]
+        
+        for pattern, description in abs_patterns:
+            LOG.debug(f"    ├─ Trying {description}")
+            LOG.debug(f"    │  Pattern: {pattern}")
+            
+            matches = re.findall(pattern, full_text)
+            LOG.debug(f"    │  Matches: {matches}")
+            
+            if matches:
+                try:
+                    if len(matches[0]) == 2:
+                        sign, amount = matches[0]
+                        change_absolute = f"{sign}₦{amount}"
+                    else:
+                        change_absolute = f"{matches[0]}"
+                    
+                    LOG.info(f"    └─ ✓ SUCCESS on {description}")
+                    LOG.info(f"       Change extracted: {change_absolute}\n")
+                    extraction_log.append(f"✓ Absolute change: {change_absolute}")
+                    break
+                except Exception as e:
+                    LOG.debug(f"    │  ✗ Error: {e}")
+                    continue
+        
+        if change_absolute is None:
+            LOG.warning("    └─ ✗ All absolute change patterns failed\n")
+    
+    else:
+        LOG.warning("⚠️  STEP 2 SKIPPED: No petrol card found\n")
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # STEP 3: Page-Level Fallback
     # ═══════════════════════════════════════════════════════════════════════
     
     if price_raw is None:
-        LOG.debug("[FuelPriceWatch] Card extraction failed, trying page-level parsing...")
+        LOG.warning("⚠️  STEP 3: Card extraction failed, attempting page-level fallback\n")
+        
         page_text = soup.get_text(" ", strip=True)
+        LOG.info(f"  Page text length: {len(page_text):,} characters")
+        LOG.debug(f"  Page text preview: {page_text[:300]}...\n")
         
-        # Look for "Average Petrol Price" followed by price
-        petrol_section = re.search(
-            r'Average\s+Petrol\s+Price\s*₦\s*(\d{3,4}\.\d{2})',
-            page_text,
-            re.I
-        )
-        if petrol_section:
+        # Try to find "Average Petrol Price" pattern
+        LOG.info("  Searching for 'Average Petrol Price' pattern...")
+        petrol_pattern = r'Average\s+Petrol\s+Price\s+₦\s*(\d+\.\d{2})'
+        LOG.debug(f"  Pattern: {petrol_pattern}")
+        
+        match = re.search(petrol_pattern, page_text)
+        if match:
             try:
-                price_raw = float(petrol_section.group(1))
-                LOG.debug(f"[FuelPriceWatch] Found price via page regex: ₦{price_raw}")
-            except ValueError:
-                pass
-        
-        # Extract percent from page
-        if change_percent is None:
-            pct_search = re.search(r'Petrol.*?([+\-]\s*\d+(?:\.\d+)?)\s*%', page_text, re.I | re.DOTALL)
-            if pct_search:
-                try:
-                    change_percent = float(pct_search.group(1).replace(" ", ""))
-                except ValueError:
-                    pass
-        
-        # Extract absolute change from page
-        if change_absolute is None:
-            abs_search = re.search(r'Petrol.*?([+\-]\s*₦\s*\d+(?:\.\d+)?)\s*today', page_text, re.I | re.DOTALL)
-            if abs_search:
-                change_absolute = abs_search.group(1).replace(" ", "")
+                price_raw = float(match.group(1))
+                LOG.info(f"  ✓ Page-level price found: ₦{price_raw:.2f}\n")
+                extraction_log.append(f"✓ Price via page fallback: ₦{price_raw:.2f}")
+            except ValueError as e:
+                LOG.warning(f"  ✗ ValueError: {e}\n")
+        else:
+            LOG.warning("  ✗ Page-level pattern not found\n")
     
     # ═══════════════════════════════════════════════════════════════════════
-    # STEP 4: Build diagnostic info
+    # STEP 4: Diagnostic Information Collection
     # ═══════════════════════════════════════════════════════════════════════
     
-    # Collect all elements with ₦ for diagnostics
-    naira_elements = []
-    for elem in soup.find_all(['div', 'span', 'p']):
+    LOG.info("🔬 STEP 4: Collecting Diagnostic Information\n")
+    
+    LOG.info("  Scanning all elements for ₦ character or price indicators...")
+    element_count = 0
+    price_element_count = 0
+    
+    for elem in soup.find_all(['div', 'span', 'p', 'h1', 'h2', 'h3']):
+        element_count += 1
         text = elem.get_text(strip=True)
-        if '₦' in text and len(text) < 200:  # Reasonable length
-            naira_elements.append(FoundElement(
+        
+        # Check both for the character and for common fuel price indicators
+        has_naira = '₦' in text
+        has_price_pattern = bool(re.search(r'\d{3,4}\.\d{2}', text))
+        has_fuel_type = any(f in text for f in ['Petrol', 'Diesel', 'Kerosene', 'Fuel'])
+        
+        should_collect = (has_naira or (has_price_pattern and has_fuel_type)) and len(text) < 300
+        
+        if should_collect:
+            price_element_count += 1
+            price_match = re.search(r'₦\s*[\d,.]+', text)
+            found_elements.append(FoundElement(
                 tag=elem.name,
-                classes=" ".join(elem.get("class", [])),
+                classes=" ".join(elem.get("class", [])) if elem.get("class") else "",
                 element_id=elem.get("id", ""),
                 text_preview=text[:100],
-                price_found=re.search(r'₦\s*[\d,]+\.?\d*', text).group(0) if re.search(r'₦\s*[\d,]+\.?\d*', text) else None
+                price_found=price_match.group(0) if price_match else None
             ))
     
-    # Summary logging
-    LOG.info(
-        "[FuelPriceWatch] Parse summary | Price: %s | Percent: %s | Absolute: %s | Elements: %d | Selectors: %s",
-        f"₦{price_raw:,.2f}" if price_raw else "None",
-        f"{change_percent}%" if change_percent is not None else "None",
-        change_absolute or "None",
-        len(naira_elements),
-        selectors_used or ["none"]
-    )
-
+    LOG.info(f"  ├─ Total elements scanned: {element_count:,}")
+    LOG.info(f"  ├─ Price elements found: {price_element_count}")
+    LOG.info(f"  └─ Elements with ₦: {sum(1 for e in found_elements if e.price_found)}\n")
+    
+    if found_elements:
+        LOG.info("  📍 Found Elements (first 10):")
+        for idx, elem in enumerate(found_elements[:10], 1):
+            LOG.info(f"    {idx}. {elem}")
+        if len(found_elements) > 10:
+            LOG.info(f"    ... and {len(found_elements) - 10} more")
+        LOG.info()
+    else:
+        LOG.warning("  ⚠️  No elements with ₦ found!\n")
+    
+    # ═══════════════════════════════════════════════════════════════════════
+    # STEP 5: Final Summary
+    # ═══════════════════════════════════════════════════════════════════════
+    
+    elapsed = time.time() - start_time
+    success = price_raw is not None
+    
+    LOG.info("📊 FINAL SUMMARY")
+    LOG.info(f"{'='*80}")
+    LOG.info(f"  Extraction Success: {'✓ YES' if success else '✗ NO'}")
+    LOG.info(f"  Price: {f'₦{price_raw:,.2f}' if price_raw else 'NOT FOUND'}")
+    LOG.info(f"  Percent Change: {f'{change_percent}%' if change_percent is not None else 'NOT FOUND'}")
+    LOG.info(f"  Absolute Change: {change_absolute or 'NOT FOUND'}")
+    LOG.info(f"  Execution Time: {elapsed:.2f}s")
+    LOG.info(f"{'='*80}\n")
+    
+    LOG.info("📋 EXTRACTION LOG:")
+    for idx, entry in enumerate(extraction_log, 1):
+        LOG.info(f"  {idx}. {entry}")
+    LOG.info()
+    
     return {
         "source": url,
         "price_raw": price_raw or 0.0,
@@ -3281,12 +3381,101 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
         "change_percent": change_percent,
         "change_absolute": change_absolute,
         "last_updated": "Live data",
-        "parsed_from": card_text[:400] if card_text else (soup.get_text(" ", strip=True)[:400]),
-        "elements_found_count": len(naira_elements),
-        "elements_details": [str(e) for e in naira_elements[:10]],
-        "selectors_used": selectors_used or ["none"],
-        "parser_version": "2026.02.11-tailwind",
+        "success": success,
+        "diagnostic_elements": [str(e) for e in found_elements[:10]],
+        "parser_version": "2026.02.11-comprehensive-logging",
+        "execution_time_seconds": elapsed,
+        "extraction_log": extraction_log,
     }
+
+
+async def scrape_fuel_prices() -> Dict[str, Any]:
+    """
+    Scrape current fuel prices from Fuel Price Watch with comprehensive logging.
+    """
+    app_url = "https://app.fuelpricewatch.com/"
+    
+    LOG.info("\n" + "="*80)
+    LOG.info("🚀 FUEL PRICE SCRAPER - SESSION START")
+    LOG.info("="*80 + "\n")
+    
+    session_start = time.time()
+    
+    try:
+        LOG.info("📡 Method 1: Fetching live app with Playwright\n")
+        
+        fetch_start = time.time()
+        html = await fetch_with_playwright_aggressive(
+            app_url,
+            retries=3,
+            return_visible_text=False,
+            wait_for_selector='div.gumroad-card, div[class*="bg-card"]',
+            wait_timeout=30000
+        )
+        fetch_time = time.time() - fetch_start
+        
+        LOG.info(f"  ✓ Playwright fetch successful")
+        LOG.info(f"    ├─ HTML size: {len(html):,} bytes")
+        LOG.info(f"    └─ Fetch time: {fetch_time:.2f}s\n")
+        
+        # Parse the HTML
+        parse_start = time.time()
+        result = _parse_fuelpricewatch(html, url=app_url)
+        parse_time = time.time() - parse_start
+        
+        LOG.info(f"\n  Parse time: {parse_time:.2f}s\n")
+        
+        if result.get("success"):
+            LOG.info("✅ OVERALL STATUS: SUCCESS\n")
+            
+            return {
+                "avg_petrol": result["price_str"],
+                "avg_raw": result["price_raw"],
+                "change_percent": result.get("change_percent", "N/A"),
+                "change_absolute": result.get("change_absolute", "N/A"),
+                "last_updated": result.get("last_updated", "Live"),
+                "sources": [app_url],
+                "debug": {
+                    "method": "live_app_playwright",
+                    "diagnostic_elements": result.get("diagnostic_elements", []),
+                    "extraction_log": result.get("extraction_log", []),
+                    "fetch_time_seconds": fetch_time,
+                    "parse_time_seconds": parse_time,
+                    "total_time_seconds": time.time() - session_start,
+                }
+            }
+        else:
+            LOG.error("❌ OVERALL STATUS: PARSING FAILED\n")
+            LOG.error("Check the parse logs above for details\n")
+            
+            return {
+                "avg_petrol": "N/A",
+                "avg_raw": None,
+                "error": "parsing_failed",
+                "debug": {
+                    "diagnostic_elements": result.get("diagnostic_elements", []),
+                    "extraction_log": result.get("extraction_log", []),
+                    "parser_version": result.get("parser_version"),
+                    "fetch_time_seconds": fetch_time,
+                    "total_time_seconds": time.time() - session_start,
+                }
+            }
+            
+    except Exception as e:
+        elapsed = time.time() - session_start
+        LOG.exception(f"❌ EXCEPTION OCCURRED: {type(e).__name__}")
+        LOG.error(f"  Error message: {str(e)[:200]}")
+        LOG.error(f"  Total elapsed: {elapsed:.2f}s\n")
+        
+        return {
+            "avg_petrol": "N/A",
+            "avg_raw": None,
+            "error": "exception",
+            "exception": str(e),
+            "debug": {
+                "total_time_seconds": elapsed,
+            }
+        }
 
 @retry(max_attempts=3, backoff=1.5)
 async def _fetch_lpg_html() -> str:
@@ -3299,74 +3488,72 @@ async def _fetch_lpg_html() -> str:
         wait_timeout=30000
     )
 
-async def scrape_fuel_prices() -> Dict[str, Any]:
+def _parse_lpg_price_string(price_str: Any) -> Optional[float]:
     """
-    Scrape current fuel prices from Fuel Price Watch.
+    Parse LPG depot price strings from the lpginnigeria.com table.
     
-    Uses Playwright to fetch dynamic content from app.fuelpricewatch.com,
-    then parses the structured data.
+    Handles:
+    - "16,100,000" → 16100000.0
+    - "0" → 0.0
+    - "N/A", "", None → None
+    - "₦16,100,000" → 16100000.0 (if symbol appears)
+    - "16.100.000" (dots instead of commas) → 16100000.0
+    - Whitespace, extra text
     
     Returns:
-        Dict containing:
-        - avg_petrol: Formatted price string
-        - avg_raw: Raw price value (float)
-        - change_percent: Percentage change from last period
-        - change_absolute: Absolute change today
-        - last_updated: Update timestamp
-        - sources: List of parsed source data
-        - debug: Debug information
+        float or None if parsing fails
     """
-    app_url = "https://app.fuelpricewatch.com/"
+    if price_str is None:
+        return None
     
-    LOG.info("[FuelPrices] 🚀 Starting fuel price scrape...")
+    # Convert to string and clean
+    s = str(price_str).strip()
     
-    # Try primary method: Live app with Playwright
+    # Return None for obvious non-price values
+    if not s or s.upper() in ('N/A', 'NULL', 'NONE', '-'):
+        return None
+    
+    # Remove currency symbols and common non-digit characters except digits, commas, dots
+    # Keep commas and dots as they are thousand separators
+    # But also remove any alphabetic characters and extra spaces
+    s = re.sub(r'[^\d,.-]', '', s)  # Allow digits, commas, dots, minus sign
+    
+    # If after cleaning it's empty, return None
+    if not s:
+        return None
+    
     try:
-        LOG.info("[FuelPrices] Method 1: Fetching live app with Playwright...")
+        # Handle negative values (unlikely for prices but possible for diffs)
+        is_negative = s.startswith('-')
+        if is_negative:
+            s = s[1:]
         
-        html = await fetch_with_playwright_aggressive(
-            app_url,
-            retries=3,
-            return_visible_text=False,
-            wait_for_selector='div.gumroad-card, div.rounded-lg.border.bg-card',  # Wait for cards
-            wait_timeout=30000  # 15 seconds
-        )
-        LOG.info(f"[FuelPrices] ✓ Playwright fetch success: {len(html)} bytes")
+        # Replace commas and dots – but be careful: some locales use . as thousand separator
+        # We'll assume that the last dot (if any) is the decimal, but LPG prices are integers
+        # So we can just remove all thousand separators (commas or dots)
+        s = s.replace(',', '')
         
-        result = _parse_fuelpricewatch(html, url=app_url)
-        #analysis = analyze_fuel_html(html, url=app_url)
+        # If dots remain, remove them too (they are thousand separators in some formats)
+        # But if there's a dot and it's the last character or followed by only two digits,
+        # it might be decimal. Since prices are integers, we can simply remove all dots.
+        s = s.replace('.', '')
         
-        if result.get("price_raw") is not None:
-            LOG.info("[FuelPrices] ✅ Method 1 SUCCESS - Live app data extracted")
-            return {
-                "avg_petrol": result["price_str"],
-                "avg_raw": result["price_raw"],
-                "change_percent": result.get("change_percent", "N/A"),
-                "change_absolute": result.get("change_absolute", "N/A"),
-                "last_updated": result.get("last_updated", "Live data"),
-                "sources": [app_url],
-                "debug": {"method": "live_app_playwright", "url": app_url}
-            }
-        else:
-            LOG.warning(f"[FuelPrices] ⚠️ Method 1 parsing failed: {result.get('error')}")
-            
-    except Exception as e:
-        LOG.warning(f"[FuelPrices] ⚠️ Method 1 failed: {type(e).__name__}: {str(e)[:100]}")
-        import traceback
-        LOG.debug(f"[FuelPrices] Method 1 traceback:\n{traceback.format_exc()}")
-    
-    LOG.error("[FuelPrices] ❌ ALL METHODS FAILED - No fuel price data available")
-    
-    return {
-        "avg_petrol": "N/A",
-        "change_percent": "N/A",
-        "change_absolute": "N/A",
-        "last_updated": "N/A",
-        "avg_raw": None,
-        "error": "all_methods_failed",
-        "sources": [],
-        "debug": {"method": "failed", "attempted": ["live_app_playwright", "static_index"]}
-    }
+        # Convert to float
+        value = float(s)
+        if is_negative:
+            value = -value
+        
+        return value
+    except ValueError:
+        # Last resort: extract the first number using regex
+        match = re.search(r'([-]?[\d,]+(?:\.\d+)?)', str(price_str))
+        if match:
+            num_str = match.group(1).replace(',', '').replace('.', '')
+            try:
+                return float(num_str)
+            except ValueError:
+                return None
+    return None
 
 async def scrape_lpg_prices() -> Dict[str, Any]:
     try:
@@ -3381,10 +3568,10 @@ async def scrape_lpg_prices() -> Dict[str, Any]:
             "last_updated": "N/A",
             "source": "https://lpginnigeria.com/chart",
         }
-
+    
     soup = BeautifulSoup(html, "lxml")
     page_text = soup.get_text("\n", strip=True)
-
+    
     block = _detect_block(soup)
     if block:
         LOG.warning(f"LPG chart blocked: {block}")
@@ -3396,51 +3583,58 @@ async def scrape_lpg_prices() -> Dict[str, Any]:
             "last_updated": "N/A",
             "source": "https://lpginnigeria.com/chart",
         }
-
+    
     date_match = re.search(r"(?:\[)?(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)?(?:\])?,\s*\d{1,2}(st|nd|rd|th)?\s+\w+\s*,\s*\d{4}", page_text, re.IGNORECASE)
     last_updated = date_match.group(0).strip("[] ,") if date_match else "Today"
-
+    
     depots = []
     valid_prices = []
-
-    # Find the depot price table - headers: Depot, Prices, Diff., Diff %
+    
+    target_table = None
     for table in soup.find_all("table"):
-        headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
-        
-        # Check if this is the depot price table
-        if "depot" in headers and "prices" in headers and "diff" in headers:
-            for row in table.find_all("tr")[1:]:  # Skip header row
-                cols = row.find_all(["td"])
-                if len(cols) >= 4:
-                    depot_name = cols[0].get_text(strip=True)
-                    price_raw = cols[1].get_text(strip=True)
-                    
-                    # Extract diff and diff % - clean out icons and extra spans
-                    diff_cell = cols[2]
-                    diff_pct_cell = cols[3]
-                    
-                    # Get the actual number value (not the icon)
-                    diff_span = diff_cell.find("span", class_="pr-5")
-                    diff_value = diff_span.get_text(strip=True) if diff_span else diff_cell.get_text(strip=True)
-                    
-                    diff_pct_span = diff_pct_cell.find("span", class_="pr-5")
-                    diff_pct_value = diff_pct_span.get_text(strip=True) if diff_pct_span else diff_pct_cell.get_text(strip=True)
-                    
-                    price = _parse_price_string(price_raw) or 0.0
-                    
-                    depots.append({
-                        "depot": depot_name,
-                        "price_20mt": price,
-                        "price_str": _format_naira(price) if price > 0 else "N/A",
-                        "diff": diff_value,
-                        "diff_pct": diff_pct_value,
-                    })
-                    
-                    # Valid price filter: between 10M and 50M, not zero
-                    if price > 10_000_000 and price < 50_000_000:
-                        valid_prices.append(price)
-            break  # Found our table
-
+        header_text = table.get_text().lower()
+        if "depot" in header_text and "price" in header_text:
+            target_table = table
+            break
+    
+    if target_table:
+        for row in target_table.find_all("tr")[1:]:
+            cols = [c.get_text(strip=True) for c in row.find_all(["td", "th"])]
+            if len(cols) >= 4:
+                depot_name = cols[0]
+                price_raw = cols[1]
+                diff_str = cols[2]
+                diff_pct_str = cols[3]
+                
+                price = _parse_lpg_price_string(price_raw) or 0.0
+                
+                depots.append({
+                    "depot": depot_name,
+                    "price_20mt": price,
+                    "price_str": _format_naira(price) if price > 0 else "N/A",
+                    "diff": diff_str,
+                    "diff_pct": diff_pct_str,
+                })
+                
+                if price > 10_000_000 and price < 50_000_000 and "infinity" not in diff_pct_str.lower():
+                    valid_prices.append(price)
+    
+    if not valid_prices:
+        row_matches = re.findall(r"([A-Z][A-Za-z\s\(\)&]+)\s+(\d{1,2}(?:,\d{3})*)\s+([+-]?\d{1,3}(?:,\d{3})*)\s+([+-]?\d+\.\d+%|Infinity%)", page_text)
+        for depot_name, price_str, diff_str, diff_pct_str in row_matches:
+            price = _parse_price_string(price_str) or 0.0
+            
+            depots.append({
+                "depot": depot_name.strip(),
+                "price_20mt": price,
+                "price_str": _format_naira(price) if price > 0 else "N/A",
+                "diff": diff_str,
+                "diff_pct": diff_pct_str,
+            })
+            
+            if price > 10_000_000 and price < 50_000_000 and "infinity" not in diff_pct_str.lower():
+                valid_prices.append(price)
+    
     if not valid_prices:
         LOG.warning("No valid depot prices found")
         return {
@@ -3452,22 +3646,22 @@ async def scrape_lpg_prices() -> Dict[str, Any]:
             "source": "https://lpginnigeria.com/chart",
             "depots": depots,
         }
-
+    
     avg_20mt = sum(valid_prices) / len(valid_prices)
     per_kg = avg_20mt / 20_000
-
+    
     margin_low = 400
     margin_high = 600
     retail_low = per_kg + margin_low
     retail_high = per_kg + margin_high
-
+    
     avg_20mt_str = f"₦{int(round(avg_20mt)):,}"
     per_kg_str = f"₦{per_kg:,.2f}"
     retail_range_str = f"₦{int(round(retail_low)):,} – ₦{int(round(retail_high)):,} per kg"
-
+    
     LOG.info("LPG scraped → Avg 20MT: %s | Per kg: %s | Lagos retail est: %s | Date: %s | Valid depots: %d",
              avg_20mt_str, per_kg_str, retail_range_str, last_updated, len(valid_prices))
-
+    
     return {
         "avg_depot_20mt": avg_20mt_str,
         "avg_depot_per_kg": per_kg_str,
@@ -3482,6 +3676,7 @@ async def scrape_lpg_prices() -> Dict[str, Any]:
         "valid_depots_count": len(valid_prices),
         "note": "Lagos retail estimate calculated as: average depot price per kg + ₦400–600/kg typical markup",
     }
+
 # ═══════════════════════════════════════════════════════════════════════════
 # SITE-SPECIFIC ARTICLE LISTING PAGES (WITH ENHANCED LOGGING)
 # ═══════════════════════════════════════════════════════════════════════════
