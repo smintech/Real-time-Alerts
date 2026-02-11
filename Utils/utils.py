@@ -1473,8 +1473,7 @@ def retry(max_attempts: int = 3, backoff: float = 1.5):
 @retry(max_attempts=4, backoff=2.0)
 async def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False) -> str:
     domain = get_domain_from_url(url)
-    # Removed 'konga' from tough_domains — Cloudscraper first (faster, less timeout)
-    tough_domains = ['konga', 'jumia', 'gov.ng', 'nysc', 'nuc', 'waec', 'neco', 'myschool', 'punchng', 'education']
+    tough_domains = ['konga', 'jumia', 'gov.ng', 'nysc', 'nuc', 'waec', 'neco', 'myschool', 'punchng', 'education', 'lpginnigeria']
     
     if any(d in domain for d in tough_domains):
         prefer_playwright_on_first_try = True
@@ -1502,7 +1501,6 @@ async def _fetch_html(url: str, prefer_playwright_on_first_try: bool = False) ->
     except Exception as e:
         LOG.exception("All fetch strategies failed for %s: %s", url, e)
         raise ScrapeError(f"All fetch strategies failed for {url}: {e}")
-
 # ═══════════════════════════════════════════════════════════════════════════
 # HELPER FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3293,7 +3291,13 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
 @retry(max_attempts=3, backoff=1.5)
 async def _fetch_lpg_html() -> str:
     url = "https://lpginnigeria.com/chart"
-    return await _fetch_html(url)
+    return await fetch_with_playwright_aggressive(
+        url,
+        retries=3,
+        return_visible_text=False,
+        wait_for_selector='table.table-striped',  # ✅ Wait for the actual price table
+        wait_timeout=30000
+    )
 
 async def scrape_fuel_prices() -> Dict[str, Any]:
     """
@@ -3325,12 +3329,12 @@ async def scrape_fuel_prices() -> Dict[str, Any]:
             retries=3,
             return_visible_text=False,
             wait_for_selector='div.gumroad-card, div.rounded-lg.border.bg-card',  # Wait for cards
-            wait_timeout=15000  # 15 seconds
+            wait_timeout=30000  # 15 seconds
         )
         LOG.info(f"[FuelPrices] ✓ Playwright fetch success: {len(html)} bytes")
         
         result = _parse_fuelpricewatch(html, url=app_url)
-        analysis = analyze_fuel_html(html, url=app_url)
+        #analysis = analyze_fuel_html(html, url=app_url)
         
         if result.get("price_raw") is not None:
             LOG.info("[FuelPrices] ✅ Method 1 SUCCESS - Live app data extracted")
@@ -3366,7 +3370,7 @@ async def scrape_fuel_prices() -> Dict[str, Any]:
 
 async def scrape_lpg_prices() -> Dict[str, Any]:
     try:
-        html = await _fetch_lpg_html()  # your existing fetch function
+        html = await _fetch_lpg_html()
     except Exception as e:
         LOG.error(f"Failed to fetch LPG chart: {e}")
         return {
@@ -3377,113 +3381,93 @@ async def scrape_lpg_prices() -> Dict[str, Any]:
             "last_updated": "N/A",
             "source": "https://lpginnigeria.com/chart",
         }
-    
+
     soup = BeautifulSoup(html, "lxml")
-    
-    # Clean up some common non-breaking spaces & entities
-    page_text = soup.get_text(separator="\n", strip=True)
-    page_text = page_text.replace("\xa0", " ").replace("&nbsp;", " ").replace("  ", " ")
-    
-    # ────────────────────────────────────────────────
-    # 1. Extract last_updated date
-    # ────────────────────────────────────────────────
-    date_match = re.search(
-        r"(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)?\s*,?\s*\d{1,2}(?:st|nd|rd|th)?\s+[A-Za-z]+\s*,?\s*\d{4}",
-        page_text, re.IGNORECASE
-    )
-    last_updated = date_match.group(0).strip(" ,") if date_match else "Today"
-    
-    # ────────────────────────────────────────────────
-    # 2. Parse depot prices from text (Markdown table style)
-    # ────────────────────────────────────────────────
-    lines = page_text.splitlines()
-    in_depot_section = False
-    depots: List[Dict[str, Any]] = []
-    valid_prices: List[float] = []
-    
-    for line in lines:
-        line = line.strip()
-        if not line:
-            continue
+    page_text = soup.get_text("\n", strip=True)
+
+    block = _detect_block(soup)
+    if block:
+        LOG.warning(f"LPG chart blocked: {block}")
+        return {
+            "error": block,
+            "avg_depot_20mt": "N/A",
+            "avg_depot_per_kg": "N/A",
+            "retail_estimate_lagos": "N/A",
+            "last_updated": "N/A",
+            "source": "https://lpginnigeria.com/chart",
+        }
+
+    date_match = re.search(r"(?:\[)?(?:Monday|Tuesday|Wednesday|Thursday|Friday|Saturday|Sunday)?(?:\])?,\s*\d{1,2}(st|nd|rd|th)?\s+\w+\s*,\s*\d{4}", page_text, re.IGNORECASE)
+    last_updated = date_match.group(0).strip("[] ,") if date_match else "Today"
+
+    depots = []
+    valid_prices = []
+
+    # Find the depot price table - headers: Depot, Prices, Diff., Diff %
+    for table in soup.find_all("table"):
+        headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
         
-        # Detect start of depot prices section
-        if any(kw in line.upper() for kw in ["DAILY LPG DEPOT PRICES", "DEPOT PRICES PER 20MT", "DEPOT", "PRICES", "DIFF %"]):
-            in_depot_section = True
-            continue
-        
-        # Skip separator lines like |---|---|
-        if in_depot_section and ("---" in line or line.startswith("| ---")):
-            continue
-        
-        # Process potential data rows (look for pipe-separated with price pattern)
-        if in_depot_section and "|" in line:
-            parts = [p.strip() for p in line.split("|") if p.strip()]
-            if len(parts) >= 4:  # Depot | Price | Diff | Diff%
-                depot_name = parts[0]
-                price_raw = parts[1].replace(",", "").replace("₦", "").strip()
-                
-                try:
-                    price = float(price_raw)
-                    # Reasonable range for 20MT in recent Nigerian LPG market
-                    if 12_000_000 < price < 30_000_000:
+        # Check if this is the depot price table
+        if "depot" in headers and "prices" in headers and "diff" in headers:
+            for row in table.find_all("tr")[1:]:  # Skip header row
+                cols = row.find_all(["td"])
+                if len(cols) >= 4:
+                    depot_name = cols[0].get_text(strip=True)
+                    price_raw = cols[1].get_text(strip=True)
+                    
+                    # Extract diff and diff % - clean out icons and extra spans
+                    diff_cell = cols[2]
+                    diff_pct_cell = cols[3]
+                    
+                    # Get the actual number value (not the icon)
+                    diff_span = diff_cell.find("span", class_="pr-5")
+                    diff_value = diff_span.get_text(strip=True) if diff_span else diff_cell.get_text(strip=True)
+                    
+                    diff_pct_span = diff_pct_cell.find("span", class_="pr-5")
+                    diff_pct_value = diff_pct_span.get_text(strip=True) if diff_pct_span else diff_pct_cell.get_text(strip=True)
+                    
+                    price = _parse_price_string(price_raw) or 0.0
+                    
+                    depots.append({
+                        "depot": depot_name,
+                        "price_20mt": price,
+                        "price_str": _format_naira(price) if price > 0 else "N/A",
+                        "diff": diff_value,
+                        "diff_pct": diff_pct_value,
+                    })
+                    
+                    # Valid price filter: between 10M and 50M, not zero
+                    if price > 10_000_000 and price < 50_000_000:
                         valid_prices.append(price)
-                        depots.append({
-                            "depot": depot_name,
-                            "price_20mt": price,
-                            "price_str": f"₦{int(round(price)):,}",
-                            "diff": parts[2] if len(parts) > 2 else "N/A",
-                            "diff_pct": parts[3] if len(parts) > 3 else "N/A",
-                        })
-                except ValueError:
-                    pass  # skip malformed lines
-    
-    # ────────────────────────────────────────────────
-    # 3. If no valid prices → fallback / error
-    # ────────────────────────────────────────────────
+            break  # Found our table
+
     if not valid_prices:
-        LOG.warning("No valid depot prices found after text parsing")
-        # Optional: try crude average from chart text as last resort
-        chart_match = re.search(r"Average Depot prices.*?(\d{1,3}(?:,\d{3})+)\b", page_text, re.IGNORECASE | re.DOTALL)
-        if chart_match:
-            try:
-                avg_fallback = float(chart_match.group(1).replace(",", ""))
-                valid_prices = [avg_fallback]  # treat as single point
-                LOG.info(f"Fallback to chart average: ₦{int(avg_fallback):,}")
-            except:
-                pass
-        
-        if not valid_prices:
-            return {
-                "error": "no_valid_prices",
-                "avg_depot_20mt": "N/A",
-                "avg_depot_per_kg": "N/A",
-                "retail_estimate_lagos": "N/A",
-                "last_updated": last_updated,
-                "source": "https://lpginnigeria.com/chart",
-                "depots": depots,
-                "valid_depots_count": 0,
-            }
-    
-    # ────────────────────────────────────────────────
-    # 4. Calculate averages & retail estimate
-    # ────────────────────────────────────────────────
+        LOG.warning("No valid depot prices found")
+        return {
+            "error": "no_valid_prices",
+            "avg_depot_20mt": "N/A",
+            "avg_depot_per_kg": "N/A",
+            "retail_estimate_lagos": "N/A",
+            "last_updated": last_updated,
+            "source": "https://lpginnigeria.com/chart",
+            "depots": depots,
+        }
+
     avg_20mt = sum(valid_prices) / len(valid_prices)
-    per_kg = avg_20mt / 20_000  # 20 metric tons = 20,000 kg
-    
+    per_kg = avg_20mt / 20_000
+
     margin_low = 400
     margin_high = 600
     retail_low = per_kg + margin_low
     retail_high = per_kg + margin_high
-    
+
     avg_20mt_str = f"₦{int(round(avg_20mt)):,}"
     per_kg_str = f"₦{per_kg:,.2f}"
     retail_range_str = f"₦{int(round(retail_low)):,} – ₦{int(round(retail_high)):,} per kg"
-    
-    LOG.info(
-        "LPG scraped → Avg 20MT: %s | Per kg: %s | Lagos retail est: %s | Date: %s | Valid depots: %d",
-        avg_20mt_str, per_kg_str, retail_range_str, last_updated, len(valid_prices)
-    )
-    
+
+    LOG.info("LPG scraped → Avg 20MT: %s | Per kg: %s | Lagos retail est: %s | Date: %s | Valid depots: %d",
+             avg_20mt_str, per_kg_str, retail_range_str, last_updated, len(valid_prices))
+
     return {
         "avg_depot_20mt": avg_20mt_str,
         "avg_depot_per_kg": per_kg_str,
@@ -3496,7 +3480,7 @@ async def scrape_lpg_prices() -> Dict[str, Any]:
         "source": "https://lpginnigeria.com/chart",
         "depots": depots,
         "valid_depots_count": len(valid_prices),
-        "note": "Lagos retail estimate: average depot price per kg + ₦400–600/kg typical markup",
+        "note": "Lagos retail estimate calculated as: average depot price per kg + ₦400–600/kg typical markup",
     }
 # ═══════════════════════════════════════════════════════════════════════════
 # SITE-SPECIFIC ARTICLE LISTING PAGES (WITH ENHANCED LOGGING)
