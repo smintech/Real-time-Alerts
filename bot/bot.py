@@ -1427,7 +1427,7 @@ async def run_bot():
                 #time=time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
                 #name="check_fuel_prices",
                 #first=20,
-            )
+            #)
             #application.job_queue.run_repeating(
                 #callback=check_trials,
                 #interval=86400,
