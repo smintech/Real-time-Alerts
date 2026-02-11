@@ -3064,73 +3064,95 @@ class FoundElement:
             parts.append(f"📈 Change: {self.change_found}")
         return " | ".join(parts)
 
-def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/") -> dict:
+def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/") -> Dict[str, Any]:
+    """
+    Hybrid parser: Combines DOM targeting, Script inspection, and Global Regex.
+    """
     start_time = time.time()
     soup = BeautifulSoup(html, "html.parser")
     
-    # Initialize variables
+    # Extraction State
     price_raw = 0.0
     change_percent = None
     change_absolute = None
     success = False
     extraction_log = []
 
-    # 1. FIND THE PETROL CARD
-    # We look for the 'gumroad-card' that contains the specific text
+    # ═══════════════════════════════════════════════════════════════════════
+    # STRATEGY 1: Targeted Card DOM Extraction
+    # ═══════════════════════════════════════════════════════════════════════
+    # We look for the gumroad-card container first.
     petrol_card = None
-    all_cards = soup.find_all("div", class_="gumroad-card")
-    
-    for card in all_cards:
+    for card in soup.find_all("div", class_="gumroad-card"):
         if "Petrol" in card.get_text():
             petrol_card = card
-            extraction_log.append("✓ Found Petrol card container")
+            extraction_log.append("✓ Located Petrol Card via DOM")
             break
 
-    if not petrol_card:
-        # Fallback: find any element containing the text and get its parent
-        target = soup.find(string=re.compile(r"Average Petrol Price", re.I))
-        if target:
-            petrol_card = target.find_parent("div", class_="gumroad-card") or target.find_parent("div")
-            extraction_log.append("✓ Found Petrol card via string fallback")
-
-    # 2. EXTRACT DATA FROM CARD
     if petrol_card:
-        # Get all text from card for broad regex search
-        full_text = petrol_card.get_text(" ", strip=True)
-        LOG.debug(f"Card Content: {full_text}")
-
-        # --- EXTRACT PRICE ---
-        # Look for: ₦ followed by numbers, or just numbers with two decimals near "Price"
-        # Handles: ₦873.88, ₦ 873.88, 873.88
-        price_match = re.search(r'(?:₦|N)?\s*(\d{2,4}(?:,\d{3})*\.\d{2})', full_text)
-        
+        card_text = petrol_card.get_text(" ", strip=True)
+        # Regex looks for ₦ symbol (or 'N') + a decimal number
+        price_match = re.search(r'(?:₦|N)?\s*(\d{2,4}(?:,\d{3})*\.\d{2})', card_text)
         if price_match:
             try:
-                price_val = price_match.group(1).replace(",", "")
-                price_raw = float(price_val)
+                price_raw = float(price_match.group(1).replace(",", ""))
                 success = True
-                extraction_log.append(f"✓ Extracted Price: {price_raw}")
+                extraction_log.append(f"✓ Price found in Card: {price_raw}")
             except (ValueError, IndexError):
-                extraction_log.append("✗ Failed to convert price string to float")
-        else:
-            extraction_log.append("✗ Could not find price pattern in card text")
+                pass
 
-        # --- EXTRACT PERCENT CHANGE ---
-        # Look for: +0.5%, -1.2%
-        pct_match = re.search(r'([+\-]\s*\d+(?:\.\d+)?)\s*%', full_text)
-        if pct_match:
-            change_percent = float(pct_match.group(1).replace(" ", ""))
-            extraction_log.append(f"✓ Found Percent: {change_percent}%")
+    # ═══════════════════════════════════════════════════════════════════════
+    # STRATEGY 2: Script Tag Deep-Dive (JSON Blobs)
+    # ═══════════════════════════════════════════════════════════════════════
+    # If Strategy 1 failed (hydration issue), search for data in <script> tags.
+    if not success:
+        LOG.info("DOM Card empty; searching script tags...")
+        # Common in Next.js/React apps (__NEXT_DATA__ or similar)
+        scripts = soup.find_all("script")
+        for script in scripts:
+            script_content = script.string if script.string else ""
+            if "Average Petrol Price" in script_content or "873" in script_content:
+                # Look for numbers near "Petrol" inside the code string
+                # This pattern targets: "Petrol","price":873.88 or similar
+                script_match = re.search(r'Petrol.*?(\d{3,4}\.\d{2})', script_content, re.S)
+                if script_match:
+                    price_raw = float(script_match.group(1))
+                    success = True
+                    extraction_log.append(f"✓ Price found in Script tag: {price_raw}")
+                    break
 
-        # --- EXTRACT ABSOLUTE CHANGE ---
-        # Look for: +₦5.00 today or ₦-2.50 today
-        abs_match = re.search(r'([+\-]?\s*(?:₦|N)\s*[+\-]?\s*\d+\.\d{2})\s*today', full_text, re.I)
-        if abs_match:
-            change_absolute = abs_match.group(1).replace(" ", "")
-            extraction_log.append(f"✓ Found Absolute Change: {change_absolute}")
+    # ═══════════════════════════════════════════════════════════════════════
+    # STRATEGY 3: Global Regex Scan (Hail Mary)
+    # ═══════════════════════════════════════════════════════════════════════
+    # If we still have nothing, scan the entire raw HTML string.
+    if not success:
+        LOG.warning("Script tags yielded nothing; attempting Global Regex.")
+        # We look for the FIRST currency-formatted number in the whole doc
+        # Usually, the main summary price appears first in the HTML.
+        global_matches = re.findall(r'[₦N]\s*(\d{2,4}(?:,\d{3})*\.\d{2})', html)
+        if global_matches:
+            try:
+                price_raw = float(global_matches[0].replace(",", ""))
+                success = True
+                extraction_log.append(f"✓ Price found via Global Scan: {price_raw}")
+            except Exception:
+                pass
 
-    else:
-        extraction_log.append("✗ Could not identify Petrol Price card")
+    # ═══════════════════════════════════════════════════════════════════════
+    # CHANGE EXTRACTION (Global context is usually safer for these)
+    # ═══════════════════════════════════════════════════════════════════════
+    # 1. Percent Change (+0.5%)
+    pct_match = re.search(r'([+\-]\s*\d+(?:\.\d+)?)\s*%', html)
+    if pct_match:
+        change_percent = float(pct_match.group(1).replace(" ", ""))
+        extraction_log.append(f"✓ Percent change: {change_percent}%")
+
+    # 2. Absolute Change (+₦5.00 today)
+    # This looks for the sign + currency + digits + 'today' anchor
+    abs_match = re.search(r'([+\-]?\s*[₦N]\s*[+\-]?\s*\d+\.\d{2})\s*today', html, re.I)
+    if abs_match:
+        change_absolute = abs_match.group(1).replace(" ", "")
+        extraction_log.append(f"✓ Absolute change: {change_absolute}")
 
     elapsed = time.time() - start_time
     
@@ -3142,7 +3164,8 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
         "change_absolute": change_absolute,
         "success": success,
         "extraction_log": extraction_log,
-        "execution_time": elapsed
+        "execution_time_seconds": elapsed,
+        "parser_version": "2026.02.11-hybrid-strategy"
     }
 
 
@@ -3166,7 +3189,7 @@ async def scrape_fuel_prices() -> Dict[str, Any]:
             app_url,
             retries=3,
             return_visible_text=False,
-            wait_for_selector='div.gumroad-card, div[class*="bg-card"]',
+            wait_for_selector='div.gumroad-card:has-text('₦'), div[class*="bg-card"]',
             wait_timeout=30000
         )
         fetch_time = time.time() - fetch_start
