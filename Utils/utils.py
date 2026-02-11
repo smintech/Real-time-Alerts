@@ -3264,8 +3264,6 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
         if change_percent is None:
             LOG.warning("    └─ ✗ No percent change found")
         
-        LOG.info("")
-        
         # ─────────────────────────────────────────────────────────────────
         # Extract Absolute Change - Pattern: "+₦5.00 today"
         # ─────────────────────────────────────────────────────────────────
@@ -3427,7 +3425,7 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
     LOG.info("📋 EXTRACTION LOG:")
     for idx, entry in enumerate(extraction_log, 1):
         LOG.info(f"  {idx}. {entry}")
-    LOG.info()
+    
 
     return {
         "source": url,
