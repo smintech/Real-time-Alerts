@@ -3088,18 +3088,6 @@ class FoundElement:
             parts.append(f"📈 Change: {self.change_found}")
         return " | ".join(parts)
 
-
-class FoundElement(NamedTuple):
-    tag: str
-    classes: str
-    element_id: str
-    text_preview: str
-    price_found: str = None
-    
-    def __str__(self):
-        price_info = f" [Price: {self.price_found}]" if self.price_found else ""
-        return f"<{self.tag}> {self.text_preview[:60]}{price_info}"
-
 def parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/") -> Dict[str, Any]:
     """
     Parse Fuel Price Watch with comprehensive logging at every step.
