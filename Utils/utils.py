@@ -3173,7 +3173,7 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
     if not petrol_card:
         LOG.info("  └─ ✗ No card-like element reliably identified (will attempt script/global fallback)\n")
     else:
-        LOG.info("")
+        LOG.info("Found")
 
     # ---------------------------------------------------------
     # STEP 2: Price extraction from chosen card (if any)
@@ -3370,7 +3370,6 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
     for idx, entry in enumerate(extraction_log, 1):
         # keep logs compact in console
         LOG.info(f"  {idx}. {entry if len(entry) < 400 else entry[:400] + '...'}")
-    LOG.info()
 
     return {
         "source": url,
