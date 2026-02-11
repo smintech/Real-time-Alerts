@@ -3069,322 +3069,173 @@ class FoundElement:
 
 def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/") -> Dict[str, Any]:
     """
-    Parse Fuel Price Watch - handles modern concatenated card structure.
-    
-    Current structure (2026-02-11):
-    - Cards: div.rounded-lg.border.bg-card with class "gumroad-card"
-    - Concatenated text: "Average Petrol Price₦873.88+0.5% from last period+₦5.00 today"
-    - No spaces between concatenated values
+    Parse Fuel Price Watch - robust parser that:
+     - searches for multiple card selectors (gumroad-card, bg-card, generic card)
+     - handles concatenated card text (no separators)
+     - extracts price (₦), percent change (e.g. +0.5%) and absolute change (e.g. +₦5.00 today)
+     - returns structured diagnostic info similar to your original return format
     """
-    soup = BeautifulSoup(html, "lxml")
-    LOG.info("[FuelPriceWatch] ═══════════════════════════════════════════════════════")
-    LOG.info("[FuelPriceWatch] Starting parse with %d chars of HTML", len(html))
-    LOG.info("[FuelPriceWatch] ═══════════════════════════════════════════════════════")
-    
+    soup = BeautifulSoup(html, "html.parser")
     found_elements: List[FoundElement] = []
-    
-    def log_element(element: Tag, context: str = "") -> Optional[FoundElement]:
-        """Create structured log entry for an element"""
-        if not isinstance(element, Tag):
-            return None
-            
-        text = element.get_text(" ", strip=True)
-        classes = " ".join(element.get("class", []))
-        elem_id = element.get("id", "")
-        
-        # Extract any price/change info for better logging
-        price_match = re.search(r'₦\s*(\d{3,4}(?:\.\d+)?)', text)
-        change_match = re.search(r'([+\-]\s*₦?\s*\d+\.?\d*)\s*today', text, re.IGNORECASE)
-        
-        entry = FoundElement(
-            tag=element.name,
-            classes=classes,
-            elem_id=element_id,
-            text_preview=text[:150],
-            price_found=price_match.group(0) if price_match else None,
-            change_found=change_match.group(0) if change_match else None
-        )
-        found_elements.append(entry)
-        
-        LOG.debug("[FuelPriceWatch] %s %s", context, entry)
-        return entry
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # PHASE 0: Log ALL elements in HTML for debugging
-    # ═══════════════════════════════════════════════════════════════════════
-    LOG.info("[FuelPriceWatch] PHASE 0: Scanning ALL elements in HTML")
-    LOG.info("[FuelPriceWatch] ─────────────────────────────────────────────────────────")
-    
-    # Log page title
-    page_title = soup.title.string if soup.title else "No title"
-    LOG.info("[FuelPriceWatch] Page title: %s", page_title)
-    
-    # Count all elements by tag
-    tag_counts = {}
-    for elem in soup.find_all(True):
-        tag = elem.name
-        tag_counts[tag] = tag_counts.get(tag, 0) + 1
-    
-    LOG.info("[FuelPriceWatch] Total unique tags: %d", len(tag_counts))
-    LOG.info("[FuelPriceWatch] Most common tags:")
-    for tag, count in sorted(tag_counts.items(), key=lambda x: -x[1])[:10]:
-        LOG.info("[FuelPriceWatch]   %s: %d", tag, count)
-    
-    # Log all divs with price-related classes
-    LOG.info("[FuelPriceWatch] Searching for price-related elements...")
-    price_indicators = ['price', 'Price', 'amount', 'petrol', 'Petrol']
-    
-    for indicator in price_indicators:
-        elements = soup.find_all(lambda tag: tag.name in ['div', 'span', 'p'] and 
-                                 indicator in ' '.join(tag.get('class', [])))
-        if elements:
-            LOG.info("[FuelPriceWatch] Found %d elements with '%s' in class", len(elements), indicator)
-            for idx, elem in enumerate(elements[:3], 1):  # First 3
-                text = elem.get_text(" ", strip=True)[:100]
-                classes = " ".join(elem.get("class", []))
-                LOG.info("[FuelPriceWatch]   [%d] %s | Classes: %s", idx, text, classes)
-    
-    # Log all elements containing ₦ symbol
-    LOG.info("[FuelPriceWatch] Searching for elements with ₦ symbol...")
-    naira_elements = soup.find_all(lambda tag: '₦' in tag.get_text())
-    LOG.info("[FuelPriceWatch] Found %d elements with ₦ symbol", len(naira_elements))
-    
-    for idx, elem in enumerate(naira_elements[:10], 1):  # First 10
-        text = elem.get_text(" ", strip=True)[:100]
-        classes = " ".join(elem.get("class", []))
-        LOG.info("[FuelPriceWatch]   [%d] <%s> %s | Classes: %s", 
-                idx, elem.name, text, classes if classes else "(no classes)")
-    
-    # ═══════════════════════════════════════════════════════════════════════
-    # STRATEGY 1: Find petrol card using updated class selectors
-    # ═══════════════════════════════════════════════════════════════════════
+    # Candidate card selectors (kept in same order as analysis)
+    card_selectors = [
+        ('div.gumroad-card', 'gumroad-card (exact)'),
+        ('div.rounded-lg.border.bg-card', 'rounded border card'),
+        ('div[class*="bg-card"]', 'bg-card contains'),
+        ('div[class*="card"]', 'generic card class'),
+    ]
+
     petrol_card = None
     card_text = ""
-    
-    # Updated selectors based on current page structure
-    card_selectors = [
-        ('div.gumroad-card', 'gumroad-card (exact)'),           # Your specific target
-        ('div.rounded-lg.border.bg-card', 'rounded border card'),  # App page structure
-        ('div[class*="bg-card"]', 'bg-card contains'),          # Fallback
-        ('div[class*="card"]', 'generic card class'),           # Generic
-    ]
-    
-    LOG.info("[FuelPriceWatch] ═══════════════════════════════════════════════════════")
-    LOG.info("[FuelPriceWatch] STRATEGY 1: Scanning for petrol cards (%d selectors)", len(card_selectors))
-    LOG.info("[FuelPriceWatch] ─────────────────────────────────────────────────────────")
-    
-    for selector, desc in card_selectors:
-        try:
-            cards = soup.select(selector)
-            LOG.info("[FuelPriceWatch] Selector '%s' (%s): %d elements found", selector, desc, len(cards))
-            
-            for idx, card in enumerate(cards):
-                log_element(card, f"CANDIDATE[{idx}]")
-                text = card.get_text(" ", strip=True)
-                
-                # Log what we found in this card
-                LOG.debug("[FuelPriceWatch]   Card [%d] text preview: %s...", idx, text[:150])
-                
-                # Check for petrol indicator + price in valid range
-                if 'petrol' in text.lower() and '₦' in text:
-                    price_check = re.search(r'₦\s*(\d{3,4}(?:\.\d+)?)', text)
-                    if price_check:
-                        price_val = float(price_check.group(1))
-                        LOG.info("[FuelPriceWatch]   Card [%d] contains 'petrol' + price: ₦%.2f", idx, price_val)
-                        
-                        if 600 <= price_val <= 1500:
-                            petrol_card = card
-                            card_text = text
-                            LOG.info(
-                                "[FuelPriceWatch] ✓ MATCH on selector '%s' (card #%d): ₦%.2f",
-                                selector, idx, price_val
-                            )
-                            LOG.info("[FuelPriceWatch] Full card text: %s", card_text[:300])
-                            
-                            # Log all found elements in this card for debugging
-                            LOG.info("[FuelPriceWatch] Logging children of matched card:")
-                            for child_idx, child in enumerate(card.find_all(['div', 'p', 'span', 'h3', 'h2']), 1):
-                                child_text = child.get_text(" ", strip=True)[:80]
-                                child_classes = " ".join(child.get("class", []))
-                                LOG.info("[FuelPriceWatch]   Child [%d] <%s>: %s | Classes: %s", 
-                                        child_idx, child.name, child_text, child_classes)
-                                log_element(child, f"  CHILD[{child_idx}]")
-                            break
-                        else:
-                            LOG.debug("[FuelPriceWatch]   Card [%d] price out of range: ₦%.2f", idx, price_val)
-                    else:
-                        LOG.debug("[FuelPriceWatch]   Card [%d] has 'petrol' but no valid price", idx)
-                        
-            if petrol_card:
-                break
-                
-        except Exception as e:
-            LOG.warning("[FuelPriceWatch] Selector '%s' failed: %s", selector, e)
-            continue
-    
-    # ═══════════════════════════════════════════════════════════════════════
-    # STRATEGY 2: Fallback - regex extraction from full page
-    # ═══════════════════════════════════════════════════════════════════════
-    if not petrol_card:
-        LOG.warning("[FuelPriceWatch] No petrol card found via selectors, using page-wide regex")
-        LOG.info("[FuelPriceWatch] ═══════════════════════════════════════════════════════")
-        LOG.info("[FuelPriceWatch] STRATEGY 2: Regex fallback on full page text")
-        LOG.info("[FuelPriceWatch] ─────────────────────────────────────────────────────────")
-        
-        page_text = soup.get_text(" ", strip=True)
-        
-        # Log sample of page text for debugging
-        LOG.info("[FuelPriceWatch] Page text sample (first 500 chars):")
-        LOG.info("[FuelPriceWatch] %s...", page_text[:500])
-        
-        # Look for concatenated pattern: "Average Petrol Price₦XXX.XX+/-X.X%..."
-        patterns = [
-            # Pattern 1: Full concatenated string
-            r'Average\s+Petrol\s+Price\s*(₦\s*\d{3,4}(?:\.\d+)?)\s*([+\-]\d+\.?\d*)\s*%?\s*from\s+last\s+period\s*([+\-]\s*₦?\s*\d+\.?\d*)\s*today',
-            # Pattern 2: Just price and change near "petrol"
-            r'Petrol.*?Price\s*(₦\s*\d{3,4}(?:\.\d+)?)',
-            # Pattern 3: Any ₦XXX near "Average" and "Petrol"
-            r'Average.*?Petrol.*?(₦\s*\d{3,4}(?:\.\d+)?)',
-        ]
-        
-        for pattern_idx, pattern in enumerate(patterns, 1):
-            LOG.info("[FuelPriceWatch] Trying pattern [%d]: %s", pattern_idx, pattern[:60])
-            match = re.search(pattern, page_text, re.IGNORECASE | re.DOTALL)
-            if match:
-                card_text = match.group(0)
-                LOG.info("[FuelPriceWatch] ✓ Regex match found: %s", card_text[:100])
-                break
-            else:
-                LOG.debug("[FuelPriceWatch] Pattern [%d] no match", pattern_idx)
-    
-    if not card_text:
-        LOG.error("[FuelPriceWatch] ❌ Failed to locate petrol price data")
-        LOG.info("[FuelPriceWatch] Elements scanned: %d", len(found_elements))
-        LOG.info("[FuelPriceWatch] Selectors tried: %s", [s[0] for s in card_selectors])
-        
-        return {
-            "error": "no_petrol_data_found",
-            "elements_scanned": len(found_elements),
-            "selectors_tried": [s[0] for s in card_selectors],
-            "raw_sample": soup.get_text(" ", strip=True)[:300]
-        }
+    selectors_used = []
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # EXTRACTION: Parse concatenated or structured text
-    # ═══════════════════════════════════════════════════════════════════════
-    LOG.info("[FuelPriceWatch] ═══════════════════════════════════════════════════════")
-    LOG.info("[FuelPriceWatch] EXTRACTION: Parsing extracted text")
-    LOG.info("[FuelPriceWatch] ─────────────────────────────────────────────────────────")
-    LOG.info("[FuelPriceWatch] Raw card text: %s", card_text[:200])
-    
-    # Normalize: remove spaces between currency and numbers, handle concatenation
-    normalized = card_text
-    normalized = re.sub(r'₦\s+', '₦', normalized)  # Remove space after ₦
-    normalized = re.sub(r'(\d)([+\-])', r'\1 \2', normalized)  # Add space before +/-
-    normalized = re.sub(r'([+\-])(\d)', r'\1 \2', normalized)  # Add space after +/-
-    normalized = re.sub(r'([a-zA-Z])(₦)', r'\1 \2', normalized)  # Space before ₦ if attached to word
-    normalized = re.sub(r'(%)([+\-])', r'\1 \2', normalized)  # Space between % and +/-
-    normalized = re.sub(r'\s+', ' ', normalized)  # Collapse multiple spaces
-    
-    LOG.info("[FuelPriceWatch] Normalized: %s", normalized[:200])
-
-    # Extract price
-    price_raw = None
-    price_match = re.search(r'₦\s*(\d{3,4}(?:\.\d+)?)', normalized)
-    if price_match:
-        try:
-            price_raw = float(price_match.group(1))
-            LOG.info("[FuelPriceWatch] ✓ Price extracted: ₦%.2f", price_raw)
-        except ValueError as ve:
-            LOG.error("[FuelPriceWatch] ✗ Price parse error: %s", ve)
-    else:
-        LOG.error("[FuelPriceWatch] ✗ No price pattern found in normalized text")
-    
-    if not price_raw or not (600 <= price_raw <= 1500):
-        LOG.error("[FuelPriceWatch] ❌ Invalid price extracted: %s", price_raw)
-        return {
-            "error": "invalid_price",
-            "extracted_price": price_raw,
-            "normalized_text": normalized[:200],
-            "elements_found": [str(e) for e in found_elements[:5]]
-        }
-
-    # Extract percentage change
-    change_percent = "N/A"
-    percent_patterns = [
-        r'([+\-]\s*\d+\.?\d*)\s*%?\s*from\s+last\s+period',  # +0.5% from last period
-        r'from\s+last\s+period\s*([+\-]\s*\d+\.?\d*)',  # from last period +0.5
-        r'([+\-]\d+\.?\d*)\s*%',  # generic percent with sign
-    ]
-    
-    for pattern_idx, pattern in enumerate(percent_patterns, 1):
-        LOG.debug("[FuelPriceWatch] Trying percent pattern [%d]: %s", pattern_idx, pattern[:50])
-        match = re.search(pattern, normalized, re.IGNORECASE)
-        if match:
-            val = match.group(1).replace(' ', '')
-            change_percent = f"{val}%"
-            LOG.info("[FuelPriceWatch] ✓ Percent change extracted: %s", change_percent)
+    # 1) Try targeted card selectors
+    for sel, desc in card_selectors:
+        elems = soup.select(sel)
+        if elems:
+            selectors_used.append(sel)
+            petrol_card = elems[0]
+            card_text = petrol_card.get_text(" ", strip=True)
             break
-        else:
-            LOG.debug("[FuelPriceWatch] Percent pattern [%d] no match", pattern_idx)
-    
-    # Extract absolute change
-    change_absolute = "N/A"
+
+    # 2) Fallback: find any element that contains "Average Petrol" or "Average Petrol Price"
+    if petrol_card is None:
+        candidates = soup.find_all(lambda t: t.name in ("div","section","article") and
+                                   ("Average Petrol" in (t.get_text(" ", strip=True) or "") or
+                                    "Average Petrol Price" in (t.get_text(" ", strip=True) or "")))
+        if candidates:
+            petrol_card = candidates[0]
+            card_text = petrol_card.get_text(" ", strip=True)
+            selectors_used.append("fallback:contains(Average Petrol)")
+
+    # 3) Final fallback: gather top elements containing '₦' anywhere on the page
+    if petrol_card is None:
+        naira_elems = [e for e in soup.find_all() if '₦' in (e.get_text() or "")]
+        if naira_elems:
+            petrol_card = naira_elems[0]
+            card_text = petrol_card.get_text(" ", strip=True)
+            selectors_used.append("fallback:first_element_with_₦")
+
+    # Build a detailed list of top found elements (for diagnostics)
+    naira_elements = soup.find_all(lambda tag: '₦' in (tag.get_text() or ""))
+    for elem in naira_elements[:20]:
+        text = elem.get_text(" ", strip=True)[:300]
+        classes = " ".join(elem.get("class", []))
+        fe = FoundElement(
+            tag=elem.name,
+            classes=classes,
+            element_id=elem.get("id", "") or "",
+            text_preview=text,
+            price_found=None,
+            change_found=None
+        )
+        found_elements.append(fe)
+
+    # If we still don't have any text, use entire page text as last resort
+    if not card_text:
+        card_text = soup.get_text(" ", strip=True)
+
+    # Normalize whitespace
+    card_text_norm = re.sub(r'\s+', ' ', card_text).strip()
+
+    # --- Price extraction heuristics ---
+    price_raw = None
+    change_percent = None
+    change_absolute = None
+
+    # 1) Try to extract explicit Naira value near phrases like "Average Petrol Price" first
+    # Look for the nearest '₦' pattern in the card_text
+    naira_matches = re.findall(r'₦\s*[\d,]+(?:\.\d+)?', card_text_norm)
+    if naira_matches:
+        # choose first as main price candidate
+        pr = naira_matches[0]
+        price_val = _extract_naira_amount(pr)
+        if price_val:
+            price_raw = price_val
+
+    # 2) If not found, find any 2-4 digit with decimal occurrences that look like the examples (e.g. 873.88)
+    if price_raw is None:
+        # match numbers with optional decimal and optional currency text
+        generic_matches = re.findall(r'(?<!\d)(\d{2,4}\.\d{1,2})(?!\d)', card_text_norm)
+        if generic_matches:
+            try:
+                # These are likely K (Naira in hundreds) -> convert to float and try to make into full Naira
+                candidate = float(generic_matches[0])
+                # If candidate < 1000, it's probably expressed as "873.88" meaning ₦873.88
+                price_raw = candidate
+            except Exception:
+                price_raw = None
+
+    # 3) As a safety, if page-level averages appear e.g. "Average Petrol Price₦873.88" parse by phrase
+    if price_raw is None:
+        m = re.search(r'Average\s+Petrol\s+Price\s*₦\s*([\d,]+(?:\.\d+)?)', card_text_norm, re.I)
+        if m:
+            try:
+                price_raw = float(m.group(1).replace(",", ""))
+            except:
+                price_raw = None
+
+    # --- Percent change extraction ---
+    pct_match = re.search(r'([+\-]\s*\d+(?:\.\d+)?\s*%)', card_text_norm)
+    if pct_match:
+        raw_pct = pct_match.group(1)
+        try:
+            change_percent = float(re.sub(r'[^0-9\.\-+]', '', raw_pct))
+        except:
+            change_percent = None
+
+    # --- Absolute change extraction (e.g. "+₦5.00 today" or "+5.00 today") ---
     abs_patterns = [
-        r'([+\-]\s*₦?\s*\d+\.?\d*)\s*today',  # +₦5.00 today or +5.00 today
-        r'today\s*([+\-]\s*₦?\s*\d+\.?\d*)',  # today +₦5.00
-        r'period\s*([+\-]\s*₦?\s*\d+\.?\d*)\s*today',  # period +5 today
+        r'([+\-]\s*₦\s*[\d,]+(?:\.\d+)?)\s*today',
+        r'([+\-]\s*[\d,]+(?:\.\d+)?)\s*today',
+        r'today\s*([+\-]\s*₦?\s*[\d,]+(?:\.\d+)?)',
+        r'from last period\s*([+\-]\s*₦?\s*[\d,]+(?:\.\d+)?)',
     ]
-    
-    for pattern_idx, pattern in enumerate(abs_patterns, 1):
-        LOG.debug("[FuelPriceWatch] Trying absolute change pattern [%d]: %s", pattern_idx, pattern[:50])
-        match = re.search(pattern, normalized, re.IGNORECASE)
-        if match:
-            val = match.group(1).strip()
-            # Normalize to +₦X.XX format
-            val = re.sub(r'\s+', '', val)
-            has_plus = '+' in val
-            has_minus = '-' in val
-            sign = '-' if has_minus else '+'
-            
-            # Extract number
-            num_match = re.search(r'[\d,]+\.?\d*', val)
+    for pattern in abs_patterns:
+        m = re.search(pattern, card_text_norm, re.I)
+        if m:
+            val = m.group(1)
+            num_match = re.search(r'([+\-])\s*₦?\s*([\d,]+(?:\.\d+)?)', val)
             if num_match:
-                num = num_match.group(0).replace(',', '')
+                sign = num_match.group(1)
+                num = num_match.group(2).replace(",", "")
                 try:
-                    num_float = float(num)
-                    change_absolute = f"{sign}₦{num_float:,.2f}"
-                    LOG.info("[FuelPriceWatch] ✓ Absolute change extracted: %s", change_absolute)
+                    numf = float(num)
+                    change_absolute = f"{sign}₦{numf:,.2f}"
                     break
-                except ValueError:
-                    LOG.debug("[FuelPriceWatch] Absolute change pattern [%d] parse error", pattern_idx)
+                except:
                     continue
-        else:
-            LOG.debug("[FuelPriceWatch] Absolute change pattern [%d] no match", pattern_idx)
 
-    # Build detailed elements log
-    elements_summary = []
-    for i, elem in enumerate(found_elements[:10], 1):  # Top 10 elements
-        elements_summary.append(f"{i}. {elem}")
+    # Final normalization: price_raw to float in Naira (if it's suspiciously small but looks like decimals, keep as-is)
+    if price_raw is not None:
+        # if price_raw < 100 -> it might be expressed as "873.88" (valid) -> keep it
+        try:
+            price_raw = float(price_raw)
+        except:
+            price_raw = None
 
-    LOG.info("[FuelPriceWatch] ═══════════════════════════════════════════════════════")
-    LOG.info(
-        "[FuelPriceWatch] ✅ SUCCESS | Price: ₦%.2f | Change: %s | Today: %s | Elements: %d",
-        price_raw, change_percent, change_absolute, len(found_elements)
-    )
-    LOG.info("[FuelPriceWatch] ═══════════════════════════════════════════════════════")
+    # Summary elements details (top 10) for diagnostics
+    elements_summary = [str(e) for e in found_elements[:10]]
+
+    # Logging summary (keeps parity with your code's INFO logs)
+    LOG.info("[FuelPriceWatch] Parse summary | Price: %s | Percent: %s | Absolute: %s | Elements: %d",
+             f"₦{price_raw:,.2f}" if price_raw else "None",
+             f"{change_percent}%" if change_percent is not None else "None",
+             change_absolute or "None",
+             len(found_elements))
 
     return {
         "source": url,
-        "price_raw": price_raw,
-        "price_str": f"₦{price_raw:,.2f}",
+        "price_raw": price_raw or 0.0,
+        "price_str": f"₦{price_raw:,.2f}" if price_raw else None,
         "change_percent": change_percent,
         "change_absolute": change_absolute,
         "last_updated": "Live data",
-        "parsed_from": card_text[:200],
+        "parsed_from": card_text_norm[:400],
         "elements_found_count": len(found_elements),
         "elements_details": elements_summary,
-        "selectors_used": [s[0] for s in card_selectors],
+        "selectors_used": selectors_used or ["none"],
     }
 
 @retry(max_attempts=3, backoff=1.5)
