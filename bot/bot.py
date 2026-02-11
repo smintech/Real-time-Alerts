@@ -1418,16 +1418,15 @@ async def run_bot():
             application.job_queue.run_repeating(
                 callback=check_and_post_channel_deals,
                 interval=CHECK_INTERVAL_SECONDS,
-                #first=10,
+                first=10,
                 name="channel_deals"
             )
-            application.job_queue.run_repeating(
             #application.job_queue.run_daily(
-                callback=check_and_post_fuel_prices,
-                interval=CHECK_INTERVAL_SECONDS,
+                #callback=check_and_post_fuel_prices,
+                #interval=CHECK_INTERVAL_SECONDS,
                 #time=time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
-                name="check_fuel_prices",
-                first=20,
+                #name="check_fuel_prices",
+                #first=20,
             )
             #application.job_queue.run_repeating(
                 #callback=check_trials,
@@ -1442,7 +1441,6 @@ async def run_bot():
                 #time=time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
                 #name="school_updates_poster",
             # )
-            # Cleanup job
             application.job_queue.run_daily(
                 callback=lambda ctx: cleanup_all_expired(),
                 time=time(hour=3, minute=0, second=0, tzinfo=TIMEZONE),
