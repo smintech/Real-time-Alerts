@@ -1218,18 +1218,25 @@ shared_playwright = SharedPlaywrightManager()
 async def fetch_with_playwright_aggressive(
     url: str,
     retries: int = 3,
-    return_visible_text: bool = False
+    return_visible_text: bool = False,
+    wait_for_selector: Optional[str] = None,  # NEW PARAMETER
+    wait_timeout: int = 15000  # NEW PARAMETER
 ) -> Union[str, Tuple[str, str]]:
     """
     PRODUCTION FETCH FUNCTION - OPTIMIZED FOR KONGA
     1. Extracts product ID from URL for validation
     2. Focuses on main product container
     3. Handles Konga's dynamic content loading
+    
+    NEW: Added wait_for_selector support for dynamic pages
     """
     LOG.info("╔═══════════════════════════════════════════════════════════════════╗")
-    LOG.info("║ PRODUCTION FIXES                                            ║")
+    LOG.info("║ PRODUCTION FIXES (with wait_for_selector support)                ║")
     LOG.info("╚═══════════════════════════════════════════════════════════════════╝")
     LOG.info(f"🌐 {url[:80]}")
+    
+    if wait_for_selector:
+        LOG.info(f"⏳ Will wait for selector: {wait_for_selector}")
     
     # Extract product ID from URL for logging
     product_id = None
@@ -1305,9 +1312,21 @@ async def fetch_with_playwright_aggressive(
                     # NAVIGATE
                     try:
                         await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+                        LOG.info("  ✓ Navigation complete (domcontentloaded)")
                     except Exception as nav_error:
                         LOG.warning(f"Navigation timeout, trying load: {str(nav_error)[:60]}")
                         await page.goto(url, wait_until="load", timeout=20000)
+                        LOG.info("  ✓ Navigation complete (load)")
+                    
+                    # WAIT FOR SELECTOR (NEW FUNCTIONALITY)
+                    if wait_for_selector:
+                        LOG.info(f"  ⏳ Waiting for selector: {wait_for_selector}")
+                        try:
+                            await page.wait_for_selector(wait_for_selector, timeout=wait_timeout)
+                            LOG.info(f"  ✓ Selector found: {wait_for_selector}")
+                        except Exception as wait_error:
+                            LOG.warning(f"  ⚠️ Selector wait timeout ({wait_timeout}ms): {str(wait_error)[:60]}")
+                            LOG.warning(f"  Continuing without selector match...")
                     
                     # KONGA-SPECIFIC WAITING
                     if is_konga:
@@ -1377,6 +1396,7 @@ async def fetch_with_playwright_aggressive(
                     LOG.error(f"  ❌ All {retries} attempts exhausted")
     
     raise Exception(f"Failed to fetch {url} after {retries} attempts")
+
 # ═══════════════════════════════════════════════════════════════════════════
 # ULTIMATE FETCH
 # ═══════════════════════════════════════════════════════════════════════════
@@ -3197,7 +3217,9 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
     - No spaces between concatenated values
     """
     soup = BeautifulSoup(html, "lxml")
-    LOG.debug("[FuelPriceWatch] Starting parse with %d chars of HTML", len(html))
+    LOG.info("[FuelPriceWatch] ═══════════════════════════════════════════════════════")
+    LOG.info("[FuelPriceWatch] Starting parse with %d chars of HTML", len(html))
+    LOG.info("[FuelPriceWatch] ═══════════════════════════════════════════════════════")
     
     found_elements: List[FoundElement] = []
     
@@ -3217,7 +3239,7 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
         entry = FoundElement(
             tag=element.name,
             classes=classes,
-            element_id=elem_id,
+            elem_id=elem_id,
             text_preview=text[:150],
             price_found=price_match.group(0) if price_match else None,
             change_found=change_match.group(0) if change_match else None
@@ -3227,6 +3249,52 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
         LOG.debug("[FuelPriceWatch] %s %s", context, entry)
         return entry
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # PHASE 0: Log ALL elements in HTML for debugging
+    # ═══════════════════════════════════════════════════════════════════════
+    LOG.info("[FuelPriceWatch] PHASE 0: Scanning ALL elements in HTML")
+    LOG.info("[FuelPriceWatch] ─────────────────────────────────────────────────────────")
+    
+    # Log page title
+    page_title = soup.title.string if soup.title else "No title"
+    LOG.info("[FuelPriceWatch] Page title: %s", page_title)
+    
+    # Count all elements by tag
+    tag_counts = {}
+    for elem in soup.find_all(True):
+        tag = elem.name
+        tag_counts[tag] = tag_counts.get(tag, 0) + 1
+    
+    LOG.info("[FuelPriceWatch] Total unique tags: %d", len(tag_counts))
+    LOG.info("[FuelPriceWatch] Most common tags:")
+    for tag, count in sorted(tag_counts.items(), key=lambda x: -x[1])[:10]:
+        LOG.info("[FuelPriceWatch]   %s: %d", tag, count)
+    
+    # Log all divs with price-related classes
+    LOG.info("[FuelPriceWatch] Searching for price-related elements...")
+    price_indicators = ['price', 'Price', 'amount', 'petrol', 'Petrol']
+    
+    for indicator in price_indicators:
+        elements = soup.find_all(lambda tag: tag.name in ['div', 'span', 'p'] and 
+                                 indicator in ' '.join(tag.get('class', [])))
+        if elements:
+            LOG.info("[FuelPriceWatch] Found %d elements with '%s' in class", len(elements), indicator)
+            for idx, elem in enumerate(elements[:3], 1):  # First 3
+                text = elem.get_text(" ", strip=True)[:100]
+                classes = " ".join(elem.get("class", []))
+                LOG.info("[FuelPriceWatch]   [%d] %s | Classes: %s", idx, text, classes)
+    
+    # Log all elements containing ₦ symbol
+    LOG.info("[FuelPriceWatch] Searching for elements with ₦ symbol...")
+    naira_elements = soup.find_all(lambda tag: '₦' in tag.get_text())
+    LOG.info("[FuelPriceWatch] Found %d elements with ₦ symbol", len(naira_elements))
+    
+    for idx, elem in enumerate(naira_elements[:10], 1):  # First 10
+        text = elem.get_text(" ", strip=True)[:100]
+        classes = " ".join(elem.get("class", []))
+        LOG.info("[FuelPriceWatch]   [%d] <%s> %s | Classes: %s", 
+                idx, elem.name, text, classes if classes else "(no classes)")
+    
     # ═══════════════════════════════════════════════════════════════════════
     # STRATEGY 1: Find petrol card using updated class selectors
     # ═══════════════════════════════════════════════════════════════════════
@@ -3241,22 +3309,29 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
         ('div[class*="card"]', 'generic card class'),           # Generic
     ]
     
-    LOG.info("[FuelPriceWatch] Scanning for petrol cards using %d selectors...", len(card_selectors))
+    LOG.info("[FuelPriceWatch] ═══════════════════════════════════════════════════════")
+    LOG.info("[FuelPriceWatch] STRATEGY 1: Scanning for petrol cards (%d selectors)", len(card_selectors))
+    LOG.info("[FuelPriceWatch] ─────────────────────────────────────────────────────────")
     
     for selector, desc in card_selectors:
         try:
             cards = soup.select(selector)
-            LOG.debug("[FuelPriceWatch] Selector '%s' (%s): %d elements found", selector, desc, len(cards))
+            LOG.info("[FuelPriceWatch] Selector '%s' (%s): %d elements found", selector, desc, len(cards))
             
             for idx, card in enumerate(cards):
                 log_element(card, f"CANDIDATE[{idx}]")
                 text = card.get_text(" ", strip=True)
+                
+                # Log what we found in this card
+                LOG.debug("[FuelPriceWatch]   Card [%d] text preview: %s...", idx, text[:150])
                 
                 # Check for petrol indicator + price in valid range
                 if 'petrol' in text.lower() and '₦' in text:
                     price_check = re.search(r'₦\s*(\d{3,4}(?:\.\d+)?)', text)
                     if price_check:
                         price_val = float(price_check.group(1))
+                        LOG.info("[FuelPriceWatch]   Card [%d] contains 'petrol' + price: ₦%.2f", idx, price_val)
+                        
                         if 600 <= price_val <= 1500:
                             petrol_card = card
                             card_text = text
@@ -3264,10 +3339,21 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
                                 "[FuelPriceWatch] ✓ MATCH on selector '%s' (card #%d): ₦%.2f",
                                 selector, idx, price_val
                             )
+                            LOG.info("[FuelPriceWatch] Full card text: %s", card_text[:300])
+                            
                             # Log all found elements in this card for debugging
-                            for child in card.find_all(['div', 'p', 'span', 'h3']):
-                                log_element(child, "  CHILD")
+                            LOG.info("[FuelPriceWatch] Logging children of matched card:")
+                            for child_idx, child in enumerate(card.find_all(['div', 'p', 'span', 'h3', 'h2']), 1):
+                                child_text = child.get_text(" ", strip=True)[:80]
+                                child_classes = " ".join(child.get("class", []))
+                                LOG.info("[FuelPriceWatch]   Child [%d] <%s>: %s | Classes: %s", 
+                                        child_idx, child.name, child_text, child_classes)
+                                log_element(child, f"  CHILD[{child_idx}]")
                             break
+                        else:
+                            LOG.debug("[FuelPriceWatch]   Card [%d] price out of range: ₦%.2f", idx, price_val)
+                    else:
+                        LOG.debug("[FuelPriceWatch]   Card [%d] has 'petrol' but no valid price", idx)
                         
             if petrol_card:
                 break
@@ -3281,10 +3367,17 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
     # ═══════════════════════════════════════════════════════════════════════
     if not petrol_card:
         LOG.warning("[FuelPriceWatch] No petrol card found via selectors, using page-wide regex")
+        LOG.info("[FuelPriceWatch] ═══════════════════════════════════════════════════════")
+        LOG.info("[FuelPriceWatch] STRATEGY 2: Regex fallback on full page text")
+        LOG.info("[FuelPriceWatch] ─────────────────────────────────────────────────────────")
+        
         page_text = soup.get_text(" ", strip=True)
         
+        # Log sample of page text for debugging
+        LOG.info("[FuelPriceWatch] Page text sample (first 500 chars):")
+        LOG.info("[FuelPriceWatch] %s...", page_text[:500])
+        
         # Look for concatenated pattern: "Average Petrol Price₦XXX.XX+/-X.X%..."
-        # Handle no spaces between elements
         patterns = [
             # Pattern 1: Full concatenated string
             r'Average\s+Petrol\s+Price\s*(₦\s*\d{3,4}(?:\.\d+)?)\s*([+\-]\d+\.?\d*)\s*%?\s*from\s+last\s+period\s*([+\-]\s*₦?\s*\d+\.?\d*)\s*today',
@@ -3294,15 +3387,21 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
             r'Average.*?Petrol.*?(₦\s*\d{3,4}(?:\.\d+)?)',
         ]
         
-        for pattern in patterns:
+        for pattern_idx, pattern in enumerate(patterns, 1):
+            LOG.info("[FuelPriceWatch] Trying pattern [%d]: %s", pattern_idx, pattern[:60])
             match = re.search(pattern, page_text, re.IGNORECASE | re.DOTALL)
             if match:
                 card_text = match.group(0)
-                LOG.info("[FuelPriceWatch] ✓ Regex match: %s", card_text[:100])
+                LOG.info("[FuelPriceWatch] ✓ Regex match found: %s", card_text[:100])
                 break
+            else:
+                LOG.debug("[FuelPriceWatch] Pattern [%d] no match", pattern_idx)
     
     if not card_text:
         LOG.error("[FuelPriceWatch] ❌ Failed to locate petrol price data")
+        LOG.info("[FuelPriceWatch] Elements scanned: %d", len(found_elements))
+        LOG.info("[FuelPriceWatch] Selectors tried: %s", [s[0] for s in card_selectors])
+        
         return {
             "error": "no_petrol_data_found",
             "elements_scanned": len(found_elements),
@@ -3313,10 +3412,12 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
     # ═══════════════════════════════════════════════════════════════════════
     # EXTRACTION: Parse concatenated or structured text
     # ═══════════════════════════════════════════════════════════════════════
-    LOG.debug("[FuelPriceWatch] Parsing extracted text: %s", card_text[:200])
+    LOG.info("[FuelPriceWatch] ═══════════════════════════════════════════════════════")
+    LOG.info("[FuelPriceWatch] EXTRACTION: Parsing extracted text")
+    LOG.info("[FuelPriceWatch] ─────────────────────────────────────────────────────────")
+    LOG.info("[FuelPriceWatch] Raw card text: %s", card_text[:200])
     
     # Normalize: remove spaces between currency and numbers, handle concatenation
-    # "₦ 873.88" -> "₦873.88", "₦873.88+0.5%" -> " ₦873.88 +0.5% "
     normalized = card_text
     normalized = re.sub(r'₦\s+', '₦', normalized)  # Remove space after ₦
     normalized = re.sub(r'(\d)([+\-])', r'\1 \2', normalized)  # Add space before +/-
@@ -3325,7 +3426,7 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
     normalized = re.sub(r'(%)([+\-])', r'\1 \2', normalized)  # Space between % and +/-
     normalized = re.sub(r'\s+', ' ', normalized)  # Collapse multiple spaces
     
-    LOG.debug("[FuelPriceWatch] Normalized: %s", normalized[:200])
+    LOG.info("[FuelPriceWatch] Normalized: %s", normalized[:200])
 
     # Extract price
     price_raw = None
@@ -3333,9 +3434,11 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
     if price_match:
         try:
             price_raw = float(price_match.group(1))
-            LOG.debug("[FuelPriceWatch] ✓ Price: ₦%.2f", price_raw)
-        except ValueError:
-            pass
+            LOG.info("[FuelPriceWatch] ✓ Price extracted: ₦%.2f", price_raw)
+        except ValueError as ve:
+            LOG.error("[FuelPriceWatch] ✗ Price parse error: %s", ve)
+    else:
+        LOG.error("[FuelPriceWatch] ✗ No price pattern found in normalized text")
     
     if not price_raw or not (600 <= price_raw <= 1500):
         LOG.error("[FuelPriceWatch] ❌ Invalid price extracted: %s", price_raw)
@@ -3354,13 +3457,16 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
         r'([+\-]\d+\.?\d*)\s*%',  # generic percent with sign
     ]
     
-    for pattern in percent_patterns:
+    for pattern_idx, pattern in enumerate(percent_patterns, 1):
+        LOG.debug("[FuelPriceWatch] Trying percent pattern [%d]: %s", pattern_idx, pattern[:50])
         match = re.search(pattern, normalized, re.IGNORECASE)
         if match:
             val = match.group(1).replace(' ', '')
             change_percent = f"{val}%"
-            LOG.debug("[FuelPriceWatch] ✓ Percent change: %s", change_percent)
+            LOG.info("[FuelPriceWatch] ✓ Percent change extracted: %s", change_percent)
             break
+        else:
+            LOG.debug("[FuelPriceWatch] Percent pattern [%d] no match", pattern_idx)
     
     # Extract absolute change
     change_absolute = "N/A"
@@ -3370,7 +3476,8 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
         r'period\s*([+\-]\s*₦?\s*\d+\.?\d*)\s*today',  # period +5 today
     ]
     
-    for pattern in abs_patterns:
+    for pattern_idx, pattern in enumerate(abs_patterns, 1):
+        LOG.debug("[FuelPriceWatch] Trying absolute change pattern [%d]: %s", pattern_idx, pattern[:50])
         match = re.search(pattern, normalized, re.IGNORECASE)
         if match:
             val = match.group(1).strip()
@@ -3387,20 +3494,25 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
                 try:
                     num_float = float(num)
                     change_absolute = f"{sign}₦{num_float:,.2f}"
-                    LOG.debug("[FuelPriceWatch] ✓ Absolute change: %s", change_absolute)
+                    LOG.info("[FuelPriceWatch] ✓ Absolute change extracted: %s", change_absolute)
                     break
                 except ValueError:
+                    LOG.debug("[FuelPriceWatch] Absolute change pattern [%d] parse error", pattern_idx)
                     continue
+        else:
+            LOG.debug("[FuelPriceWatch] Absolute change pattern [%d] no match", pattern_idx)
 
     # Build detailed elements log
     elements_summary = []
     for i, elem in enumerate(found_elements[:10], 1):  # Top 10 elements
         elements_summary.append(f"{i}. {elem}")
 
+    LOG.info("[FuelPriceWatch] ═══════════════════════════════════════════════════════")
     LOG.info(
-        "[FuelPriceWatch] ✅ SUCCESS | Price: ₦%.2f | Change: %s | Today: %s | Elements logged: %d",
+        "[FuelPriceWatch] ✅ SUCCESS | Price: ₦%.2f | Change: %s | Today: %s | Elements: %d",
         price_raw, change_percent, change_absolute, len(found_elements)
     )
+    LOG.info("[FuelPriceWatch] ═══════════════════════════════════════════════════════")
 
     return {
         "source": url,
@@ -3448,9 +3560,10 @@ async def scrape_fuel_prices() -> Dict[str, Any]:
         html = await fetch_with_playwright_aggressive(
             app_url,
             retries=3,
-            return_visible_text=False
+            return_visible_text=False,
+            wait_for_selector='div.gumroad-card, div.rounded-lg.border.bg-card',  # Wait for cards
+            wait_timeout=15000  # 15 seconds
         )
-        
         LOG.info(f"[FuelPrices] ✓ Playwright fetch success: {len(html)} bytes")
         
         result = _parse_fuelpricewatch(html, url=app_url)
@@ -3475,37 +3588,6 @@ async def scrape_fuel_prices() -> Dict[str, Any]:
         import traceback
         LOG.debug(f"[FuelPrices] Method 1 traceback:\n{traceback.format_exc()}")
     
-    # Fallback Method 2: Static index page
-    index_url = "https://www.fuelpricewatch.com/fuel-price-index-nigeria"
-    
-    try:
-        LOG.info("[FuelPrices] Method 2: Fetching static index page...")
-        
-        index_html = await _fetch_html(index_url)
-        LOG.info(f"[FuelPrices] ✓ Index fetch success: {len(index_html)} bytes")
-        
-        index_result = _parse_fuelpricewatch(index_html, url=app_url)
-        
-        if index_result.get("price_raw") is not None:
-            LOG.info("[FuelPrices] ✅ Method 2 SUCCESS - Index data extracted")
-            return {
-                "avg_petrol": index_result["price_str"],
-                "avg_raw": index_result["price_raw"],
-                "change_percent": index_result.get("change_percent", "N/A"),
-                "change_absolute": index_result.get("change_absolute", "N/A"),
-                "last_updated": "Index snapshot (may be outdated)",
-                "sources": [index_result],
-                "debug": {"method": "static_index_fallback", "url": index_url}
-            }
-        else:
-            LOG.warning(f"[FuelPrices] ⚠️ Method 2 parsing failed: {index_result.get('error')}")
-            
-    except Exception as e:
-        LOG.warning(f"[FuelPrices] ⚠️ Method 2 failed: {type(e).__name__}: {str(e)[:100]}")
-        import traceback
-        LOG.debug(f"[FuelPrices] Method 2 traceback:\n{traceback.format_exc()}")
-    
-    # All methods failed
     LOG.error("[FuelPrices] ❌ ALL METHODS FAILED - No fuel price data available")
     
     return {
