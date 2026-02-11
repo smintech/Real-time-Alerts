@@ -3066,108 +3066,326 @@ class FoundElement:
 
 def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/") -> Dict[str, Any]:
     """
-    Hybrid parser: Combines DOM targeting, Script inspection, and Global Regex.
+    Parse Fuel Price Watch with more robust naira detection, global searching (including <script> tags
+    and raw HTML), and comprehensive logging of matched-card contents.
     """
     start_time = time.time()
-    soup = BeautifulSoup(html, "html.parser")
-    
-    # Extraction State
-    price_raw = 0.0
+    parse_session_id = f"parse_{int(start_time)}"
+
+    LOG.info(f"\n{'='*80}")
+    LOG.info(f"🔷 FUEL PRICE PARSE SESSION: {parse_session_id}")
+    LOG.info(f"{'='*80}\n")
+
+    # Normalize input and report
+    LOG.info("📋 STEP 0: HTML Input Validation")
+    is_bytes = isinstance(html, (bytes, bytearray))
+    if is_bytes:
+        try:
+            html_text = html.decode("utf-8", errors="replace")
+        except Exception:
+            html_text = html.decode("latin-1", errors="replace")
+    else:
+        html_text = str(html)
+
+    LOG.info(f"  ├─ HTML size: {len(html_text):,} characters")
+    LOG.info(f"  ├─ Raw type: {'bytes' if is_bytes else 'str'}")
+    LOG.info(f"  ├─ Contains literal '₦': {'✓ YES' if '₦' in html_text else '✗ NO'}")
+    LOG.info(f"  ├─ Contains HTML entity '&#8358;': {'✓ YES' if '&#8358;' in html_text else '✗ NO'}")
+    LOG.debug(f"  └─ HTML preview: {html_text[:500]}...\n")
+
+    # Pre-normalize HTML entities for naira to use a single symbol in searches
+    html_text_normalized = html_text.replace("&#8358;", "₦").replace("&num;", "#")  # keep simple substitution
+    # Also normalize common textual forms
+    # We'll treat "NGN", "Naira", "N" (careful with single N) as fallbacks in regexes below
+
+    soup = BeautifulSoup(html_text_normalized, "html.parser")
+    found_elements: List[FoundElement] = []
+
+    price_raw = None
     change_percent = None
     change_absolute = None
-    success = False
-    extraction_log = []
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # STRATEGY 1: Targeted Card DOM Extraction
-    # ═══════════════════════════════════════════════════════════════════════
-    # We look for the gumroad-card container first.
     petrol_card = None
-    for card in soup.find_all("div", class_="gumroad-card"):
-        if "Petrol" in card.get_text():
+    extraction_log = []  # Track what worked/failed
+    matched_card_contents = []
+
+    # ---------------------------------------------------------
+    # STEP 1: Card discovery (improved logging of full card contents)
+    # ---------------------------------------------------------
+    LOG.info("🔍 STEP 1: Finding Petrol Price Card (robust search)")
+    LOG.info("  ├─ Strategy 1A: Searching for gumroad-card elements...")
+    cards = soup.find_all("div", class_="gumroad-card")
+    LOG.info(f"  │  └─ Found {len(cards)} gumroad-card elements")
+
+    # gather candidate cards that include 'Petrol' or naira symbol
+    candidates = []
+    for idx, card in enumerate(cards):
+        card_text = card.get_text(" ", strip=True)
+        card_html = str(card)
+        LOG.debug(f"  │  Card #{idx+1} text preview: {card_text[:120]}...")
+        # consider match if contains petrol/fuel keywords OR contains naira symbol/entity
+        if any(k in card_text for k in ("Petrol", "Fuel", "Diesel", "Kerosene")) or "₦" in card_html:
+            candidates.append((idx, card, card_text, card_html))
+
+    # Also search for any elements with class names that look like price cards (commonly used)
+    fallback_card_selectors = ["card", "price-card", "price", "stat", "grid", "rounded-lg", "bg-card"]
+    for sel in fallback_card_selectors:
+        found = soup.find_all(True, class_=re.compile(sel))
+        for el in found:
+            txt = el.get_text(" ", strip=True)
+            if any(k in txt for k in ("Petrol", "Average Petrol", "Average Petrol Price", "Average Petrol Price")) or "₦" in txt:
+                candidates.append(("fallback", el, txt, str(el)))
+
+    # Deduplicate by element text
+    seen_texts = set()
+    filtered_candidates = []
+    for item in candidates:
+        txt = item[2]
+        if txt not in seen_texts:
+            seen_texts.add(txt)
+            filtered_candidates.append(item)
+    LOG.info(f"  ├─ Candidate cards after heuristic filtering: {len(filtered_candidates)}")
+
+    # prefer candidates that contain both 'Petrol' and a price/₦
+    for idx, card, card_text, card_html in filtered_candidates:
+        if "Petrol" in card_text and ("₦" in card_text or re.search(r'\d{3,4}\.\d{2}', card_text)):
             petrol_card = card
-            extraction_log.append("✓ Located Petrol Card via DOM")
+            LOG.info("  │  ✓ Selected a candidate card containing 'Petrol' and price-like text")
+            # Log full card contents (very useful for debugging) - limit for console but keep in extraction_log full
+            log_preview = card_html if len(card_html) <= 10000 else card_html[:10000] + "\n...<truncated>..."
+            LOG.debug(f"  │    └─ Full card HTML (preview/truncated):\n{log_preview}\n")
+            matched_card_contents.append(card_html)
+            extraction_log.append("✓ Found petrol card via candidate heuristics (full card HTML logged)")
             break
 
+    # If still not found, try global search for any element that mentions "Average Petrol"
+    if not petrol_card:
+        LOG.info("  ├─ Strategy 1B: Searching for 'Average Petrol' text anywhere in the page...")
+        avg_nodes = soup.find_all(string=re.compile(r'Average\s+Petrol', re.I))
+        if avg_nodes:
+            # pick the containing element
+            petrol_card = avg_nodes[0].find_parent() or avg_nodes[0]
+            LOG.info("  │  ✓ Found node containing 'Average Petrol' - logging full parent HTML")
+            card_html = str(petrol_card)
+            LOG.debug(f"  │    └─ Full card HTML (preview/truncated):\n{card_html[:10000]}...\n")
+            matched_card_contents.append(card_html)
+            extraction_log.append("✓ Found petrol card via 'Average Petrol' global search")
+
+    if not petrol_card:
+        LOG.info("  └─ ✗ No card-like element reliably identified (will attempt script/global fallback)\n")
+    else:
+        LOG.info("")
+
+    # ---------------------------------------------------------
+    # STEP 2: Price extraction from chosen card (if any)
+    # ---------------------------------------------------------
+    def parse_number_str(num_str: str) -> float:
+        """Normalize and parse number strings like '1,234.56' or '873.88'"""
+        try:
+            return float(num_str.replace(",", "").strip())
+        except Exception:
+            # last resort: extract digits and decimal point
+            m = re.search(r'(\d+(?:\.\d+)?)', num_str.replace(",", ""))
+            return float(m.group(1)) if m else None
+
+    def find_price_in_text(text: str):
+        """
+        Look for prices using multiple robust patterns (naira symbol, entity, NGN, Naira).
+        Returns tuple (price_float, matched_text, pattern_description)
+        """
+        # prioritize literal naira symbol
+        patterns = [
+            (r'₦\s*([\d,]+(?:\.\d+)?)', "₦ with digits"),
+            (r'&#8358;\s*([\d,]+(?:\.\d+)?)', "HTML entity &#8358;"),
+            (r'\bNGN[:\s]*([\d,]+(?:\.\d+)?)\b', "NGN textual"),
+            (r'\bNaira[:\s]*([\d,]+(?:\.\d+)?)\b', "Naira textual"),
+            # as a last resort, numbers next to 'Average Petrol Price' keywords
+            (r'Average\s+Petrol\s+Price[:\s]*₦?\s*([\d,]+(?:\.\d+)?)', "Average Petrol Price context"),
+            (r'\b(\d{3,4}(?:,\d{3})*(?:\.\d+)?)\b(?=\s*(?:today|from last|from previous|from last period|from last))', "number followed by context words"),
+        ]
+
+        for pat, desc in patterns:
+            LOG.debug(f"    ├─ Trying pattern: {desc} -> {pat}")
+            m = re.search(pat, text, flags=re.IGNORECASE)
+            if m:
+                num = m.group(1)
+                try:
+                    val = parse_number_str(num)
+                    LOG.info(f"    └─ ✓ Found price via {desc}: {val}")
+                    return val, m.group(0), desc
+                except Exception as e:
+                    LOG.debug(f"    │  ✗ parse error for '{num}': {e}")
+                    continue
+        return None, None, None
+
     if petrol_card:
-        card_text = petrol_card.get_text(" ", strip=True)
-        # Regex looks for ₦ symbol (or 'N') + a decimal number
-        price_match = re.search(r'(?:₦|N)?\s*(\d{2,4}(?:,\d{3})*\.\d{2})', card_text)
-        if price_match:
+        LOG.info("💰 STEP 2: Extracting Price Data from Card (detailed)")
+        full_text = petrol_card.get_text(" ", strip=True)
+        card_html_str = str(petrol_card)
+        LOG.info(f"  Card text length: {len(full_text)} characters")
+        LOG.info(f"  Card HTML length: {len(card_html_str)} bytes")
+        LOG.info(f"  Card text preview: {full_text[:200]}...\n")
+
+        # log full card HTML into extraction_log (avoid flooding console but keep entry)
+        extraction_log.append("CARD_HTML:" + (card_html_str if len(card_html_str) < 20000 else card_html_str[:20000] + "...<truncated>"))
+
+        # attempt price extraction from the card's text
+        price_val, matched_text, pattern_desc = find_price_in_text(full_text)
+        if price_val is not None:
+            price_raw = price_val
+            extraction_log.append(f"✓ Price extracted from card: ₦{price_raw:.2f} (via {pattern_desc} / matched '{matched_text}')")
+        else:
+            LOG.warning("    └─ ✗ No price found inside selected card; will try card HTML and global fallbacks")
+            extraction_log.append("✗ Price not found in selected card text")
+
+        # Percent change and absolute change extraction (prefer card text)
+        pct_match = re.search(r'([+\-]\s*\d+(?:\.\d+)?)\s*%', full_text)
+        if pct_match:
             try:
-                price_raw = float(price_match.group(1).replace(",", ""))
-                success = True
-                extraction_log.append(f"✓ Price found in Card: {price_raw}")
-            except (ValueError, IndexError):
-                pass
+                change_percent = float(pct_match.group(1).replace(" ", ""))
+                LOG.info(f"    └─ ✓ Percent found in card: {change_percent}%")
+                extraction_log.append(f"✓ Percent change (card): {change_percent}%")
+            except Exception as e:
+                LOG.debug(f"    │  ✗ Percent parse error: {e}")
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # STRATEGY 2: Script Tag Deep-Dive (JSON Blobs)
-    # ═══════════════════════════════════════════════════════════════════════
-    # If Strategy 1 failed (hydration issue), search for data in <script> tags.
-    if not success:
-        LOG.info("DOM Card empty; searching script tags...")
-        # Common in Next.js/React apps (__NEXT_DATA__ or similar)
-        scripts = soup.find_all("script")
-        for script in scripts:
-            script_content = script.string if script.string else ""
-            if "Average Petrol Price" in script_content or "873" in script_content:
-                # Look for numbers near "Petrol" inside the code string
-                # This pattern targets: "Petrol","price":873.88 or similar
-                script_match = re.search(r'Petrol.*?(\d{3,4}\.\d{2})', script_content, re.S)
-                if script_match:
-                    price_raw = float(script_match.group(1))
-                    success = True
-                    extraction_log.append(f"✓ Price found in Script tag: {price_raw}")
-                    break
+        abs_match = re.search(r'([+\-]\s*₦\s*[\d,]+(?:\.\d+)?)|₦\s*([+\-]\s*[\d,]+(?:\.\d+)?)|([+\-]\s*[\d,]+(?:\.\d+)?)\s*today', full_text)
+        if abs_match:
+            # normalize from available groups
+            candidate = next((g for g in abs_match.groups() if g), None)
+            if candidate:
+                change_absolute = candidate.replace(" ", "")
+                LOG.info(f"    └─ ✓ Absolute change found in card: {change_absolute}")
+                extraction_log.append(f"✓ Absolute change (card): {change_absolute}")
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # STRATEGY 3: Global Regex Scan (Hail Mary)
-    # ═══════════════════════════════════════════════════════════════════════
-    # If we still have nothing, scan the entire raw HTML string.
-    if not success:
-        LOG.warning("Script tags yielded nothing; attempting Global Regex.")
-        # We look for the FIRST currency-formatted number in the whole doc
-        # Usually, the main summary price appears first in the HTML.
-        global_matches = re.findall(r'[₦N]\s*(\d{2,4}(?:,\d{3})*\.\d{2})', html)
-        if global_matches:
-            try:
-                price_raw = float(global_matches[0].replace(",", ""))
-                success = True
-                extraction_log.append(f"✓ Price found via Global Scan: {price_raw}")
-            except Exception:
-                pass
+    # ---------------------------------------------------------
+    # STEP 3: Page-level & script fallback if we still don't have price
+    # ---------------------------------------------------------
+    if price_raw is None:
+        LOG.warning("⚠️  STEP 3: Card extraction failed or incomplete; attempting page-level and <script> search")
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # CHANGE EXTRACTION (Global context is usually safer for these)
-    # ═══════════════════════════════════════════════════════════════════════
-    # 1. Percent Change (+0.5%)
-    pct_match = re.search(r'([+\-]\s*\d+(?:\.\d+)?)\s*%', html)
-    if pct_match:
-        change_percent = float(pct_match.group(1).replace(" ", ""))
-        extraction_log.append(f"✓ Percent change: {change_percent}%")
+        # 1) search whole page text
+        page_text = soup.get_text(" ", strip=True)
+        LOG.info(f"  Page text length: {len(page_text):,} characters")
+        LOG.debug(f"  Page text preview: {page_text[:500]}...\n")
 
-    # 2. Absolute Change (+₦5.00 today)
-    # This looks for the sign + currency + digits + 'today' anchor
-    abs_match = re.search(r'([+\-]?\s*[₦N]\s*[+\-]?\s*\d+\.\d{2})\s*today', html, re.I)
-    if abs_match:
-        change_absolute = abs_match.group(1).replace(" ", "")
-        extraction_log.append(f"✓ Absolute change: {change_absolute}")
+        price_val, matched_text, pattern_desc = find_price_in_text(page_text)
+        if price_val is not None:
+            price_raw = price_val
+            extraction_log.append(f"✓ Price extracted from page text: ₦{price_raw:.2f} (via {pattern_desc})")
+            LOG.info(f"  ✓ Page-level price found: ₦{price_raw:.2f}")
+        else:
+            LOG.info("  ├─ ✗ No price in page text. Searching <script> tags and raw HTML...")
 
+            # 2) search script tags (many SPAs embed JSON/data there)
+            script_search_hits = []
+            for i, script in enumerate(soup.find_all("script")):
+                # script.string may be None if script has children; use get_text()
+                s_text = script.string if script.string is not None else script.get_text(" ", strip=True)
+                if not s_text:
+                    continue
+                # quick check for naira or NGN
+                if "₦" in s_text or "&#8358;" in s_text or "NGN" in s_text or "Naira" in s_text:
+                    LOG.debug(f"    ├─ Script #{i+1} contains naira-like tokens; scanning for prices")
+                    price_val, matched_text, pattern_desc = find_price_in_text(s_text)
+                    # log script content (truncated) for debugging
+                    script_preview = s_text if len(s_text) <= 8000 else s_text[:8000] + "...<truncated>..."
+                    extraction_log.append("SCRIPT_HTML_PREVIEW:" + script_preview)
+                    if price_val is not None:
+                        script_search_hits.append((i, price_val, matched_text, pattern_desc, script_preview))
+                        LOG.info(f"    └─ ✓ Found price in script #{i+1}: {price_val} (via {pattern_desc})")
+                        break
+
+            if script_search_hits and price_raw is None:
+                price_raw = script_search_hits[0][1]
+                extraction_log.append(f"✓ Price extracted from script: ₦{price_raw:.2f} (script #{script_search_hits[0][0]})")
+
+            # 3) final fallback: raw HTML search (fallback to entity & plain number heuristics)
+            if price_raw is None:
+                LOG.info("  ├─ Final fallback: scanning raw HTML for '₦' / '&#8358;' / NGN / Naira patterns")
+                price_val, matched_text, pattern_desc = find_price_in_text(html_text_normalized)
+                if price_val is not None:
+                    price_raw = price_val
+                    extraction_log.append(f"✓ Price extracted from raw HTML: ₦{price_raw:.2f} (via {pattern_desc})")
+                    LOG.info(f"  ✓ Raw HTML price found: ₦{price_raw:.2f}")
+                else:
+                    LOG.warning("  └─ ✗ All global fallbacks failed to find a price\n")
+                    extraction_log.append("✗ Global fallbacks failed")
+
+    # ---------------------------------------------------------
+    # STEP 4: Diagnostic collection - scan page for price-like elements
+    # ---------------------------------------------------------
+    LOG.info("🔬 STEP 4: Collecting Diagnostic Information")
+    LOG.info("  Scanning all elements for ₦ character or price indicators...")
+    element_count = 0
+    price_element_count = 0
+
+    for elem in soup.find_all(['div', 'span', 'p', 'h1', 'h2', 'h3', 'li', 'td']):
+        element_count += 1
+        text = elem.get_text(" ", strip=True)
+        has_naira = '₦' in text or '&#8358;' in str(elem)
+        has_price_pattern = bool(re.search(r'\d{3,4}(?:,\d{3})*(?:\.\d{2})', text))
+        has_fuel_type = any(f in text for f in ['Petrol', 'Diesel', 'Kerosene', 'Fuel', 'Average Petrol'])
+        should_collect = (has_naira or (has_price_pattern and has_fuel_type)) and len(text) < 1000
+
+        if should_collect:
+            price_element_count += 1
+            price_match = re.search(r'(₦\s*[\d,.]+|&#8358;\s*[\d,.]+|NGN[:\s]*[\d,.]+|Naira[:\s]*[\d,.]+)', text, flags=re.I)
+            found_elements.append(FoundElement(
+                tag=elem.name,
+                classes=" ".join(elem.get("class", [])) if elem.get("class") else "",
+                element_id=elem.get("id", ""),
+                text_preview=text[:200],
+                price_found=price_match.group(0) if price_match else None
+            ))
+
+    LOG.info(f"  ├─ Total elements scanned: {element_count:,}")
+    LOG.info(f"  ├─ Price elements found: {price_element_count}")
+    LOG.info(f"  └─ Elements with ₦: {sum(1 for e in found_elements if e.price_found)}\n")
+
+    if found_elements:
+        LOG.info("  📍 Found Elements (first 10):")
+        for idx, elem in enumerate(found_elements[:10], 1):
+            LOG.info(f"    {idx}. {elem}")
+        if len(found_elements) > 10:
+            LOG.info(f"    ... and {len(found_elements) - 10} more")
+        LOG.info()
+    else:
+        LOG.warning("  ⚠️  No elements with ₦ found!\n")
+
+    # ---------------------------------------------------------
+    # STEP 5: Final summary & sanitize return values
+    # ---------------------------------------------------------
     elapsed = time.time() - start_time
-    
+    success = price_raw is not None
+
+    LOG.info("📊 FINAL SUMMARY")
+    LOG.info(f"{'='*80}")
+    LOG.info(f"  Extraction Success: {'✓ YES' if success else '✗ NO'}")
+    LOG.info(f"  Price: {f'₦{price_raw:,.2f}' if price_raw else 'NOT FOUND'}")
+    LOG.info(f"  Percent Change: {f'{change_percent}%' if change_percent is not None else 'NOT FOUND'}")
+    LOG.info(f"  Absolute Change: {change_absolute or 'NOT FOUND'}")
+    LOG.info(f"  Execution Time: {elapsed:.2f}s")
+    LOG.info(f"{'='*80}\n")
+
+    LOG.info("📋 EXTRACTION LOG:")
+    for idx, entry in enumerate(extraction_log, 1):
+        # keep logs compact in console
+        LOG.info(f"  {idx}. {entry if len(entry) < 400 else entry[:400] + '...'}")
+    LOG.info()
+
     return {
         "source": url,
-        "price_raw": price_raw,
-        "price_str": f"₦{price_raw:,.2f}" if success else None,
+        "price_raw": float(price_raw) if price_raw is not None else 0.0,
+        "price_str": f"₦{price_raw:,.2f}" if price_raw is not None else None,
         "change_percent": change_percent,
         "change_absolute": change_absolute,
+        "last_updated": "Live data",
         "success": success,
-        "extraction_log": extraction_log,
+        "diagnostic_elements": [str(e) for e in found_elements[:10]],
+        "matched_card_contents": matched_card_contents,   # full card HTMLs we've logged (could be large)
+        "parser_version": "2026.02.11-comprehensive-logging-v2",
         "execution_time_seconds": elapsed,
-        "parser_version": "2026.02.11-hybrid-strategy"
+        "extraction_log": extraction_log,
     }
-
 
 async def scrape_fuel_prices() -> Dict[str, Any]:
     """
