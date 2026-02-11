@@ -3064,31 +3064,7 @@ class FoundElement:
             parts.append(f"📈 Change: {self.change_found}")
         return " | ".join(parts)
 
-
-@dataclass
-class FoundElement:
-    """Structured logging for found elements"""
-    tag: str
-    classes: str
-    element_id: str
-    text_preview: str
-    price_found: Optional[str] = None
-    change_found: Optional[str] = None
-    
-    def __str__(self) -> str:
-        parts = [
-            f"[{self.tag}]",
-            f"Classes: {self.classes or 'none'}",
-            f"ID: {self.element_id or 'none'}",
-            f"Text: '{self.text_preview[:100]}...'"
-        ]
-        if self.price_found:
-            parts.append(f"💰 Price: {self.price_found}")
-        if self.change_found:
-            parts.append(f"📈 Change: {self.change_found}")
-        return " | ".join(parts)
-
-def parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/") -> Dict[str, Any]:
+def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/") -> Dict[str, Any]:
     """
     Parse Fuel Price Watch with comprehensive logging at every step.
     Handles Unicode Naira symbol (₦) correctly.
