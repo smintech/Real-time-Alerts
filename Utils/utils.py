@@ -3347,7 +3347,6 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
             LOG.info(f"    {idx}. {elem}")
         if len(found_elements) > 10:
             LOG.info(f"    ... and {len(found_elements) - 10} more")
-        LOG.info()
     else:
         LOG.warning("  ⚠️  No elements with ₦ found!\n")
 
