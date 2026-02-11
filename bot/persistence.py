@@ -1,5 +1,3 @@
-# persistence.py - FIXED POSTGRES SSL CONNECTION FOR NEON + IMPROVED CLEANUP
-
 import os
 import json
 import logging
@@ -454,7 +452,7 @@ async def save_snapshot(snapshot: dict, redis_ttl: int = REDIS_TTL_SECONDS):
         logger.exception("Failed updating alternatives index for %s", snapshot.get("url"))
 
 # ═══════════════════════════════════════════════════════════════════════════
-# CHANNEL SNAPSHOTS (DUAL-LAYER WITH DEDUPLICATION)
+# CHANNEL SNAPSHOTS (DUAL-LAYER WITH SMART CACHING)
 # ═══════════════════════════════════════════════════════════════════════════
 
 def _db_get_channel_snapshot(ref: str) -> Optional[Dict]:
@@ -580,14 +578,68 @@ def _db_check_duplicate_content(content_hash: str, lookback_hours: int = 48) -> 
     finally:
         return_pg_connection(conn)
 
+def _snapshot_has_changed(current: Optional[Dict], incoming: Dict) -> bool:
+    """
+    Compare snapshots to detect actual changes.
+    
+    Returns True if snapshot is new or has meaningful changes.
+    Ignores timestamps and always-changing fields.
+    
+    Comparable fields: site, title, url, current_price, item_count, raw
+    """
+    if current is None:
+        logger.debug("Snapshot is new (no current version)")
+        return True  # New snapshot
+    
+    # Fields that matter for "changed" detection
+    comparable_fields = [
+        "site", "title", "url", "current_price", "item_count"
+    ]
+    
+    for field in comparable_fields:
+        current_val = current.get(field)
+        incoming_val = incoming.get(field)
+        
+        if current_val != incoming_val:
+            logger.info(
+                "Snapshot changed: %s | %s: %s → %s",
+                incoming.get("ref", "?"),
+                field,
+                current_val,
+                incoming_val
+            )
+            return True
+    
+    # Check raw data if present
+    current_raw = current.get("raw", {})
+    incoming_raw = incoming.get("raw", {})
+    
+    if current_raw != incoming_raw:
+        logger.info("Snapshot changed: raw data differs for %s", incoming.get("ref", "?"))
+        return True
+    
+    logger.debug("Snapshot unchanged: %s", incoming.get("ref", "?"))
+    return False
+
 async def load_channel_snapshot(ref: str) -> Optional[Dict]:
     """
-    Load channel snapshot (Redis first, Postgres fallback).
+    Load channel snapshot with smart caching strategy:
+    
+    Redis Layer (24h cache):
+    - Primary lookup for fast retrieval
+    - If expired, fallback to DB
+    
+    Postgres Layer (30d retention):
+    - Persistent storage
+    - If found but Redis expired, restore to Redis (24h)
+    - No "new" flag on restoration (preserves original timestamps)
+    
+    Returns: Channel snapshot dict or None if not found
     """
     loop = asyncio.get_event_loop()
     key = _channel_snap_key(ref)
 
-    # Try Redis first
+    # Try Redis first (24h cache)
     def _read_redis():
         try:
             r = get_redis()
@@ -605,12 +657,26 @@ async def load_channel_snapshot(ref: str) -> Optional[Dict]:
     except Exception:
         pass
 
-    # Fallback to Postgres
-    try:
-        return await loop.run_in_executor(None, _db_get_channel_snapshot, ref)
-    except Exception:
-        logger.exception("DB channel read failed %s", ref)
-        return None
+    # Redis expired → check DB (30d store) and restore Redis cache
+    def _read_db_and_restore_redis():
+        try:
+            snapshot = _db_get_channel_snapshot(ref)
+            if snapshot:
+                # Re-populate Redis cache for next 24h
+                # Keep original timestamps (not treated as new)
+                try:
+                    r = get_redis()
+                    snap_key = _channel_snap_key(ref)
+                    r.set(snap_key, json.dumps(snapshot), ex=REDIS_TTL_SECONDS)
+                    logger.info("Restored channel snapshot to Redis from DB: %s", ref)
+                except Exception:
+                    logger.exception("Failed to restore to Redis: %s", ref)
+            return snapshot
+        except Exception:
+            logger.exception("DB channel read failed %s", ref)
+            return None
+
+    return await loop.run_in_executor(None, _read_db_and_restore_redis)
 
 async def save_channel_snapshot(
     ref: str, 
@@ -619,16 +685,22 @@ async def save_channel_snapshot(
     expires_hours: int = POSTGRES_RETENTION_DAYS * 24
 ):
     """
-    Save channel snapshot to both Redis and Postgres.
+    Save channel snapshot with change detection.
     
-    Redis layers:
-    1. Full snapshot (channel:snap:{ref})
-    2. Content hash for dedup (channel:dedup:{hash})
-    3. Recent posts sorted set (channel:recent:{ref}:posts)
+    Strategy:
+    1. Load current snapshot from DB
+    2. Compare with incoming snapshot (ignore timestamps)
+    3. If different → update both Redis + DB + history
+    4. If same → only refresh Redis cache (24h) + skip DB + skip history
     
-    Postgres:
-    1. channel_snapshots (current state)
-    2. channel_post_history (all posts for analytics)
+    Redis Layers (always refreshed if changed):
+    - channel:snap:{ref} → Full snapshot
+    - channel:dedup:{hash} → Content hash for dedup (only if new)
+    - channel:recent:{ref}:posts → Sorted set of recent posts (only if new)
+    
+    Postgres (only if changed):
+    - channel_snapshots → Current state (upsert)
+    - channel_post_history → All posts for analytics (insert only)
     """
     loop = asyncio.get_event_loop()
     
@@ -638,6 +710,19 @@ async def save_channel_snapshot(
     
     content_hash = snapshot["content_hash"]
     now = datetime.now(timezone.utc)
+    
+    # Load current snapshot to compare
+    def _load_current():
+        try:
+            return _db_get_channel_snapshot(ref)
+        except Exception:
+            logger.exception("Failed to load current snapshot for comparison: %s", ref)
+            return None
+    
+    current_snapshot = await loop.run_in_executor(None, _load_current)
+    
+    # Determine if this is actually new/different
+    is_new_or_different = _snapshot_has_changed(current_snapshot, snapshot)
     
     # Prepare snapshot with timestamps
     full_snapshot = {
@@ -654,30 +739,31 @@ async def save_channel_snapshot(
         "item_count": snapshot.get("item_count")
     }
 
-    # Write to Redis (3 operations)
+    # Write to Redis (always refresh cache if changed, selective dedup/recent)
     def _write_redis():
         try:
             r = get_redis()
             
-            # 1. Full snapshot
+            # 1. Full snapshot (always refresh)
             snap_key = _channel_snap_key(ref)
             r.set(snap_key, json.dumps(full_snapshot), ex=ttl_seconds)
             
-            # 2. Content hash for dedup
-            dedup_key = _channel_dedup_key(content_hash)
-            r.set(dedup_key, json.dumps({
-                "ref": ref,
-                "posted_at": now.isoformat(),
-                "title": snapshot.get("title")
-            }), ex=ttl_seconds)
-            
-            # 3. Recent posts sorted set (score = timestamp)
-            recent_key = _channel_recent_key(ref)
-            r.zadd(recent_key, {content_hash: now.timestamp()})
-            r.expire(recent_key, ttl_seconds)
-            
-            # Cleanup old entries from sorted set (keep last 50)
-            r.zremrangebyrank(recent_key, 0, -51)
+            # 2. Content hash for dedup (only if new/different)
+            if is_new_or_different:
+                dedup_key = _channel_dedup_key(content_hash)
+                r.set(dedup_key, json.dumps({
+                    "ref": ref,
+                    "posted_at": now.isoformat(),
+                    "title": snapshot.get("title")
+                }), ex=ttl_seconds)
+                
+                # 3. Recent posts sorted set (only if new/different)
+                recent_key = _channel_recent_key(ref)
+                r.zadd(recent_key, {content_hash: now.timestamp()})
+                r.expire(recent_key, ttl_seconds)
+                
+                # Cleanup old entries from sorted set (keep last 50)
+                r.zremrangebyrank(recent_key, 0, -51)
             
         except Exception:
             logger.exception("Redis channel write failed %s", ref)
@@ -687,18 +773,33 @@ async def save_channel_snapshot(
     except Exception:
         pass
 
-    # Write to Postgres (2 operations)
-    try:
-        await loop.run_in_executor(None, _db_upsert_channel_snapshot, ref, snapshot, expires_hours)
-    except Exception:
-        logger.exception("DB channel upsert failed %s", ref)
-    
-    # Record post in history if this is a new post
-    if snapshot.get("last_posted_at"):
+    # Write to DB only if actually changed
+    if is_new_or_different:
         try:
-            await loop.run_in_executor(None, _db_record_post, ref, snapshot, POSTGRES_RETENTION_DAYS)
+            await loop.run_in_executor(
+                None, 
+                _db_upsert_channel_snapshot, 
+                ref, snapshot, expires_hours
+            )
+            logger.info("Updated channel snapshot in DB (new/changed): %s", ref)
         except Exception:
-            logger.exception("Failed to record post history for %s", ref)
+            logger.exception("DB channel upsert failed %s", ref)
+        
+        # Record post in history if this is a new post
+        if snapshot.get("last_posted_at"):
+            try:
+                await loop.run_in_executor(
+                    None, 
+                    _db_record_post, 
+                    ref, snapshot, POSTGRES_RETENTION_DAYS
+                )
+            except Exception:
+                logger.exception("Failed to record post history for %s", ref)
+    else:
+        # Not changed → just refreshed Redis cache, skip DB updates
+        logger.debug(
+            "Channel snapshot unchanged, Redis cache refreshed (no DB update): %s", ref
+        )
 
 async def check_duplicate_post(
     ref: str,
@@ -708,7 +809,7 @@ async def check_duplicate_post(
     """
     Check if this content was recently posted.
     
-    Fast path: Redis sorted set lookup
+    Fast path: Redis dedup key + sorted set lookup
     Fallback: Postgres history table
     
     Returns True if duplicate, False if unique.
