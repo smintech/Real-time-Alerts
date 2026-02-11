@@ -644,11 +644,11 @@ async def check_and_post_channel_deals(context: ContextTypes.DEFAULT_TYPE):
 # ═══════════════════════════════════════════════════════════════════════════
 # FUEL PRICES POSTING
 # ═══════════════════════════════════════════════════════════════════════════
-
 async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
     """
     Daily fuel & LPG update job - posts only if petrol OR LPG price changed.
     Uses dual-layer persistence with deduplication.
+    Includes source attribution and improved formatting.
     """
     now = datetime.now(TIMEZONE)
     FUEL_TRACKING_KEY = "fuel_prices_nigeria"
@@ -708,10 +708,12 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
     petrol_avg_formatted = None
     petrol_avg_raw = None
     petrol_changed = True
+    petrol_sources = []
 
     if petrol_data:
         petrol_avg_formatted = petrol_data.get("avg_petrol")
         petrol_avg_raw = petrol_data.get("avg_raw")
+        petrol_sources = petrol_data.get("sources", [])
         
         if not TEST_MODE and previous_petrol_raw is not None and petrol_avg_raw is not None:
             petrol_changed = abs(petrol_avg_raw - previous_petrol_raw) >= 0.01
@@ -720,10 +722,12 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
     lpg_retail_range = None
     lpg_depot_per_kg_raw = None
     lpg_changed = True
+    lpg_source = None
 
     if lpg_data and lpg_data.get("retail_estimate_lagos") != "N/A":
         lpg_retail_range = lpg_data["retail_estimate_lagos"]
         lpg_depot_per_kg_raw = lpg_data.get("depot_per_kg_raw")
+        lpg_source = lpg_data.get("source")
 
         if not TEST_MODE and previous_lpg_raw is not None and lpg_depot_per_kg_raw is not None:
             lpg_changed = abs(lpg_depot_per_kg_raw - previous_lpg_raw) >= 0.01
@@ -738,8 +742,9 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
     # Build message
     message_lines = [
         "🌅 <b>Daily Fuel Price Report — Nigeria</b>",
-        f"📅 {now.strftime('%B %d, %Y')} — <i>Morning update</i>",
-        "━━━━━━━━━━━━━━━━━━",
+        f"📅 {now.strftime('%B %d, %Y')} • <i>Morning update</i>",
+        "",
+        "┌" + "─" * 38 + "┐",
     ]
 
     # Petrol section
@@ -747,17 +752,24 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
         change_absolute = petrol_data.get("change_absolute", "N/A")
         change_percent = petrol_data.get("change_percent", "N/A")
         
-        change_emoji = "📊"
+        change_emoji = "•"
         if change_absolute and str(change_absolute).startswith("+"):
             change_emoji = "📈"
         elif change_absolute and str(change_absolute).startswith("-"):
             change_emoji = "📉"
 
         message_lines.extend([
-            "⛽ <b>Petrol (PMS) — National Average</b>",
-            f"   <b>Price:</b> {petrol_avg_formatted}",
-            f"   {change_emoji} <b>Change:</b> {change_absolute} ({change_percent})",
-            "",
+            "│ ⛽ <b>Petrol (PMS)</b> — National Average",
+            "│",
+            f"│    <b>Price:</b> <code>{petrol_avg_formatted}</code>",
+            f"│    {change_emoji} <b>Change:</b> {change_absolute} ({change_percent})",
+            "│",
+        ])
+    else:
+        message_lines.extend([
+            "│ ⛽ <b>Petrol (PMS)</b>",
+            "│    <i>Data unavailable</i>",
+            "│",
         ])
 
     # LPG section
@@ -766,15 +778,44 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
         lpg_depot_per_kg = lpg_data.get("avg_depot_per_kg", "N/A")
         
         message_lines.extend([
-            "🔥 <b>LPG (Cooking Gas) — Lagos Retail Estimate</b>",
-            f"   📊 <b>Depot average (20MT):</b> {lpg_depot_avg}",
-            f"      <b>Per kg at depot:</b> {lpg_depot_per_kg}",
-            f"   🏙️ <b>Estimated retail:</b> {lpg_retail_range}",
-            "",
+            "│ 🔥 <b>LPG (Cooking Gas)</b> — Lagos Estimate",
+            "│",
+            f"│    <b>Depot (20MT):</b> <code>{lpg_depot_avg}</code>",
+            f"│    <b>Per kg:</b> <code>{lpg_depot_per_kg}</code>",
+            f"│    <b>Retail range:</b> <code>{lpg_retail_range}</code>",
+            "│",
+        ])
+    else:
+        message_lines.extend([
+            "│ 🔥 <b>LPG (Cooking Gas)</b>",
+            "│    <i>Data unavailable</i>",
+            "│",
         ])
 
+    message_lines.append("└" + "─" * 38 + "┘")
+    message_lines.append("")
+
+    # Sources section
+    message_lines.append("<b>📍 Sources:</b>")
+    
+    if petrol_sources:
+        for source in petrol_sources:
+            # Create a clickable source with cleaner URL display
+            source_display = source.replace("https://", "").replace("http://", "").rstrip("/")
+            if "fuelpricewatch" in source.lower():
+                message_lines.append(f"  • ⛽ <a href=\"{source}\">Fuel Price Watch</a>")
+            else:
+                message_lines.append(f"  • ⛽ <a href=\"{source}\">{source_display}</a>")
+    
+    if lpg_source:
+        source_display = lpg_source.replace("https://", "").replace("http://", "").rstrip("/")
+        if "lpg" in lpg_source.lower():
+            message_lines.append(f"  • 🔥 <a href=\"{lpg_source}\">LPG in Nigeria</a>")
+        else:
+            message_lines.append(f"  • 🔥 <a href=\"{lpg_source}\">{source_display}</a>")
+
     message_lines.extend([
-        "━━━━━━━━━━━━━━━━━━",
+        "",
         "<i>Tap source links for live updates</i> 🔗",
     ])
 
@@ -793,8 +834,9 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
                 disable_web_page_preview=True,
             )
             sent_successfully = True
+            LOG.info(f"Fuel price update sent to {chat_id}")
         except Exception:
-            LOG.exception("Failed to send fuel update")
+            LOG.exception(f"Failed to send fuel update to {chat_id}")
 
     # Update snapshot
     if sent_successfully and not TEST_MODE:
@@ -809,7 +851,6 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
             LOG.info("Fuel prices posted and snapshot saved")
         except Exception:
             LOG.exception("Failed to save fuel snapshot")
-
 # ═══════════════════════════════════════════════════════════════════════════
 # SCHOOL UPDATES POSTING
 # ═══════════════════════════════════════════════════════════════════════════
