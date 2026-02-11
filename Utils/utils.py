@@ -3064,135 +3064,74 @@ class FoundElement:
             parts.append(f"📈 Change: {self.change_found}")
         return " | ".join(parts)
 
-def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/") -> Dict[str, Any]:
-    """
-    Parse Fuel Price Watch with targeted extraction based on site analysis.
-    """
+def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/") -> dict:
     start_time = time.time()
-    
-    # ═══════════════════════════════════════════════════════════════════════
-    # STEP 0: Setup & Soup
-    # ═══════════════════════════════════════════════════════════════════════
     soup = BeautifulSoup(html, "html.parser")
     
+    # Initialize variables
     price_raw = 0.0
     change_percent = None
     change_absolute = None
-    petrol_card = None
     success = False
     extraction_log = []
 
-    LOG.info(f"🔍 Starting parse of {len(html)} bytes")
-
-    # ═══════════════════════════════════════════════════════════════════════
-    # STEP 1: Targeted Card Discovery
-    # ═══════════════════════════════════════════════════════════════════════
-    # The analysis confirmed the data lives in a 'gumroad-card'
-    # and specifically the one containing 'Average Petrol Price'.
+    # 1. FIND THE PETROL CARD
+    # We look for the 'gumroad-card' that contains the specific text
+    petrol_card = None
+    all_cards = soup.find_all("div", class_="gumroad-card")
     
-    cards = soup.find_all("div", class_="gumroad-card")
-    LOG.info(f"  Found {len(cards)} 'gumroad-card' candidates")
-
-    for card in cards:
-        card_text = card.get_text(" ", strip=True)
-        # We specifically want the Petrol card, not Diesel or Kerosene
-        if "Average Petrol Price" in card_text:
+    for card in all_cards:
+        if "Petrol" in card.get_text():
             petrol_card = card
-            extraction_log.append("✓ Found 'Average Petrol Price' card")
-            LOG.info("  ✓ Locked on to Petrol Card")
+            extraction_log.append("✓ Found Petrol card container")
             break
-    
+
     if not petrol_card:
-        # Fallback: Look for any div containing the specific title if class name changed
-        LOG.warning("  ⚠️ 'gumroad-card' class not found, trying text search fallback...")
-        petrol_card = soup.find(string=re.compile("Average Petrol Price"))
-        if petrol_card:
-            # Move up to the parent container
-            petrol_card = petrol_card.find_parent("div")
-            extraction_log.append("✓ Found card via text fallback")
+        # Fallback: find any element containing the text and get its parent
+        target = soup.find(string=re.compile(r"Average Petrol Price", re.I))
+        if target:
+            petrol_card = target.find_parent("div", class_="gumroad-card") or target.find_parent("div")
+            extraction_log.append("✓ Found Petrol card via string fallback")
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # STEP 2: Data Extraction
-    # ═══════════════════════════════════════════════════════════════════════
+    # 2. EXTRACT DATA FROM CARD
     if petrol_card:
-        card_text = petrol_card.get_text(" ", strip=True)
-        LOG.info(f"  Parsing card text: {card_text[:100]}...")
+        # Get all text from card for broad regex search
+        full_text = petrol_card.get_text(" ", strip=True)
+        LOG.debug(f"Card Content: {full_text}")
 
-        # --- A. Extract Price (Target: ₦873.88) ---
-        # The analysis shows the price is often in a specific bold div:
-        # 'text-xl sm:text-2xl font-bold text-foreground'
-        # We try to find that specific element first for highest accuracy.
-        price_elem = petrol_card.find("div", class_=lambda c: c and "text-xl" in c and "font-bold" in c)
+        # --- EXTRACT PRICE ---
+        # Look for: ₦ followed by numbers, or just numbers with two decimals near "Price"
+        # Handles: ₦873.88, ₦ 873.88, 873.88
+        price_match = re.search(r'(?:₦|N)?\s*(\d{2,4}(?:,\d{3})*\.\d{2})', full_text)
         
-        price_found = False
-        
-        # Method 1: Specific Element Text
-        if price_elem:
-            elem_text = price_elem.get_text(strip=True)
-            # Regex to handle ₦ symbol, commas, and decimals
-            match = re.search(r'[₦N]\s*([\d,]+\.\d{2})', elem_text)
-            if match:
-                try:
-                    price_raw = float(match.group(1).replace(",", ""))
-                    price_found = True
-                    extraction_log.append(f"✓ Extracted price ₦{price_raw} from bold element")
-                except ValueError:
-                    pass
-
-        # Method 2: Regex on full card text (Fallback)
-        if not price_found:
-            # Pattern: Look for ₦ followed by digits, potentially immediately after "Price"
-            # Matches: ₦873.88, ₦1,000.00
-            patterns = [
-                r'Average\s+Petrol\s+Price\s*[₦N]\s*([\d,]+\.\d{2})', # Context aware
-                r'[₦N]\s*([\d,]+\.\d{2})'                            # Raw symbol
-            ]
-            for pat in patterns:
-                match = re.search(pat, card_text)
-                if match:
-                    try:
-                        price_raw = float(match.group(1).replace(",", ""))
-                        price_found = True
-                        extraction_log.append(f"✓ Extracted price ₦{price_raw} via regex")
-                        break
-                    except ValueError:
-                        continue
-
-        # --- B. Extract Percent Change (Target: +0.5%) ---
-        # Pattern: +0.5% or -0.2%
-        pct_match = re.search(r'([+\-]\s*[\d\.]+)\s*%', card_text)
-        if pct_match:
+        if price_match:
             try:
-                change_percent = float(pct_match.group(1).replace(" ", ""))
-                extraction_log.append(f"✓ Found percent change: {change_percent}%")
-            except ValueError:
-                pass
-
-        # --- C. Extract Absolute Change (Target: +₦5.00 today) ---
-        # The analysis showed this specific string: "+₦5.00 today"
-        # We look for the "today" marker and the naira symbol nearby
-        abs_match = re.search(r'([+\-])\s*[₦N]\s*([\d\.]+)\s*today', card_text, re.IGNORECASE)
-        if abs_match:
-            sign = abs_match.group(1)
-            amount = abs_match.group(2)
-            change_absolute = f"{sign}₦{amount}"
-            extraction_log.append(f"✓ Found daily change: {change_absolute}")
+                price_val = price_match.group(1).replace(",", "")
+                price_raw = float(price_val)
+                success = True
+                extraction_log.append(f"✓ Extracted Price: {price_raw}")
+            except (ValueError, IndexError):
+                extraction_log.append("✗ Failed to convert price string to float")
         else:
-            # Fallback for negative numbers often formatted like: ₦-2.50 today
-            abs_match_neg = re.search(r'[₦N]\s*([+\-][\d\.]+)\s*today', card_text, re.IGNORECASE)
-            if abs_match_neg:
-                change_absolute = f"₦{abs_match_neg.group(1)}"
-                extraction_log.append(f"✓ Found daily change (alt format): {change_absolute}")
+            extraction_log.append("✗ Could not find price pattern in card text")
 
-        success = price_found
+        # --- EXTRACT PERCENT CHANGE ---
+        # Look for: +0.5%, -1.2%
+        pct_match = re.search(r'([+\-]\s*\d+(?:\.\d+)?)\s*%', full_text)
+        if pct_match:
+            change_percent = float(pct_match.group(1).replace(" ", ""))
+            extraction_log.append(f"✓ Found Percent: {change_percent}%")
+
+        # --- EXTRACT ABSOLUTE CHANGE ---
+        # Look for: +₦5.00 today or ₦-2.50 today
+        abs_match = re.search(r'([+\-]?\s*(?:₦|N)\s*[+\-]?\s*\d+\.\d{2})\s*today', full_text, re.I)
+        if abs_match:
+            change_absolute = abs_match.group(1).replace(" ", "")
+            extraction_log.append(f"✓ Found Absolute Change: {change_absolute}")
+
     else:
-        extraction_log.append("✗ CRITICAL: Could not locate Petrol Card")
-        LOG.error("Could not locate Petrol Card")
+        extraction_log.append("✗ Could not identify Petrol Price card")
 
-    # ═══════════════════════════════════════════════════════════════════════
-    # STEP 3: Return Result
-    # ═══════════════════════════════════════════════════════════════════════
-    
     elapsed = time.time() - start_time
     
     return {
@@ -3201,7 +3140,6 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
         "price_str": f"₦{price_raw:,.2f}" if success else None,
         "change_percent": change_percent,
         "change_absolute": change_absolute,
-        "last_updated": "Live data",
         "success": success,
         "extraction_log": extraction_log,
         "execution_time": elapsed
