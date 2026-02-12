@@ -73,6 +73,13 @@ nest_asyncio.apply()
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() in ("1", "true", "yes")
 SCHOOL_FORCE_POST = os.getenv("SCHOOL_UPDATES_FORCE", "false").lower() in ("1", "true", "yes") 
 
+SCHEDULE_TIMES = [
+    time(hour=7, minute=0, tzinfo=TIMEZONE),   # 07:00
+    time(hour=13, minute=0, tzinfo=TIMEZONE),  # 13:00
+    time(hour=19, minute=0, tzinfo=TIMEZONE),  # 19:00
+    time(hour=1, minute=0, tzinfo=TIMEZONE),   # 01:00 (next day)
+]
+
 # ═══════════════════════════════════════════════════════════════════════════
 # HELPER FUNCTIONS
 # ═══════════════════════════════════════════════════════════════════════════
@@ -651,12 +658,21 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
     Includes source attribution and improved formatting.
     """
     now = datetime.now(TIMEZONE)
+    current_weekday = now.weekday()
+    current_day_name = now.strftime('%A')
+
+    if current_weekday != 5:  # 5 = Saturday
+        LOG.debug("⏭️  Skipping fuel price check — today is %s (%d), not Saturday",current_day_name,current_weekday)
+        return
+    
+    LOG.info("🛢️  Running weekly fuel price check (Saturday %02d:%02d:%02d)",now.hour,now.minute,now.second)
+
     FUEL_TRACKING_KEY = "fuel_prices_nigeria"
 
     # Wake-up window check
     if not TEST_MODE:
         if not (7 <= now.hour < 8):
-            LOG.debug("Outside of 7 AM window — skipping fuel update")
+            LOG.warning("⚠️  Saturday fuel check ran outside 7-8 AM window (actual time: %02d:%02d)",now.hour,now.minute)
             return
 
     # Load last snapshot
@@ -1415,32 +1431,29 @@ async def run_bot():
                 #first=30,
                 #name="price_checker"
             #)
-            application.job_queue.run_repeating(
-                callback=check_and_post_channel_deals,
-                interval=CHECK_INTERVAL_SECONDS,
-                first=10,
-                name="channel_deals"
-            )
-            #application.job_queue.run_daily(
-                #callback=check_and_post_fuel_prices,
+            #application.job_queue.run_repeating(
+                #callback=check_and_post_channel_deals,
                 #interval=CHECK_INTERVAL_SECONDS,
-                #time=time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
-                #name="check_fuel_prices",
-                #first=20,
+                #first=10,
+                #name="channel_deals"
             #)
+            application.job_queue.run_daily(
+                callback=check_and_post_fuel_prices,
+                time=time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
+                name="check_fuel_prices",
+            )
             #application.job_queue.run_repeating(
                 #callback=check_trials,
                 #interval=86400,
                 #first=3600,
                 #name="trial_checker"
             #)
-            #application.job_queue.run_repeating(
-                #callback=check_and_post_school_updates,
-                #interval=CHECK_INTERVAL_SECONDS,  # 6 hours
-                #first=30,
-                #time=time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
-                #name="school_updates_poster",
-            # )
+            for idx, t in enumerate(SCHEDULE_TIMES):
+                application.job_queue.run_daily(
+                    callback=check_and_post_school_updates,
+                    time=t,
+                    name=f"school_updates_poster_{idx}",  # Unique names
+               )
             application.job_queue.run_daily(
                 callback=lambda ctx: cleanup_all_expired(),
                 time=time(hour=3, minute=0, second=0, tzinfo=TIMEZONE),
