@@ -74,10 +74,10 @@ TEST_MODE = os.getenv("TEST_MODE", "false").lower() in ("1", "true", "yes")
 SCHOOL_FORCE_POST = os.getenv("SCHOOL_UPDATES_FORCE", "false").lower() in ("1", "true", "yes") 
 
 SCHEDULE_TIMES = [
-    time(hour=7, minute=0, tzinfo=TIMEZONE),   # 07:00
-    time(hour=13, minute=0, tzinfo=TIMEZONE),  # 13:00
-    time(hour=19, minute=0, tzinfo=TIMEZONE),  # 19:00
-    time(hour=1, minute=0, tzinfo=TIMEZONE),   # 01:00 (next day)
+    time(hour=7, minute=34, tzinfo=TIMEZONE),   # 07:00
+    time(hour=13, minute=34, tzinfo=TIMEZONE),  # 13:00
+    time(hour=19, minute=34, tzinfo=TIMEZONE),  # 19:00
+    time(hour=1, minute=34, tzinfo=TIMEZONE),   # 01:00 (next day)
 ]
 
 # ═══════════════════════════════════════════════════════════════════════════
