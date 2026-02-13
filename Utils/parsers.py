@@ -1,7 +1,6 @@
 """
 All parsing utilities: dates, prices, product IDs, DOM price extraction.
 """
-
 import re
 import logging
 from datetime import datetime, timedelta, timezone
