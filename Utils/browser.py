@@ -9,7 +9,7 @@ import time
 import importlib
 from typing import Optional, Tuple, Union, List, Iterable, Dict, Any
 from urllib.parse import urlparse
-
+import os
 from playwright.async_api import async_playwright, Browser, BrowserContext, Page, TimeoutError as PlaywrightTimeoutError
 from playwright._impl._errors import TargetClosedError
 
