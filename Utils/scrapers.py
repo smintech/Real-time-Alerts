@@ -21,6 +21,13 @@ from .parsers import (
 )
 from .browser import fetch_with_playwright_aggressive, _BROWSER_SEMAPHORE
 
+from bot.settings import (
+    SUPPORTED_SITES,
+    MIN_CHANGE_TO_ALERT,
+    HIGH_DEAL_THRESHOLD,
+    MEDIUM_DEAL_THRESHOLD,
+    LOW_DEAL_THRESHOLD,
+)
 # -------------------------------------------------------------------
 # Logging setup
 # -------------------------------------------------------------------
