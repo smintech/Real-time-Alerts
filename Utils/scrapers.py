@@ -169,9 +169,13 @@ def scrape_binance_ref(ref: str) -> Dict[str, Any]:
 # -------------------------------------------------------------------
 async def scrape_ecommerce(url: str) -> Dict[str, Any]:
     domain = get_domain_from_url(url)
-    # (Site support check removed for brevity – assume already checked)
+    if not any(s in domain for s in SUPPORTED_SITES):
+        raise NotImplementedError(f"Unsupported site: {domain}. Add to SUPPORTED_SITES.")
+
     html = None
     visible_text = None
+
+    # Primary fetch strategy
     if any(d in domain for d in ("konga", "jumia")):
         try:
             LOG.debug("Using Playwright (with visible text) for %s", domain)
@@ -180,7 +184,7 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
                 html, visible_text = res
             else:
                 html = res
-            LOG.debug("Playwright succeeded: HTML=%d bytes, visible_text=%d bytes",
+            LOG.debug("Playwright succeeded: HTML=%d bytes, visible_text=%d bytes", 
                      len(html) if html else 0, len(visible_text) if visible_text else 0)
         except Exception as e:
             LOG.warning("Playwright fetch failed for %s: %s - Falling back", url, str(e)[:50])
@@ -191,6 +195,8 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
         except Exception as e:
             LOG.warning("Primary fetch failed for %s: %s", url, str(e)[:50])
             html = None
+    
+    # Fallback
     if html is None or len(html) < 5000:
         try:
             LOG.debug("Falling back to cloudscraper for %s", url)
@@ -203,6 +209,7 @@ async def scrape_ecommerce(url: str) -> Dict[str, Any]:
             raise NoDataError(f"Cloudscraper timeout for {url}")
         except Exception as e:
             raise NoDataError(f"All fetch methods failed for {url}: {e}")
+    
     soup = BeautifulSoup(html, "lxml")
     title_str = soup.title.string.lower() if soup.title else ""
     if any(kw in title_str for kw in ["just a moment", "verify", "cloudflare", "attention required", "challenge"]):
