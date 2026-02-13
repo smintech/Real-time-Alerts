@@ -1,7 +1,6 @@
 """
 E‑commerce and general product scraping.
 """
-
 import asyncio
 import logging
 import random
