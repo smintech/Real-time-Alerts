@@ -6,4 +6,4 @@ from Utils.parsers import *
 from Utils.browser import *
 from Utils.scrapers import *
 from Utils.energy_scrapers import *
-from Utils.news_scrapers import *
+from Utils.school_news_scrapers import *
