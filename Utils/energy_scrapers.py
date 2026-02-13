@@ -14,7 +14,7 @@ from urllib.parse import urlparse
 from bs4 import BeautifulSoup
 
 from .browser import fetch_with_playwright_aggressive, shared_playwright
-from .helpers import get_domain_from_url
+from .helpers import get_domain_from_url, retry
 
 # -------------------------------------------------------------------
 # Logging setup
