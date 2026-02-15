@@ -1410,7 +1410,7 @@ async def run_bot():
             LOG.info("   ✓ Database tables ready")
         except Exception as e:
             LOG.exception("   ✗ Database initialization failed.")
-            raise RuntimeError(f"Database init failed: {e}") from e
+            
         
         # ─────────────────────────────────────────────────────────────────────
         # REDIS CONNECTION
@@ -1432,7 +1432,7 @@ async def run_bot():
             raise RuntimeError(f"Redis connection failed: {e}") from e
         except Exception as e:
             LOG.exception("   ✗ Unexpected Redis error.")
-            raise RuntimeError(f"Unexpected Redis error: {e}") from e
+            
         
         # ─────────────────────────────────────────────────────────────────────
         # DISTRIBUTED LOCK
@@ -1446,7 +1446,7 @@ async def run_bot():
             
             if not lock_acquired:
                 LOG.warning("   ⚠️  Could not acquire lock — another instance is running")
-                raise SystemExit("Exiting to prevent conflicts (Lock not acquired).")
+                
             
             lock, renewal_task = lock_info
             LOG.info("   ✓ Lock acquired and renewal task started")
@@ -1456,7 +1456,7 @@ async def run_bot():
             raise RuntimeError("Lock acquisition timeout")
         except RedisError as e:
             LOG.error(f"   ❌ Redis error during lock acquisition: {e}")
-            raise RuntimeError(f"Lock failed due to Redis error: {e}") from e
+            
         
         # ─────────────────────────────────────────────────────────────────────
         # TELEGRAM APPLICATION BUILD
