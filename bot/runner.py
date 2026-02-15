@@ -678,7 +678,7 @@ async def run_bot_with_signal():
 # ═══════════════════════════════════════════════════════════════════════════
 # Enhanced Startup Event
 # ═══════════════════════════════════════════════════════════════════════════
-
+@app.on_event("startup")
 async def on_startup():
     """FastAPI startup event handler with enhanced resilience and diagnostics"""
     global _last_activity
