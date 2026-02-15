@@ -44,9 +44,8 @@ from bot.bot import (
     check_and_post_school_updates,
     check_all_watches,
     check_trials,
-    application as bot_app,
 )
-
+import bot.bot 
 # Import telegram bot types
 from telegram.ext import ContextTypes
 
@@ -110,11 +109,12 @@ def verify_ip(ip_address: str) -> bool:
 # -----------------------
 async def get_bot_context():
     """Get a ContextTypes.DEFAULT_TYPE for bot operations."""
-    if not bot_app:
+    if not bot.bot.application:
         raise HTTPException(status_code=503, detail="Bot not initialized")
     
-    context = ContextTypes.DEFAULT_TYPE(application=bot_app)
+    context = ContextTypes.DEFAULT_TYPE(application=bot.bot.application)
     return context
+
 
 # -----------------------
 # Basic endpoints (with activity tracking)
@@ -145,7 +145,7 @@ async def health():
             "api": "healthy",
             "database": "connected",
             "redis": "connected",
-            "bot": "running" if bot_app else "initializing",
+            "bot": "running" if bot.bot.application else "initializing",
         }
     }
 
@@ -751,12 +751,11 @@ async def on_startup():
 async def bot_status():
     touch_activity()
     return {
-        "bot_initialized": bot_app is not None,
+        "bot_initialized": bot.bot.application is not None,
         "bot_ready": _bot_ready.is_set(),
         "bot_error": str(_bot_error) if _bot_error else None,
         "uptime_seconds": time.time() - _last_activity,
     }
-
 
 @app.on_event("shutdown")
 async def on_shutdown():
