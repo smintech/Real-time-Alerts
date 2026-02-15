@@ -1,6 +1,3 @@
-# runner.py — SINGLE-PROCESS ASYNC VERSION with External Endpoints
-# Includes: Passive wake-up handling for external ping services (UptimeRobot, Cron-Job, etc.)
-
 import os
 import time
 import logging
