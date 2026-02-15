@@ -1,4 +1,3 @@
-
 import logging
 import asyncio
 from telegram import Update
@@ -72,13 +71,6 @@ application: Application | None = None
 nest_asyncio.apply()
 TEST_MODE = os.getenv("TEST_MODE", "false").lower() in ("1", "true", "yes")
 SCHOOL_FORCE_POST = os.getenv("SCHOOL_UPDATES_FORCE", "false").lower() in ("1", "true", "yes") 
-
-SCHEDULE_TIMES = [
-    time(hour=7, minute=34, tzinfo=TIMEZONE),   # 07:00
-    time(hour=13, minute=34, tzinfo=TIMEZONE),  # 13:00
-    time(hour=19, minute=34, tzinfo=TIMEZONE),  # 19:00
-    time(hour=1, minute=34, tzinfo=TIMEZONE),   # 01:00 (next day)
-]
 
 # ═══════════════════════════════════════════════════════════════════════════
 # HELPER FUNCTIONS
@@ -867,6 +859,7 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
             LOG.info("Fuel prices posted and snapshot saved")
         except Exception:
             LOG.exception("Failed to save fuel snapshot")
+
 # ═══════════════════════════════════════════════════════════════════════════
 # SCHOOL UPDATES POSTING
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1423,43 +1416,6 @@ async def run_bot():
         if os.getenv("WIPE_CHANNEL_REDIS") == "1":
             wipe_channel_snapshots_redis(dry_run=False)
         
-        # Register jobs
-        if application.job_queue:
-            #application.job_queue.run_repeating(
-                #callback=check_all_watches,
-                #interval=CHECK_INTERVAL_SECONDS,
-                #first=30,
-                #name="price_checker"
-            #)
-            #application.job_queue.run_repeating(
-                #callback=check_and_post_channel_deals,
-                #interval=CHECK_INTERVAL_SECONDS,
-                #first=10,
-                #name="channel_deals"
-            #)
-            application.job_queue.run_daily(
-                callback=check_and_post_fuel_prices,
-                time=time(hour=7, minute=0, second=0, tzinfo=TIMEZONE),
-                name="check_fuel_prices",
-            )
-            #application.job_queue.run_repeating(
-                #callback=check_trials,
-                #interval=86400,
-                #first=3600,
-                #name="trial_checker"
-            #)
-            for idx, t in enumerate(SCHEDULE_TIMES):
-                application.job_queue.run_daily(
-                    callback=check_and_post_school_updates,
-                    time=t,
-                    name=f"school_updates_poster_{idx}",  # Unique names
-               )
-            application.job_queue.run_daily(
-                callback=lambda ctx: cleanup_all_expired(),
-                time=time(hour=3, minute=0, second=0, tzinfo=TIMEZONE),
-                name="cleanup_expired"
-            )
-
         # Clear webhook
         try:
             await application.bot.delete_webhook(drop_pending_updates=True)
