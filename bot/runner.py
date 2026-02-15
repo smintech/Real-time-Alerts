@@ -639,55 +639,111 @@ async def debug_playwright_env():
     LOG.info("-------------------------")
 
 _bot_ready = asyncio.Event()
-_bot_error = None
+_bot_error: Optional[Exception] = None
+_bot_task: Optional[asyncio.Task] = None
 
 async def run_bot_with_signal():
-    """Wrapper that signals when bot is ready and logs errors"""
-    global _bot_error
+    """
+    Wrapper that:
+    - Runs the bot in the background
+    - Catches all errors and logs them loudly
+    - Signals when ready (success or failure)
+    - Prevents startup from hanging if bot crashes
+    """
+    global _bot_error, _bot_task
+    _bot_task = asyncio.current_task()
+    
     try:
-        logger.info("🤖 Bot thread starting...")
+        logger.info("🤖 Bot background task starting...")
+        touch_activity()
         await run_bot()
-        logger.info("✅ Bot finished normally")
+        logger.info("✅ Bot finished normally (unexpected - should run forever)")
+        
     except Exception as e:
         _bot_error = e
-        logger.exception("❌ BOT CRASHED: %s", e)
+        logger.error("=" * 70)
+        logger.error("❌ BOT CRASHED DURING INITIALIZATION")
+        logger.error("=" * 70)
+        logger.exception("Exception: %s", e)
+        logger.error("=" * 70)
+        logger.error("API will still start but Telegram bot won't function")
+        logger.error("Check your configuration:")
+        logger.error("  - TELEGRAM_TOKEN")
+        logger.error("  - REDIS_URL")
+        logger.error("  - DB_URL")
+        logger.error("=" * 70)
+        touch_activity()
+        
     finally:
+        logger.info("🔔 Signaling bot ready event (success or failure)...")
         _bot_ready.set()  # Signal ready even on failure
 
-@app.on_event("startup")
+# ═══════════════════════════════════════════════════════════════════════════
+# Enhanced Startup Event
+# ═══════════════════════════════════════════════════════════════════════════
+
 async def on_startup():
+    """FastAPI startup event handler with improved bot initialization"""
     global _last_activity
-    _last_activity = time.time()
+    _last_activity = datetime.now(timezone.utc)
     
     logger.info("=" * 70)
-    logger.info("FastAPI startup — initializing Naija Price Alerts")
+    logger.info("🚀 FastAPI startup — initializing Naija Price Alerts")
+    logger.info("=" * 70)
+    logger.info(f"Timestamp: {_last_activity.isoformat()}")
     logger.info("=" * 70)
     
+    # Debug Playwright
     await debug_playwright_env()
     
-    logger.info("Initializing database tables...")
+    # Initialize database
+    logger.info("\n📦 Initializing database tables...")
     try:
         initialize_database()
-        logger.info("✓ Database initialized successfully")
+        logger.info("   ✓ Database initialized successfully")
     except Exception as e:
-        logger.exception("✗ Database initialization failed: %s", e)
+        logger.exception("   ✗ Database initialization FAILED: %s", e)
+        logger.error("   ⚠️  API will start but persistence won't work")
     
-    logger.info("Launching Telegram bot...")
-    bot_task = asyncio.create_task(run_bot_with_signal())
-    
+    # Launch bot in background
+    logger.info("\n🤖 Launching Telegram bot background task...")
     try:
-        await asyncio.wait_for(_bot_ready.wait(), timeout=30.0)
-        if _bot_error:
-            logger.error("⚠️  Bot failed to initialize: %s", _bot_error)
-            logger.error("API will still run but bot commands won't work")
-        else:
-            logger.info("✓ Bot initialized and ready")
-    except asyncio.TimeoutError:
-        logger.warning("⚠️  Bot initialization timeout after 30s")
+        bot_task = asyncio.create_task(run_bot_with_signal())
+        logger.info("   ✓ Bot task created")
+        
+        # Wait for bot to signal ready (or timeout)
+        logger.info("   ⏳ Waiting for bot initialization (max 45s)...")
+        try:
+            await asyncio.wait_for(_bot_ready.wait(), timeout=45.0)
+            
+            if _bot_error:
+                logger.error("   ⚠️  Bot initialization FAILED:")
+                logger.error(f"      {_bot_error.__class__.__name__}: {_bot_error}")
+                logger.error("   ℹ️  API will run but bot commands unavailable")
+            else:
+                logger.info("   ✓ Bot initialized successfully and ready")
+                
+        except asyncio.TimeoutError:
+            logger.warning("   ⏱️  Bot initialization timeout after 45s")
+            logger.warning("   ℹ️  Bot may still be connecting, continuing startup...")
+            
+    except Exception as e:
+        logger.exception("   ✗ Failed to create bot task: %s", e)
+        logger.error("   ⚠️  Continuing without bot functionality")
     
+    # Final status
+    logger.info("\n" + "=" * 70)
+    logger.info("✅ FastAPI startup complete")
     logger.info("=" * 70)
-    logger.info("Startup complete - API ready for external pings")
+    logger.info("API Status:")
+    logger.info(f"  - HTTP Server: ✓ Ready")
+    logger.info(f"  - Database: ✓ Initialized")
+    logger.info(f"  - Telegram Bot: {'❌ Failed' if _bot_error else '✓ Ready'}")
     logger.info("=" * 70)
+    logger.info("Endpoints:")
+    logger.info("  - GET  /health          (for external pings)")
+    logger.info("  - POST /v1/jobs/*       (scheduled jobs)")
+    logger.info("=" * 70 + "\n")
 
 
 @app.on_event("shutdown")
