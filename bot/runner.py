@@ -750,6 +750,16 @@ async def on_startup():
     logger.info("  • POST /v1/jobs/*   → Trigger scheduled jobs")
     logger.info("=" * 70 + "\n")
 
+@app.get("/bot-status")
+async def bot_status():
+    touch_activity()
+    return {
+        "bot_initialized": bot_app is not None,
+        "bot_ready": _bot_ready.is_set(),
+        "bot_error": str(_bot_error) if _bot_error else None,
+        "uptime_seconds": time.time() - _last_activity,
+    }
+
 
 @app.on_event("shutdown")
 async def on_shutdown():
