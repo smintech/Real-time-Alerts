@@ -1366,47 +1366,34 @@ async def acquire_long_running_lock(r: redis_async.Redis, lock_name: str = "tele
 async def global_error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     LOG.exception("Unhandled handler error: %s", context.error)
 
-# ═══════════════════════════════════════════════════════════════════════════
-# MAIN BOT RUNNER
-# ═══════════════════════════════════════════════════════════════════════════
-
 async def run_bot():
     """
     Main bot runner with PTB v20+/v21 compatibility.
-    Enhanced with proper error handling and validation.
+    Enhanced with granular error handling, fail-fast validation, and safe teardown.
     """
     global application
+    application = None
 
     # ─────────────────────────────────────────────────────────────────────
-    # VALIDATION PHASE
+    # VALIDATION PHASE (Fail-Fast)
     # ─────────────────────────────────────────────────────────────────────
     
     LOG.info("\n" + "=" * 70)
     LOG.info("🔍 BOT VALIDATION PHASE")
     LOG.info("=" * 70)
     
-    # Check TELEGRAM_TOKEN
-    if not TELEGRAM_TOKEN:
-        error_msg = "❌ TELEGRAM_TOKEN is not set in environment variables"
-        LOG.error(error_msg)
-        raise RuntimeError(error_msg)
-    LOG.info("   ✓ TELEGRAM_TOKEN configured")
+    required_vars = ["TELEGRAM_TOKEN", "REDIS_URL", "DB_URL"]
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
     
-    # Check REDIS_URL
+    if missing_vars:
+        error_msg = f"❌ Missing required environment variables: {', '.join(missing_vars)}"
+        LOG.error(error_msg)
+        raise ValueError(error_msg)
+        
+    TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
     REDIS_URL = os.getenv("REDIS_URL")
-    if not REDIS_URL:
-        error_msg = "❌ REDIS_URL is not set in environment variables"
-        LOG.error(error_msg)
-        raise RuntimeError(error_msg)
-    LOG.info("   ✓ REDIS_URL configured")
     
-    # Check DB_URL
-    if not DB_URL:
-        error_msg = "❌ DB_URL is not set in environment variables"
-        LOG.error(error_msg)
-        raise RuntimeError(error_msg)
-    LOG.info("   ✓ DB_URL configured")
-    
+    LOG.info("   ✓ Environment variables configured successfully")
     LOG.info("=" * 70)
 
     r = None
@@ -1417,43 +1404,39 @@ async def run_bot():
         # ─────────────────────────────────────────────────────────────────────
         # DATABASE INITIALIZATION
         # ─────────────────────────────────────────────────────────────────────
-        
         LOG.info("\n📦 Initializing database...")
         try:
             initialize_database()
             LOG.info("   ✓ Database tables ready")
         except Exception as e:
-            LOG.exception("   ✗ Database initialization failed: %s", e)
+            LOG.exception("   ✗ Database initialization failed.")
             raise RuntimeError(f"Database init failed: {e}") from e
         
         # ─────────────────────────────────────────────────────────────────────
         # REDIS CONNECTION
         # ─────────────────────────────────────────────────────────────────────
-        
         LOG.info("\n🔴 Connecting to Redis...")
         try:
             r = await asyncio.wait_for(
                 redis_async.from_url(REDIS_URL, decode_responses=True),
                 timeout=10.0
             )
-            LOG.info("   ✓ Redis connected successfully")
-            
-            # Verify Redis connection
             await asyncio.wait_for(r.ping(), timeout=5.0)
-            LOG.info("   ✓ Redis ping successful")
+            LOG.info("   ✓ Redis connected and ping successful")
             
         except asyncio.TimeoutError:
-            error_msg = "❌ Redis connection timeout (10s)"
-            LOG.error(error_msg)
-            raise RuntimeError(error_msg)
-        except Exception as e:
-            LOG.exception("   ✗ Redis connection failed: %s", e)
+            LOG.error("   ❌ Redis connection timeout (10s)")
+            raise RuntimeError("Redis connection timeout")
+        except RedisConnectionError as e:
+            LOG.error(f"   ❌ Redis connection refused or invalid URL: {e}")
             raise RuntimeError(f"Redis connection failed: {e}") from e
+        except Exception as e:
+            LOG.exception("   ✗ Unexpected Redis error.")
+            raise RuntimeError(f"Unexpected Redis error: {e}") from e
         
         # ─────────────────────────────────────────────────────────────────────
         # DISTRIBUTED LOCK
         # ─────────────────────────────────────────────────────────────────────
-        
         LOG.info("\n🔐 Acquiring distributed lock...")
         try:
             lock_acquired, lock_info = await asyncio.wait_for(
@@ -1463,44 +1446,42 @@ async def run_bot():
             
             if not lock_acquired:
                 LOG.warning("   ⚠️  Could not acquire lock — another instance is running")
-                LOG.warning("   → Exiting to prevent conflicts")
-                raise RuntimeError("Could not acquire lock — another instance active")
+                raise SystemExit("Exiting to prevent conflicts (Lock not acquired).")
             
             lock, renewal_task = lock_info
             LOG.info("   ✓ Lock acquired and renewal task started")
             
         except asyncio.TimeoutError:
-            error_msg = "❌ Lock acquisition timeout (60s)"
-            LOG.error(error_msg)
-            raise RuntimeError(error_msg)
-        except Exception as e:
-            LOG.exception("   ✗ Lock acquisition failed: %s", e)
-            raise RuntimeError(f"Lock failed: {e}") from e
+            LOG.error("   ❌ Lock acquisition timeout (60s)")
+            raise RuntimeError("Lock acquisition timeout")
+        except RedisError as e:
+            LOG.error(f"   ❌ Redis error during lock acquisition: {e}")
+            raise RuntimeError(f"Lock failed due to Redis error: {e}") from e
         
         # ─────────────────────────────────────────────────────────────────────
         # TELEGRAM APPLICATION BUILD
         # ─────────────────────────────────────────────────────────────────────
-        
         LOG.info("\n📱 Building Telegram Application...")
         try:
             application = Application.builder().token(TELEGRAM_TOKEN).build()
             LOG.info("   ✓ Application builder created")
             
-            await asyncio.wait_for(application.initialize(), timeout=10.0)
+            await asyncio.wait_for(application.initialize(), timeout=15.0)
             LOG.info("   ✓ Application initialized")
             
+        except InvalidToken:
+            LOG.error("   ❌ TELEGRAM_TOKEN is invalid or rejected by Telegram API.")
+            raise RuntimeError("Invalid Telegram Token")
         except asyncio.TimeoutError:
-            error_msg = "❌ Application initialization timeout (10s)"
-            LOG.error(error_msg)
-            raise RuntimeError(error_msg)
-        except Exception as e:
-            LOG.exception("   ✗ Application build failed: %s", e)
-            raise RuntimeError(f"Application build failed: {e}") from e
+            LOG.error("   ❌ Application initialization timeout (15s)")
+            raise RuntimeError("Application initialization timeout")
+        except TelegramError as e:
+            LOG.exception("   ✗ Telegram API error during initialization.")
+            raise RuntimeError(f"Telegram initialization failed: {e}") from e
         
         # ─────────────────────────────────────────────────────────────────────
         # HANDLERS & ERROR HANDLING
         # ─────────────────────────────────────────────────────────────────────
-        
         LOG.info("\n🎛️  Adding handlers and error handler...")
         try:
             handlers = get_application_handlers()
@@ -1511,41 +1492,29 @@ async def run_bot():
             
             application.add_error_handler(global_error_handler)
             LOG.info("   ✓ Error handler registered")
-            
         except Exception as e:
-            LOG.exception("   ✗ Handler setup failed: %s", e)
+            LOG.exception("   ✗ Handler setup failed.")
             raise RuntimeError(f"Handler setup failed: {e}") from e
-        
-        # ─────────────────────────────────────────────────────────────────────
-        # OPTIONAL: WIPE CHANNEL SNAPSHOTS
-        # ─────────────────────────────────────────────────────────────────────
-        
-        if os.getenv("WIPE_CHANNEL_REDIS") == "1":
-            LOG.warning("\n🗑️  WIPE_CHANNEL_REDIS=1 detected — clearing channel snapshots")
-            try:
-                wipe_channel_snapshots_redis(dry_run=False)
-                LOG.info("   ✓ Channel snapshots cleared")
-            except Exception as e:
-                LOG.warning("   ⚠️  Wipe failed (non-fatal): %s", e)
         
         # ─────────────────────────────────────────────────────────────────────
         # WEBHOOK CLEANUP
         # ─────────────────────────────────────────────────────────────────────
-        
         LOG.info("\n🌐 Clearing any existing webhooks...")
         try:
-            await asyncio.wait_for(
-                application.bot.delete_webhook(drop_pending_updates=True),
-                timeout=10.0
-            )
-            LOG.info("   ✓ Webhook cleared")
+            if getattr(application, 'bot', None):
+                await asyncio.wait_for(
+                    application.bot.delete_webhook(drop_pending_updates=True),
+                    timeout=10.0
+                )
+                LOG.info("   ✓ Webhook cleared")
+        except asyncio.TimeoutError:
+            LOG.warning("   ⚠️  Webhook cleanup timed out, proceeding anyway.")
         except Exception as e:
-            LOG.debug("   ℹ️  Webhook cleanup (non-critical): %s", e)
+            LOG.debug(f"   ℹ️  Webhook cleanup (non-critical): {e}")
         
         # ─────────────────────────────────────────────────────────────────────
         # START APPLICATION & POLLING
         # ─────────────────────────────────────────────────────────────────────
-        
         LOG.info("\n🚀 Starting Telegram application...")
         try:
             await asyncio.wait_for(application.start(), timeout=10.0)
@@ -1561,13 +1530,15 @@ async def run_bot():
             )
             LOG.info("   ✓ Polling started")
             
+        except Conflict:
+            LOG.error("   ❌ Polling conflict: Another bot instance is currently polling.")
+            raise RuntimeError("Telegram polling conflict")
+        except NetworkError as e:
+            LOG.error(f"   ❌ Network error starting application: {e}")
+            raise RuntimeError(f"Network error starting bot: {e}") from e
         except asyncio.TimeoutError:
-            error_msg = "❌ Application startup timeout (10s)"
-            LOG.error(error_msg)
-            raise RuntimeError(error_msg)
-        except Exception as e:
-            LOG.exception("   ✗ Application startup failed: %s", e)
-            raise RuntimeError(f"Application startup failed: {e}") from e
+            LOG.error("   ❌ Application startup/polling timeout (10s)")
+            raise RuntimeError("Application startup timeout")
         
         LOG.info("\n" + "=" * 70)
         LOG.info("✅ BOT IS RUNNING - Listening for updates")
@@ -1576,7 +1547,6 @@ async def run_bot():
         # ─────────────────────────────────────────────────────────────────────
         # KEEP RUNNING FOREVER
         # ─────────────────────────────────────────────────────────────────────
-        
         LOG.info("⏳ Entering infinite wait loop (bot will keep running)...")
         await asyncio.Event().wait()
 
@@ -1587,64 +1557,58 @@ async def run_bot():
         LOG.error("\n" + "=" * 70)
         LOG.error("💥 FATAL ERROR IN BOT")
         LOG.error("=" * 70)
-        LOG.exception("Exception: %s", exc)
+        LOG.exception("Exception Details: %s", exc)
         LOG.error("=" * 70)
         raise  # Re-raise so run_bot_with_signal can catch it
 
     finally:
         LOG.info("\n🛑 CLEANING UP BOT RESOURCES...")
         
-        # Stop application
+        # Stop application (Using getattr to prevent AttributeError if crash happened before initialization)
         if application:
-            LOG.info("   → Stopping updater...")
-            try:
-                if application.updater:
-                    await asyncio.wait_for(
-                        application.updater.stop(),
-                        timeout=5.0
-                    )
+            if getattr(application, 'updater', None) and application.updater.running:
+                LOG.info("   → Stopping updater...")
+                try:
+                    await asyncio.wait_for(application.updater.stop(), timeout=5.0)
                     LOG.info("   ✓ Updater stopped")
-            except Exception as e:
-                LOG.warning("   ⚠️  Updater stop error: %s", e)
+                except Exception as e:
+                    LOG.warning(f"   ⚠️  Updater stop error: {e}")
             
-            LOG.info("   → Stopping application...")
-            try:
-                await asyncio.wait_for(
-                    application.stop(),
-                    timeout=5.0
-                )
-                LOG.info("   ✓ Application stopped")
-            except Exception as e:
-                LOG.warning("   ⚠️  Application stop error: %s", e)
+            if application.running:
+                LOG.info("   → Stopping application...")
+                try:
+                    await asyncio.wait_for(application.stop(), timeout=5.0)
+                    LOG.info("   ✓ Application stopped")
+                except Exception as e:
+                    LOG.warning(f"   ⚠️  Application stop error: {e}")
             
             LOG.info("   → Shutting down application...")
             try:
-                await asyncio.wait_for(
-                    application.shutdown(),
-                    timeout=5.0
-                )
-                LOG.info("   ✓ Application shutdown")
+                await asyncio.wait_for(application.shutdown(), timeout=5.0)
+                LOG.info("   ✓ Application shutdown complete")
             except Exception as e:
-                LOG.warning("   ⚠️  Application shutdown error: %s", e)
+                LOG.warning(f"   ⚠️  Application shutdown error: {e}")
 
         # Cancel renewal task
-        if renewal_task:
+        if renewal_task and not renewal_task.done():
             LOG.info("   → Cancelling lock renewal...")
             renewal_task.cancel()
             try:
                 await asyncio.wait_for(renewal_task, timeout=2.0)
             except (asyncio.CancelledError, asyncio.TimeoutError):
                 LOG.info("   ✓ Lock renewal cancelled")
+            except Exception as e:
+                LOG.warning(f"   ⚠️  Lock renewal cleanup issue: {e}")
 
-        # Release lock
-        if lock:
+        # Release lock safely
+        if lock and r:
             LOG.info("   → Releasing Redis lock...")
             try:
                 if await asyncio.wait_for(lock.owned(), timeout=2.0):
                     await asyncio.wait_for(lock.release(), timeout=2.0)
                     LOG.info("   ✓ Redis lock released")
             except Exception as e:
-                LOG.warning("   ⚠️  Lock release error: %s", e)
+                LOG.warning(f"   ⚠️  Lock release error: {e}")
 
         # Close Redis
         if r:
@@ -1653,7 +1617,7 @@ async def run_bot():
                 await asyncio.wait_for(r.aclose(), timeout=2.0)
                 LOG.info("   ✓ Redis connection closed")
             except Exception as e:
-                LOG.warning("   ⚠️  Redis close error: %s", e)
+                LOG.warning(f"   ⚠️  Redis close error: {e}")
 
         LOG.info("\n" + "=" * 70)
         LOG.info("🏁 Bot cleanup complete")
