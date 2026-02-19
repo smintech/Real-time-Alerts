@@ -449,14 +449,17 @@ async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news
     LOG.info(f"[MySchool Listing] 🔍 Starting extraction from {base_url}")
     LAST_MYSCHOOL_REQUEST = getattr(get_myschool_recent_articles, "_last_request", 0)
     current_time = time.time()
+    
     if current_time - LAST_MYSCHOOL_REQUEST < 5:
         wait_time = 5 - (current_time - LAST_MYSCHOOL_REQUEST)
         LOG.info(f"[MySchool Listing] ⏳ Cooling down for {wait_time:.1f}s...")
         await asyncio.sleep(wait_time)
+        
     get_myschool_recent_articles._last_request = time.time()
     root = base_url.rstrip("/").rsplit("/", 1)[0] if "/" in base_url else base_url
     urls_to_try = [base_url.rstrip("/")]
     LOG.info(f"[MySchool Listing] 📋 Will try {len(urls_to_try)} listing URLs")
+    
     for idx, listing_url in enumerate(urls_to_try, 1):
         LOG.info(f"[MySchool Listing] 🌐 [{idx}/{len(urls_to_try)}] Fetching: {listing_url}")
         try:
@@ -495,7 +498,7 @@ async def get_myschool_recent_articles(base_url: str = "https://myschool.ng/news
                     continue
                 seen.add(full_url)
                 ordered_urls.append(full_url)
-                if len(ordered_urls) >= 10:
+                if len(ordered_urls) >= 6:
                     break
             if ordered_urls:
                 LOG.info(f"[MySchool Listing] ✅ Extracted {len(ordered_urls)} article URLs from {listing_url}")
@@ -691,7 +694,7 @@ async def get_nuc_recent_articles(base_url: str = "https://www.nuc.edu.ng") -> L
 # -------------------------------------------------------------------
 # Site‑specific scrapers (return article dicts)
 # -------------------------------------------------------------------
-async def scrape_myschool_recent(base_url: str = "https://myschool.ng", max_articles: int = 10) -> List[Dict]:
+async def scrape_myschool_recent(base_url: str = "https://myschool.ng", max_articles: int = 6) -> List[Dict]:
     LOG.info(f"\n{'='*70}\n[MySchool Scraper] 🎯 STARTING - base_url={base_url}, max={max_articles}\n{'='*70}")
     try:
         article_urls = await get_myschool_recent_articles(base_url)
