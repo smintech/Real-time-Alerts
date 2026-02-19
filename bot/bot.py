@@ -675,15 +675,31 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
         except Exception:
             LOG.exception("Failed to load fuel snapshot")
 
-        # Recency check
+        # --- FIXED RECENCY CHECK (handles both string and datetime) ---
         if snapshot and snapshot.get("last_posted_at"):
             try:
-                last_run = datetime.fromisoformat(snapshot["last_posted_at"])
-                if (now - last_run).total_seconds() < 72_000:  # 20 hours
+                last_val = snapshot["last_posted_at"]
+                # Handle both string and datetime objects
+                if isinstance(last_val, datetime):
+                    last_dt = last_val
+                else:
+                    # Replace 'Z' with '+00:00' for fromisoformat compatibility
+                    last_val_str = last_val.replace("Z", "+00:00") if "Z" in last_val else last_val
+                    last_dt = datetime.fromisoformat(last_val_str)
+                
+                # Ensure timezone awareness (convert to UTC for comparison)
+                if last_dt.tzinfo is None:
+                    last_dt = last_dt.replace(tzinfo=timezone.utc)
+                else:
+                    last_dt = last_dt.astimezone(timezone.utc)
+                
+                now_utc = now.astimezone(timezone.utc)
+                hours_since = (now_utc - last_dt).total_seconds() / 3600
+                if hours_since < 20:
                     LOG.info("Fuel update already sent recently — skipping")
                     return
-            except Exception:
-                pass
+            except Exception as e:
+                LOG.warning(f"⚠️  Recency check failed for fuel: {e}")
 
     # Extract previous prices
     previous_petrol_raw = snapshot.get("last_posted_price") if snapshot else None
@@ -859,7 +875,6 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
             LOG.info("Fuel prices posted and snapshot saved")
         except Exception:
             LOG.exception("Failed to save fuel snapshot")
-
 # ═══════════════════════════════════════════════════════════════════════════
 # SCHOOL UPDATES POSTING
 # ═══════════════════════════════════════════════════════════════════════════
@@ -1095,13 +1110,28 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             else:
                 LOG.info(f"🚫 Duplicate check bypassed (force mode)")
 
-            # Recency check
+            # --- FIXED RECENCY CHECK (handles both string and datetime) ---
             if not force_mode:
                 try:
                     snapshot = await load_channel_snapshot(snapshot_key)
                     if snapshot and snapshot.get("last_posted_at"):
-                        last_dt = datetime.fromisoformat(snapshot["last_posted_at"])
-                        hours_since = (now - last_dt).total_seconds() / 3600
+                        last_val = snapshot["last_posted_at"]
+                        # Handle both string and datetime objects
+                        if isinstance(last_val, datetime):
+                            last_dt = last_val
+                        else:
+                            # Replace 'Z' with '+00:00' for fromisoformat compatibility
+                            last_val_str = last_val.replace("Z", "+00:00") if "Z" in last_val else last_val
+                            last_dt = datetime.fromisoformat(last_val_str)
+                        
+                        # Ensure timezone awareness
+                        if last_dt.tzinfo is None:
+                            last_dt = last_dt.replace(tzinfo=timezone.utc)
+                        else:
+                            last_dt = last_dt.astimezone(timezone.utc)
+                        
+                        now_utc = now.astimezone(timezone.utc)
+                        hours_since = (now_utc - last_dt).total_seconds() / 3600
                         if hours_since < 6:  # More frequent updates allowed (6 hours)
                             LOG.info(f"⏭️  Too recent ({hours_since:.1f}h), skipping")
                             skipped_count += 1
@@ -1276,12 +1306,9 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     LOG.info(f"🏁 FINAL RESULT: {posted_count}/{len(to_post)} sources posted")
     LOG.info(f"{'=' * 70}\n")
 
-
-
 # ═══════════════════════════════════════════════════════════════════════════
 # TRIAL MANAGEMENT
 # ═══════════════════════════════════════════════════════════════════════════
-
 async def check_trials(context: ContextTypes.DEFAULT_TYPE):
     """Validate trials and downgrade users whose trial expired."""
     bot = context.bot
