@@ -57,6 +57,16 @@ def _convert_decimals(obj):
         return float(obj)
     return obj
 
+def _convert_datetimes_to_str(obj):
+    """Recursively convert datetime objects to ISO strings in dict/list."""
+    if isinstance(obj, dict):
+        return {k: _convert_datetimes_to_str(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [_convert_datetimes_to_str(i) for i in obj]
+    elif isinstance(obj, datetime):
+        return obj.isoformat()
+    return obj
+
 # ═══════════════════════════════════════════════════════════════════════════
 # REDIS CONNECTION
 # ═══════════════════════════════════════════════════════════════════════════
@@ -480,6 +490,7 @@ def _db_get_channel_snapshot(ref: str) -> Optional[Dict]:
         if row.get("expires_at") and row["expires_at"] <= datetime.now(timezone.utc):
             return None
         
+        # Convert Decimal to float
         return _convert_decimals(dict(row))
     finally:
         return_pg_connection(conn)
@@ -662,16 +673,17 @@ async def load_channel_snapshot(ref: str) -> Optional[Dict]:
         try:
             snapshot = _db_get_channel_snapshot(ref)
             if snapshot:
-                # Re-populate Redis cache for next 24h
-                # Keep original timestamps (not treated as new)
+                # Convert any datetime objects to strings for JSON serialization
+                snapshot_str = _convert_datetimes_to_str(snapshot)
                 try:
                     r = get_redis()
                     snap_key = _channel_snap_key(ref)
-                    r.set(snap_key, json.dumps(snapshot), ex=REDIS_TTL_SECONDS)
+                    r.set(snap_key, json.dumps(snapshot_str), ex=REDIS_TTL_SECONDS)
                     logger.info("Restored channel snapshot to Redis from DB: %s", ref)
                 except Exception:
                     logger.exception("Failed to restore to Redis: %s", ref)
-            return snapshot
+                return snapshot_str   # return the stringified version for caller
+            return None
         except Exception:
             logger.exception("DB channel read failed %s", ref)
             return None
@@ -744,9 +756,12 @@ async def save_channel_snapshot(
         try:
             r = get_redis()
             
+            # Convert any datetime to string before JSON dump
+            snap_for_redis = _convert_datetimes_to_str(full_snapshot)
+            
             # 1. Full snapshot (always refresh)
             snap_key = _channel_snap_key(ref)
-            r.set(snap_key, json.dumps(full_snapshot), ex=ttl_seconds)
+            r.set(snap_key, json.dumps(snap_for_redis), ex=ttl_seconds)
             
             # 2. Content hash for dedup (only if new/different)
             if is_new_or_different:
