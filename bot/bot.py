@@ -1096,7 +1096,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                     is_duplicate = await check_duplicate_post(
                         ref=snapshot_key,
                         content_hash=content_hash,
-                        lookback_hours=24
+                        lookback_hours=48
                     )
                     if is_duplicate:
                         LOG.info(f"⏭️  Duplicate for {source_name}, skipping")
