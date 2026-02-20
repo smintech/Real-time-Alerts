@@ -486,7 +486,7 @@ We welcome contributions! Please:
 
 ## 📄 License
 
-This project is licensed under the NON-COMMERCIAL license — see `[📄 License](LICENSE)` file for details.
+This project is licensed under the NON-COMMERCIAL license — see `[📄 License](https://github.com/smintech/Real-time-Alerts/blob/main/LICENSE)` file for details.
 
 -----
 
