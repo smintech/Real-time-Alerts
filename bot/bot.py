@@ -1078,8 +1078,10 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 content_hash = compute_content_hash({
                     "title": source_name,
                     "item_count": len(items),
-                    "items": [{"title": item.get('title'), "date": item.get('date')} 
+                    "raw": {
+                        "items": [{"title": item.get('title'), "snippet": item.get('snippet')} 
                              for item in items[:3]]
+                    }
                 })
             except Exception as hash_err:
                 LOG.error(f"❌ Hash computation failed for {source_name}: {hash_err}")
