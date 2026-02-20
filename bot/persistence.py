@@ -1,3 +1,6 @@
+
+# Creating the fixed persistence.py file with all three issues resolved
+
 import os
 import json
 import logging
@@ -124,6 +127,7 @@ def get_pg_connection():
     pool_obj = get_pg_pool()
     
     for attempt in range(3):
+        conn = None
         try:
             conn = pool_obj.getconn()
             # Test connection
@@ -133,12 +137,33 @@ def get_pg_connection():
             conn.commit()
             return conn
         except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            # CRITICAL FIX: Invalidate the bad connection before retrying
+            if conn is not None:
+                try:
+                    pool_obj.putconn(conn, close=True)  # Force close the broken connection
+                    logger.debug(f"Closed broken connection on attempt {attempt+1}")
+                except Exception as close_err:
+                    logger.warning(f"Error closing broken connection: {close_err}")
+                    try:
+                        conn.close()
+                    except:
+                        pass
+            
             logger.warning(f"PostgreSQL connection attempt {attempt+1} failed: {e}")
             if attempt < 2:
                 time.sleep(1)
             else:
                 raise
         except Exception as e:
+            # For non-connection errors, still clean up properly
+            if conn is not None:
+                try:
+                    pool_obj.putconn(conn, close=True)
+                except:
+                    try:
+                        conn.close()
+                    except:
+                        pass
             logger.error(f"Unexpected PostgreSQL error: {e}")
             raise
 
@@ -146,10 +171,22 @@ def return_pg_connection(conn):
     """Return connection to pool with proper cleanup."""
     if conn:
         try:
+            # Check if connection is still valid before returning
+            if conn.closed:
+                logger.debug("Connection already closed, not returning to pool")
+                return
+            
             # Rollback any pending transaction
             conn.rollback()
             pool_obj = get_pg_pool()
             pool_obj.putconn(conn)
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            # Connection is broken, close it
+            logger.warning(f"Connection broken on return, closing: {e}")
+            try:
+                conn.close()
+            except:
+                pass
         except Exception as e:
             logger.warning(f"Error returning connection to pool: {e}")
             try:
@@ -196,13 +233,28 @@ def compute_content_hash(data: Dict[str, Any]) -> str:
         str(data.get("item_count", "")),
     ]
     
-    # Add raw data if available
+    # FIXED: Handle both direct "items" key and "raw" nested structure
+    items = None
+    
+    # Check for items in raw data first (original behavior)
     raw = data.get("raw", {})
-    if isinstance(raw, dict):
-        # For school news, include first snippet
-        if "items" in raw and isinstance(raw["items"], list) and raw["items"]:
-            content_parts.append(str(raw["items"][0].get("title", "")))
-            content_parts.append(str(raw["items"][0].get("snippet", ""))[:100])
+    if isinstance(raw, dict) and "items" in raw and isinstance(raw["items"], list") and raw["items"]:
+        items = raw["items"]
+    
+    # Also check for items at top level (new behavior)
+    if items is None and "items" in data and isinstance(data["items"], list) and data["items"]:
+        items = data["items"]
+    
+    # Add items to hash if found
+    if items:
+        # Include first 3 items for stable hash
+        for i, item in enumerate(items[:3]):
+            if isinstance(item, dict):
+                content_parts.append(str(item.get("title", "")))
+                content_parts.append(str(item.get("date", "")))
+                content_parts.append(str(item.get("snippet", ""))[:100])
+            else:
+                content_parts.append(str(item))
     
     content_str = "|".join(content_parts)
     return hashlib.sha256(content_str.encode()).hexdigest()[:16]
