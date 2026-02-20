@@ -1,4 +1,4 @@
-# Real-time-Alerts A🤖 Cost Intelligence & News Aggregator Bot
+# Real-time-Alerts 🤖 Cost Intelligence & News Aggregator Bot
 
 **Real-time price tracking, energy cost monitoring, and curated education news for Nigeria**
 
@@ -12,17 +12,22 @@ This is an intelligent automation system that combines **price intelligence**, *
 
 Nigerians face three critical information challenges:
 
-1. **Price Chaos** 🛍️
+#### 1. **Price Chaos** 🛍️
+
 - Products are scattered across multiple e-commerce platforms
 - Prices change constantly with no unified visibility
 - Consumers waste time comparing prices manually
 - Missing out on good deals because there’s no centralized alert system
-1. **Energy Cost Blindness** ⛽🔥
+
+#### 2. **Energy Cost Blindness** ⛽🔥
+
 - Fuel prices fluctuate unpredictably
 - LPG (cooking gas) costs impact household budgets
 - No real-time tracking of market movements
 - People can’t plan fuel purchases or budget effectively
-1. **Information Fragmentation** 📚
+
+#### 3. **Information Fragmentation** 📚
+
 - School news scattered across multiple websites
 - Students miss important announcements about admissions, exams, results
 - Parents can’t track institutional updates efficiently
@@ -66,7 +71,7 @@ iPhone 15 Pro Max
    Jumia: ₦875,000 (+₦25,000)
   
 
-💾 Save  ₦850,000 on the best price!
+💾 Save ₦850,000 on the best price!
 
 [View on Konga]
 ```
@@ -117,7 +122,6 @@ Current Average: ₦650/litre
 🔴 Last 7 days: +₦75/litre
 
 Source: FuelPriceWatch.com
-
 ```
 
 -----
@@ -376,13 +380,13 @@ Recent releases focused on **modular architecture**, **reliability**, and **scal
 ```
 bot/
 ├── browser/              # Browser & HTTP fetching
-├── scrapers/         
-├── persistent/  # Data structures
-├── settings.py/           # Configuration parsing
-├── utils/  # URL, utilities
-├── news _scrapers #news scrapers
-├── persistent/            # Data structures
-└── scrapers/  # E-commerce, energy,
+├── scrapers/             # Scraping modules
+├── persistent/           # Data structures
+├── settings.py/          # Configuration parsing
+├── utils/                # URL, utilities
+├── news_scrapers/        # News scrapers
+├── persistent/           # Data structures
+└── scrapers/             # E-commerce, energy
 ```
 
 ### Benefits
@@ -398,7 +402,7 @@ bot/
 ## 📊 Performance Metrics
 
 - **Price Scraping** — 1-30 seconds per site (concurrent)
-- **Fuel Price Update** — <20 second (parallel scraping)
+- **Fuel Price Update** — <20 seconds (parallel scraping)
 - **News Aggregation** — 1-50 seconds (all 3 sources simultaneously)
 - **Alert Distribution** — <100ms per Telegram message
 - **Duplicate Detection** — <50ms (Redis lookup)
@@ -433,7 +437,7 @@ bot/
 - Realistic request patterns
 - Cloudflare bypass strategies
 - Headless browser automation
--Request timing
+- Request timing
 
 -----
 
@@ -451,14 +455,13 @@ python -c "print('Chat ID correct: {your_id}')"
 
 ### Scraper Blocked
 
-**Check for Cloudflare blocks**
-**Check for structure changes**
-
+- Check for Cloudflare blocks
+- Check for structure changes
 
 ### Missing News Articles
 
-**Check source availability**
-**Verify selectors matching**
+- Check source availability
+- Verify selectors matching
 
 -----
 
@@ -470,7 +473,9 @@ We welcome contributions! Please:
 1. Create a feature branch (`git checkout -b feature/amazing-feature`)
 1. Commit changes (`git commit -m 'Add amazing feature'`)
 1. Push to branch (`git push origin feature/amazing-feature`)
-1. Open an issue before submitting a Pull Request. 
+1. Open an issue before submitting a Pull Request
+
+-----
 
 ## 👤 Author
 
@@ -481,7 +486,7 @@ We welcome contributions! Please:
 
 ## 📄 License
 
-This project is licensed under the NON-COMMERCIAL— see <LICENSE> file for details.
+This project is licensed under the NON-COMMERCIAL license — see `LICENSE` file for details.
 
 -----
 
