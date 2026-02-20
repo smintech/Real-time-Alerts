@@ -1080,7 +1080,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                     "item_count": len(items),
                     "raw": {
                         "items": [{"title": item.get('title'), "snippet": item.get('snippet')} 
-                             for item in items[:3]]
+                             for item in items[:5]]
                     }
                 })
             except Exception as hash_err:
