@@ -451,16 +451,14 @@ python -c "print('Chat ID correct: {your_id}')"
 
 ### Scraper Blocked
 
-Check for Cloudflare blocks
-Check for structure changes
+**Check for Cloudflare blocks**
+**Check for structure changes**
 
 
 ### Missing News Articles
 
-Check source availability
-Verify selectors matching
-
-```
+**Check source availability**
+**Verify selectors matching**
 
 -----
 
