@@ -235,7 +235,7 @@ def compute_content_hash(data: Dict[str, Any]) -> str:
     
     # Check for items in raw data first (original behavior)
     raw = data.get("raw", {})
-    if isinstance(raw, dict) and "items" in raw and isinstance(raw["items"], list") and raw["items"]:
+    if isinstance(raw, dict) and "items" in raw and isinstance(raw["items"], list) and raw["items"]:
         items = raw["items"]
     
     # Also check for items at top level (new behavior)
