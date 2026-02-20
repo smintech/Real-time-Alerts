@@ -495,7 +495,6 @@ This project is licensed under the NON-COMMERCIAL license — see [📄 License]
 - [python-telegram-bot](https://github.com/python-telegram-bot/python-telegram-bot) — Telegram integration
 - [Playwright](https://playwright.dev/) — Browser automation
 - [Beautiful Soup](https://www.crummy.com/software/BeautifulSoup/) — HTML parsing
-- The Nigerian developer community for feedback and ideas
 
 -----
 
