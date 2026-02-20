@@ -1,6 +1,3 @@
-
-# Creating the fixed persistence.py file with all three issues resolved
-
 import os
 import json
 import logging
@@ -251,7 +248,6 @@ def compute_content_hash(data: Dict[str, Any]) -> str:
         for i, item in enumerate(items[:3]):
             if isinstance(item, dict):
                 content_parts.append(str(item.get("title", "")))
-                content_parts.append(str(item.get("date", "")))
                 content_parts.append(str(item.get("snippet", ""))[:100])
             else:
                 content_parts.append(str(item))
