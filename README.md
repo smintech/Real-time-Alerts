@@ -1,4 +1,4 @@
-# Real-time-Alerts A 🤖 Cost Intelligence & News Aggregator Bot
+# Real-time-Alerts A🤖 Cost Intelligence & News Aggregator Bot
 
 **Real-time price tracking, energy cost monitoring, and curated education news for Nigeria**
 
@@ -211,8 +211,8 @@ Related Stories:
 └─────────────────────────────────────────────────────────┘
                           ↓
 ┌─────────────────────────────────────────────────────────┐
-│         Persistence Layer                               │
-│  • Redis Cache  • PostgreSQL Database  • File Storage   │
+│                  Persistence Layer                      │
+│         • Redis Cache       • PostgreSQL Database       │
 └─────────────────────────────────────────────────────────┘
 ```
 
@@ -451,14 +451,14 @@ python -c "print('Chat ID correct: {your_id}')"
 
 ### Scraper Blocked
 
-# Check for Cloudflare blocks
-# Check for structure changes
+Check for Cloudflare blocks
+Check for structure changes
 
 
 ### Missing News Articles
 
-# Check source availability
-# Verify selectors matching
+Check source availability
+Verify selectors matching
 
 ```
 
