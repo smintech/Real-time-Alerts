@@ -13,6 +13,7 @@ import redis  # pip install redis
 from typing import Optional, Dict, List, Any
 from decimal import Decimal  # For handling Postgres NUMERIC
 import re
+import json
 from Utils.config import DB_URL
 from Utils.utils import normalize_product_key
 
