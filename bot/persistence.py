@@ -12,7 +12,7 @@ import hashlib
 import redis  # pip install redis
 from typing import Optional, Dict, List, Any
 from decimal import Decimal  # For handling Postgres NUMERIC
-
+import re
 from Utils.config import DB_URL
 from Utils.utils import normalize_product_key
 
@@ -219,42 +219,56 @@ def _product_sites_set_key(product_key: str) -> str:
     """Redis set key for all sites selling this product."""
     return f"{PRODUCT_SITE_PREFIX}{product_key}:sites"
 
+_WS_RE = re.compile(r'\s+')
+
+def _norm_text(s: Any, max_len: int = None) -> str:
+    if s is None:
+        return ""
+    s = str(s)
+    s = _WS_RE.sub(' ', s).strip().lower()
+    if max_len:
+        return s[:max_len]
+    return s
+
 def compute_content_hash(data: Dict[str, Any]) -> str:
     """
-    Generate a stable hash for deduplication.
-    Uses title, price, and key raw data fields.
+    Stable, deterministic hash for deduplication:
+    - Normalizes whitespace and case
+    - Pulls title and item_count
+    - Collects up to N items with title/link/snippet, sorts them, canonicalizes with json
+    - Returns first 32 hex chars of sha256 (longer than 16 to reduce collisions)
     """
-    content_parts = [
-        str(data.get("title", "")),
-        str(data.get("current_price", "")),
-        str(data.get("item_count", "")),
-    ]
-    
-    # FIXED: Handle both direct "items" key and "raw" nested structure
+    parts = []
+    parts.append(_norm_text(data.get("title", "")))
+    parts.append(_norm_text(data.get("item_count", "")))
+
+    # find items same as before (raw preference, then top-level)
     items = None
-    
-    # Check for items in raw data first (original behavior)
     raw = data.get("raw", {})
     if isinstance(raw, dict) and "items" in raw and isinstance(raw["items"], list) and raw["items"]:
         items = raw["items"]
-    
-    # Also check for items at top level (new behavior)
     if items is None and "items" in data and isinstance(data["items"], list) and data["items"]:
         items = data["items"]
-    
-    # Add items to hash if found
-    if items:
-        # Include first 3 items for stable hash
-        for i, item in enumerate(items[:3]):
-            if isinstance(item, dict):
-                content_parts.append(str(item.get("title", "")))
-                content_parts.append(str(item.get("snippet", ""))[:100])
-            else:
-                content_parts.append(str(item))
-    
-    content_str = "|".join(content_parts)
-    return hashlib.sha256(content_str.encode()).hexdigest()[:16]
 
+    if items:
+        norm_items = []
+        for item in items:
+            if isinstance(item, dict):
+                norm_items.append({
+                    "title": _norm_text(item.get("title", "")),
+                    "link": (item.get("link") or item.get("url") or "").strip(),
+                    "snippet": _norm_text(item.get("snippet", ""), max_len=300)
+                })
+            else:
+                norm_items.append({"title": _norm_text(item)})
+        # stable ordering: sort by title then link
+        norm_items.sort(key=lambda x: (x.get("title", ""), x.get("link", "")))
+        # Keep a deterministic number of items (configurable if you want)
+        parts.append(json.dumps(norm_items[:5], sort_keys=True, ensure_ascii=False))
+
+    content_str = "|".join(parts)
+    # full sha256, but keep first 32 hex chars to be safe (store whole hex if you want)
+    return hashlib.sha256(content_str.encode("utf-8")).hexdigest()[:32]
 # ═══════════════════════════════════════════════════════════════════════════
 # DATABASE SCHEMA INITIALIZATION
 # ═══════════════════════════════════════════════════════════════════════════
@@ -871,48 +885,80 @@ async def check_duplicate_post(
 ) -> bool:
     """
     Check if this content was recently posted.
-    
+
     Fast path: Redis dedup key + sorted set lookup
     Fallback: Postgres history table
-    
+
     Returns True if duplicate, False if unique.
     """
     loop = asyncio.get_event_loop()
-    
+
+    logger.debug("Starting duplicate check: ref=%s hash=%s lookback=%sh", ref, content_hash[:12], lookback_hours)
+
     # Fast path: Check Redis dedup key
     def _check_redis():
         try:
             r = get_redis()
-            
+            if not r:
+                logger.warning("Redis client not available")
+                return False
+
             # Check dedup key
             dedup_key = _channel_dedup_key(content_hash)
-            if r.exists(dedup_key):
+            try:
+                exists = r.exists(dedup_key)
+            except Exception:
+                # defensive guard if redis client behaves unexpectedly
+                exists = False
+
+            if exists:
+                logger.debug("Found dedup key in Redis: %s", dedup_key)
                 return True
-            
+
             # Check recent posts sorted set
             recent_key = _channel_recent_key(ref)
             cutoff = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).timestamp()
-            recent_hashes = r.zrangebyscore(recent_key, cutoff, '+inf')
-            
-            return content_hash in recent_hashes
-            
+            recent_hashes = r.zrangebyscore(recent_key, cutoff, '+inf') or []
+
+            # Normalize bytes -> str for safe comparison
+            normalized = set()
+            for h in recent_hashes:
+                if isinstance(h, bytes):
+                    try:
+                        normalized.add(h.decode('utf-8'))
+                    except Exception:
+                        normalized.add(h.decode('utf-8', 'ignore'))
+                else:
+                    normalized.add(str(h))
+
+            logger.debug("Redis recent set (%s) size=%d", recent_key, len(normalized))
+            if content_hash in normalized:
+                logger.debug("Found matching hash in Redis recent set for %s", ref)
+                return True
+
+            return False
+
         except Exception:
             logger.exception("Redis dedup check failed")
             return False
-    
+
     try:
         is_dup = await loop.run_in_executor(None, _check_redis)
         if is_dup:
-            logger.info("Duplicate detected in Redis: %s (hash=%s)", ref, content_hash[:8])
+            logger.info("Duplicate detected in Redis: %s (hash=%s)", ref, content_hash[:12])
             return True
+        logger.debug("Redis fast-path did not find duplicate for %s", ref)
     except Exception:
-        pass
-    
+        logger.exception("Exception while running Redis check in executor; falling back to DB")
+
     # Fallback: Check Postgres
     try:
+        logger.debug("Running DB fallback duplicate check for %s", ref)
         is_dup = await loop.run_in_executor(None, _db_check_duplicate_content, content_hash, lookback_hours)
         if is_dup:
-            logger.info("Duplicate detected in Postgres: %s (hash=%s)", ref, content_hash[:8])
+            logger.info("Duplicate detected in Postgres: %s (hash=%s)", ref, content_hash[:12])
+        else:
+            logger.debug("No duplicate found in Postgres for %s", ref)
         return is_dup
     except Exception:
         logger.exception("DB dedup check failed")
@@ -922,10 +968,19 @@ async def mark_as_posted(ref: str, snapshot: dict):
     """
     Mark snapshot as posted by updating last_posted_at and last_posted_price.
     """
+    logger.debug("Marking as posted: ref=%s snapshot_keys=%s", ref, list(snapshot.keys()))
+
     snapshot["last_posted_at"] = datetime.now(timezone.utc).isoformat()
     snapshot["last_posted_price"] = snapshot.get("current_price")
-    
-    await save_channel_snapshot(ref, snapshot)
+
+    try:
+        logger.info("Saving snapshot for %s (hash=%s)", ref, str(snapshot.get("content_hash", ""))[:12])
+        await save_channel_snapshot(ref, snapshot)
+        logger.info("Snapshot saved successfully for %s", ref)
+    except Exception:
+        logger.exception("Failed to save snapshot for %s", ref)
+        # preserve previous propagation behavior by re-raising
+        raise
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CLEANUP OPERATIONS
