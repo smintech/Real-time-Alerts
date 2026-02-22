@@ -1063,9 +1063,10 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
 
             LOG.info(f"📝 Message built: {len(report_text)} chars")
 
-            # ========== UPDATED HASH COMPUTATION (snippet removed) ==========
+            # ========== UPDATED HASH COMPUTATION WITH DETAILED LOGGING ==========
             try:
-                content_hash = compute_content_hash({
+                # Prepare hash input data
+                hash_input_data = {
                     "title": source_name,
                     "item_count": len(items),
                     "raw": {
@@ -1077,10 +1078,26 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                             for item in items[:5]
                         ]
                     }
-                })
+                }
+                
+                # Log hash input data for debugging
+                LOG.info(f"🔐 HASH INPUT DATA for {source_name}:")
+                LOG.info(f"  - Source: {source_name}")
+                LOG.info(f"  - Item count: {len(items)}")
+                LOG.info(f"  - Items being hashed (first 5):")
+                for i, item_data in enumerate(hash_input_data["raw"]["items"], 1):
+                    LOG.info(f"    {i}. Title: {item_data.get('title', 'N/A')[:80]}")
+                    LOG.info(f"       Link: {item_data.get('link', 'N/A')[:80]}")
+                
+                # Compute hash
+                content_hash = compute_content_hash(hash_input_data)
+                LOG.info(f"✅ Generated hash for {source_name}: {content_hash}")
+                
             except Exception as hash_err:
                 LOG.error(f"❌ Hash computation failed for {source_name}: {hash_err}")
+                LOG.exception(f"Hash error traceback for {source_name}:")
                 content_hash = "fallback_hash_" + str(time.time())
+                LOG.warning(f"⚠️  Using fallback hash: {content_hash}")
             # ===============================================================
 
             snapshot_key = f"school_{_slugify(source_name)}"
