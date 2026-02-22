@@ -235,15 +235,14 @@ def compute_content_hash(data: Dict[str, Any]) -> str:
     """
     Stable, deterministic hash for deduplication:
     - Normalizes whitespace and case
-    - Pulls title and item_count
-    - Collects up to N items with title/link/snippet, sorts them, canonicalizes with json
-    - Returns first 32 hex chars of sha256 (longer than 16 to reduce collisions)
+    - Uses title, item count, and up to 5 items (title + link)
+    - Items are sorted by title and link for consistency
+    - Returns first 32 hex chars of sha256
     """
     parts = []
     parts.append(_norm_text(data.get("title", "")))
     parts.append(_norm_text(data.get("item_count", "")))
 
-    # find items same as before (raw preference, then top-level)
     items = None
     raw = data.get("raw", {})
     if isinstance(raw, dict) and "items" in raw and isinstance(raw["items"], list) and raw["items"]:
@@ -255,20 +254,19 @@ def compute_content_hash(data: Dict[str, Any]) -> str:
         norm_items = []
         for item in items:
             if isinstance(item, dict):
+                # Only use title and link – snippet excluded for stability
                 norm_items.append({
                     "title": _norm_text(item.get("title", "")),
-                    "link": (item.get("link") or item.get("url") or "").strip(),
-                    "snippet": _norm_text(item.get("snippet", ""), max_len=300)
+                    "link": (item.get("link") or item.get("url") or "").strip()
                 })
             else:
                 norm_items.append({"title": _norm_text(item)})
-        # stable ordering: sort by title then link
+        # Stable ordering: sort by title then link
         norm_items.sort(key=lambda x: (x.get("title", ""), x.get("link", "")))
-        # Keep a deterministic number of items (configurable if you want)
+        # Keep first 5 items
         parts.append(json.dumps(norm_items[:5], sort_keys=True, ensure_ascii=False))
 
     content_str = "|".join(parts)
-    # full sha256, but keep first 32 hex chars to be safe (store whole hex if you want)
     return hashlib.sha256(content_str.encode("utf-8")).hexdigest()[:32]
 # ═══════════════════════════════════════════════════════════════════════════
 # DATABASE SCHEMA INITIALIZATION
