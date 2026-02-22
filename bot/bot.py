@@ -887,13 +887,13 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     LOG.info("=" * 70)
     LOG.info("🏫 SCHOOL UPDATES JOB STARTED")
     LOG.info("=" * 70)
-    
+
     # Debug configuration state
     force_mode = TEST_MODE or SCHOOL_FORCE_POST
     LOG.info(f"Configuration: TEST_MODE={TEST_MODE}, SCHOOL_FORCE_POST={SCHOOL_FORCE_POST}")
     LOG.info(f"Force Mode: {'🔴 ENABLED (bypassing checks)' if force_mode else '⚪ DISABLED'}")
     LOG.info(f"AUTO_POST_TO_CHANNEL={AUTO_POST_TO_CHANNEL}, CHANNEL_DEAL_CHAT_ID={CHANNEL_DEAL_CHAT_ID}")
-    
+
     if not AUTO_POST_TO_CHANNEL or not CHANNEL_DEAL_CHAT_ID:
         LOG.error("❌ Channel posting disabled or CHANNEL_DEAL_CHAT_ID missing — aborting")
         return
@@ -902,19 +902,19 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     send_delay = 15
     eligible_candidates = []
     now = datetime.now(TIMEZONE)
-    
+
     LOG.info(f"📋 DEFAULT_SCHOOL_SOURCES loaded: {len(DEFAULT_SCHOOL_SOURCES)} source(s)")
-    
+
     # Convert DEFAULT_SCHOOL_SOURCES to site_configs format for the unified scraper
     site_configs = {}
     for src_name, urls in DEFAULT_SCHOOL_SOURCES.items():
         if not urls:
             LOG.warning(f"⚠️  No URLs for {src_name}, skipping")
             continue
-            
+
         base_url = urls[0]  # Take the first URL as base URL
         domain = get_domain_from_url(base_url)
-        
+
         # Determine site type based on domain
         if 'myschool.ng' in domain:
             site_type = 'myschool'
@@ -924,19 +924,19 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             site_type = 'nuc'
         else:
             site_type = 'generic'
-        
+
         site_configs[src_name] = {
             'base_url': base_url,
             'type': site_type,
             'max_articles': 10  # Default max articles per source
         }
-        
+
         LOG.info(f"  📌 {src_name}: {base_url[:60]}... ({site_type})")
-    
+
     if not site_configs:
         LOG.error("❌ No valid site configurations — aborting")
         return
-    
+
     # ═══════════════════════════════════════════════════════════════════════
     # PROCESSING LOOP
     # ═══════════════════════════════════════════════════════════════════════
@@ -945,64 +945,62 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     skipped_count = 0
     source_list = list(site_configs.items())
     total_sources = len(source_list)
-    
+
     LOG.info(f"🔄 Beginning processing loop for {total_sources} sources...")
-    
+
     idx = 0
     while idx < total_sources:
         source_name, config = source_list[idx]
         processed_count += 1
-        
+
         LOG.info(f"\n{'─' * 70}")
         LOG.info(f"🔍 [{processed_count}/{total_sources}] Processing: {source_name}")
         LOG.info(f"{'─' * 70}")
-        
-        # Source processing
+
         source_eligible = None
         try:
             LOG.info(f"🌐 Calling scrape_school_news for {source_name}...")
-            
-            # Create site config for this specific source
-            single_site_config = {
-                source_name: config
-            }
-            
+
+            single_site_config = {source_name: config}
+
             current_site_type = config.get('type', 'generic')
             if current_site_type == 'myschool':
-                timeout_seconds = 800.0  # 10 minutes for MySchool (Cloudflare heavy)
+                timeout_seconds = 800.0
                 LOG.info(f"⏰ Using extended timeout for MySchool: {timeout_seconds}s")
             else:
-                timeout_seconds = 250.0  # Standard timeout for other sites
+                timeout_seconds = 250.0
                 LOG.info(f"⏰ Using standard timeout: {timeout_seconds}s")
-                
+
             items = await asyncio.wait_for(
                 scrape_school_news(
-                    single_site_config, 
-                    fetch_full_content=False, 
+                    single_site_config,
+                    fetch_full_content=False,
                     max_articles=config.get('max_articles', 10)
                 ),
                 timeout=timeout_seconds
             )
-            
+
             item_count = len(items) if items else 0
             LOG.info(f"📊 Scrape returned {item_count} items for {source_name}")
-            
+
             if not items:
                 LOG.info(f"⏭️  No items for {source_name}, skipping")
                 skipped_count += 1
                 idx += 1
                 continue
-            
-            # Build message with better formatting
-            LOG.info(f"📝 Building message for {source_name}...")
-            
-            # Sort items by date (newest first)
+
+            # ========== STABLE SORTING (NEW) ==========
+            # Sort items deterministically: by date descending, then by title ascending
             items.sort(key=lambda x: (
-                x.get('date_obj') is None,
-                -(x.get('date_obj', datetime.now()).timestamp() if x.get('date_obj') else 0)
+                x.get('date_obj') is None,                     # None dates last
+                -x.get('date_obj', datetime.min).timestamp() if x.get('date_obj') else 0,
+                x.get('title', '').lower()                      # tie‑breaker
             ))
-            
+            # ===========================================
+
             # Build formatted message
+            LOG.info(f"📝 Building message for {source_name}...")
+
             report_lines = [
                 f"<b>📢 {source_name}</b>",
                 f"<i>📅 Updated: {now.strftime('%b %d, %Y — %H:%M WAT')}</i>",
@@ -1017,31 +1015,25 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                     date = item.get('date', '')
                     snippet = item.get('snippet', '').strip()
                     link = item.get('link', '')
-                    
-                    # Format item with number and direct link
+
                     item_line = f"<b>{i}. {title}</b>"
                     if date:
                         item_line += f" — <i>{date}</i>"
                     report_lines.append(item_line)
-                    
-                    # Add snippet if available
+
                     if snippet and len(snippet) > 30:
-                        # Clean up snippet
                         snippet = snippet.replace("Read More", "").replace("Click to read", "").strip()
                         if len(snippet) > 150:
                             snippet = snippet[:147] + "..."
                         report_lines.append(f"   {snippet}")
-                    
-                    # Add direct link - ALWAYS include this
+
                     report_lines.append(f"   🔗 <a href=\"{link}\">Read full article →</a>")
-                    
-                    report_lines.append("")  # Empty line between items
-                    
+                    report_lines.append("")
+
                 except Exception as item_err:
                     LOG.error(f"⚠️  Error processing item in {source_name}: {item_err}")
                     continue
 
-            # Add footer with source link
             source_url = config.get('base_url', '')
             report_lines.extend([
                 f"<i>💡 Tip: Click any link above to read the full article</i>",
@@ -1052,14 +1044,12 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             ])
 
             report_text = "\n".join(report_lines)
-            
-            # Length check
+
+            # Truncate if too long
             original_len = len(report_text)
             if original_len > 4000:
                 LOG.warning(f"⚠️  Message too long ({original_len}), truncating...")
-                # Keep header and first few items
                 lines = report_text.split('\n')
-                # Find where to cut (keep header and first 4 items)
                 item_count = 0
                 for i, line in enumerate(lines):
                     if re.match(r'^\d+\.\s+', line):
@@ -1067,29 +1057,35 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                         if item_count >= 5:
                             lines = lines[:i]
                             lines.append("\n<i>(Additional items truncated due to message length limit)</i>")
-                            lines.extend(report_lines[-4:])  # Keep footer
+                            lines.extend(report_lines[-4:])
                             break
                 report_text = "\n".join(lines)
-            
+
             LOG.info(f"📝 Message built: {len(report_text)} chars")
 
-            # Compute hash
+            # ========== UPDATED HASH COMPUTATION (snippet removed) ==========
             try:
                 content_hash = compute_content_hash({
                     "title": source_name,
                     "item_count": len(items),
                     "raw": {
-                        "items": [{"title": item.get('title'), "snippet": item.get('snippet')} 
-                             for item in items[:5]]
+                        "items": [
+                            {
+                                "title": item.get('title'),
+                                "link": item.get('link') or item.get('url', '')
+                            }
+                            for item in items[:5]
+                        ]
                     }
                 })
             except Exception as hash_err:
                 LOG.error(f"❌ Hash computation failed for {source_name}: {hash_err}")
                 content_hash = "fallback_hash_" + str(time.time())
-            
+            # ===============================================================
+
             snapshot_key = f"school_{_slugify(source_name)}"
             LOG.info(f"🔑 Snapshot key: {snapshot_key}")
-            
+
             # Duplicate check
             if not force_mode:
                 try:
@@ -1112,36 +1108,33 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             else:
                 LOG.info(f"🚫 Duplicate check bypassed (force mode)")
 
-            # --- FIXED RECENCY CHECK (handles both string and datetime) ---
+            # Recency check (unchanged)
             if not force_mode:
                 try:
                     snapshot = await load_channel_snapshot(snapshot_key)
                     if snapshot and snapshot.get("last_posted_at"):
                         last_val = snapshot["last_posted_at"]
-                        # Handle both string and datetime objects
                         if isinstance(last_val, datetime):
                             last_dt = last_val
                         else:
-                            # Replace 'Z' with '+00:00' for fromisoformat compatibility
                             last_val_str = last_val.replace("Z", "+00:00") if "Z" in last_val else last_val
                             last_dt = datetime.fromisoformat(last_val_str)
-                        
-                        # Ensure timezone awareness
+
                         if last_dt.tzinfo is None:
                             last_dt = last_dt.replace(tzinfo=timezone.utc)
                         else:
                             last_dt = last_dt.astimezone(timezone.utc)
-                        
+
                         now_utc = now.astimezone(timezone.utc)
                         hours_since = (now_utc - last_dt).total_seconds() / 3600
-                        if hours_since < 6:  # More frequent updates allowed (6 hours)
+                        if hours_since < 6:
                             LOG.info(f"⏭️  Too recent ({hours_since:.1f}h), skipping")
                             skipped_count += 1
                             idx += 1
                             continue
                 except Exception as rec_err:
                     LOG.error(f"⚠️  Recency check failed for {source_name}: {rec_err}")
-            
+
             LOG.info(f"✅ {source_name} ELIGIBLE ({len(items)} items)")
             source_eligible = {
                 "source_name": source_name,
@@ -1150,7 +1143,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 "snapshot_key": snapshot_key,
                 "item_count": len(items),
             }
-            
+
         except asyncio.TimeoutError:
             LOG.error(f"⏱️  TIMEOUT processing {source_name} after {timeout_seconds}")
             error_count += 1
@@ -1158,18 +1151,16 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             LOG.error(f"❌ CRITICAL ERROR in {source_name}: {str(e)}")
             LOG.exception(f"Full traceback for {source_name}:")
             error_count += 1
-        
-        # Only advance index if we didn't crash
+
         if source_eligible:
             eligible_candidates.append(source_eligible)
             LOG.info(f"🏁 {source_name}: ✅ ELIGIBLE ADDED")
         else:
             LOG.info(f"🏁 {source_name}: ❌ NOT ELIGIBLE")
-        
+
         idx += 1
-        # Small delay between sources to prevent rate limiting
         await asyncio.sleep(5)
-    
+
     # ═══════════════════════════════════════════════════════════════════════
     # END OF LOOP - POSTING PHASE
     # ═══════════════════════════════════════════════════════════════════════
@@ -1180,12 +1171,12 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     LOG.info(f"Skipped:   {skipped_count}")
     LOG.info(f"Errors:    {error_count}")
     LOG.info(f"Eligible:  {len(eligible_candidates)}")
-    
-    if eligible_candidates:
-        LOG.info(f"Eligible sources: {[e['source_name'] for e in eligible_candidates]}")
-    else:
+
+    if not eligible_candidates:
         LOG.warning("⚠️  No eligible candidates - nothing to post")
         return
+
+    LOG.info(f"Eligible sources: {[e['source_name'] for e in eligible_candidates]}")
 
     # ═══════════════════════════════════════════════════════════════════════
     # POSTING PHASE
@@ -1193,16 +1184,16 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     LOG.info(f"\n{'=' * 70}")
     LOG.info(f"📤 ENTERING POSTING PHASE")
     LOG.info(f"{'=' * 70}")
-    
+
     posted_count = 0
     targets = CHANNEL_DEAL_CHAT_ID if isinstance(CHANNEL_DEAL_CHAT_ID, list) else [CHANNEL_DEAL_CHAT_ID]
-    
+
     if not targets:
         LOG.error("❌ No targets configured!")
         return
-    
+
     LOG.info(f"📡 Targets: {targets}")
-    
+
     # Sort by number of items (most items first)
     try:
         eligible_candidates.sort(key=lambda x: -x.get("item_count", 0))
@@ -1211,44 +1202,25 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
     except Exception as sort_err:
         LOG.error(f"❌ Sorting failed: {sort_err}, using unsorted")
         to_post = eligible_candidates[:max_posts]
-    
+
     # Post each one
     for post_idx, item in enumerate(to_post, 1):
         source_name = item.get('source_name', 'Unknown')
         LOG.info(f"\n{'─' * 70}")
         LOG.info(f"📨 [{post_idx}/{len(to_post)}] Posting: {source_name}")
         LOG.info(f"{'─' * 70}")
-        
-        # Build final message
-        try:
-            # Add header emoji based on source
-            emoji_map = {
-                'MySchool.ng': '📚',
-                'Punch Education': '📰',
-                'NUC (Universities)': '🎓'
-            }
-            emoji = emoji_map.get(source_name, '📢')
-            
-            # Create clean message without extra header (already in report_text)
-            message = item.get('report_text', '')
-            
-            if not message:
-                LOG.error(f"❌ No report_text for {source_name}, skipping")
-                continue
-                
-            # Final length check
-            if len(message) > 4096:
-                LOG.warning(f"⚠️  Message too long ({len(message)}), truncating...")
-                # Simple truncation keeping header
-                message = message[:4090] + "..."
-            
-            LOG.info(f"📝 Final message length: {len(message)}")
-            
-        except Exception as msg_err:
-            LOG.error(f"❌ Message construction failed for {source_name}: {msg_err}")
+
+        message = item.get('report_text', '')
+        if not message:
+            LOG.error(f"❌ No report_text for {source_name}, skipping")
             continue
-        
-        # Send to all targets
+
+        if len(message) > 4096:
+            LOG.warning(f"⚠️  Message too long ({len(message)}), truncating...")
+            message = message[:4090] + "..."
+
+        LOG.info(f"📝 Final message length: {len(message)}")
+
         sent_to_any = False
         for chat_id in targets:
             LOG.info(f"📤 Sending to {chat_id}...")
@@ -1256,32 +1228,28 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 if not isinstance(chat_id, (int, str)):
                     LOG.error(f"❌ Invalid chat_id type: {type(chat_id)}")
                     continue
-                
-                # Send with timeout
+
                 response = await asyncio.wait_for(
                     context.bot.send_message(
                         chat_id=chat_id,
                         text=message,
                         parse_mode="HTML",
-                        disable_web_page_preview=False,  # Allow preview for better UX
+                        disable_web_page_preview=False,
                     ),
                     timeout=30.0
                 )
-                
                 sent_to_any = True
                 LOG.info(f"✅ SENT to {chat_id} (msg_id: {response.message_id})")
-                
+
             except asyncio.TimeoutError:
                 LOG.error(f"⏱️  TIMEOUT sending to {chat_id}")
             except Exception as send_err:
                 LOG.error(f"❌ FAILED to send to {chat_id}: {str(send_err)}")
-        
-        # Handle success/failure
+
         if sent_to_any:
             posted_count += 1
             LOG.info(f"✅ SUCCESS: {source_name} posted")
-            
-            # Save snapshot only if not force mode
+
             if not force_mode:
                 try:
                     snapshot_data = {
@@ -1296,14 +1264,13 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                     LOG.error(f"⚠️  Snapshot save failed: {snap_err}")
             else:
                 LOG.info(f"🚫 Snapshot skipped (force mode)")
-            
-            # Delay between posts
+
             if post_idx < len(to_post):
                 LOG.info(f"⏳ Waiting {send_delay}s...")
                 await asyncio.sleep(send_delay)
         else:
             LOG.error(f"❌ COMPLETE FAILURE: {source_name} not sent to any target")
-    
+
     LOG.info(f"\n{'=' * 70}")
     LOG.info(f"🏁 FINAL RESULT: {posted_count}/{len(to_post)} sources posted")
     LOG.info(f"{'=' * 70}\n")
