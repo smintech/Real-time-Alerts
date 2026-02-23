@@ -981,6 +981,52 @@ async def mark_as_posted(ref: str, snapshot: dict):
         # preserve previous propagation behavior by re-raising
         raise
 
+async def record_posted_hash(ref: str, content_hash: str, snapshot: dict):
+    """
+    Record hash AFTER successful post.
+    Writes to Redis + Postgres for duplicate detection.
+    
+    This is ONLY called after posting - never on skips.
+    """
+    loop = asyncio.get_event_loop()
+    now = datetime.now(timezone.utc)
+    
+    def _write_redis_dedup():
+        """Write Redis dedup keys (48h TTL)"""
+        try:
+            r = get_redis()
+            
+            # Dedup key
+            dedup_key = _channel_dedup_key(content_hash)
+            r.set(dedup_key, json.dumps({
+                "ref": ref,
+                "posted_at": now.isoformat(),
+                "title": snapshot.get("title")
+            }), ex=REDIS_TTL_SECONDS)
+            
+            # Recent posts sorted set
+            recent_key = _channel_recent_key(ref)
+            r.zadd(recent_key, {content_hash: now.timestamp()})
+            r.expire(recent_key, REDIS_TTL_SECONDS)
+            r.zremrangebyrank(recent_key, 0, -51)
+            
+        except Exception:
+            logger.exception(f"Redis dedup write failed: {ref}")
+    
+    def _write_db_history():
+        """Write Postgres history (30d retention)"""
+        try:
+            _db_record_post(ref, snapshot, POSTGRES_RETENTION_DAYS)
+        except Exception:
+            logger.exception(f"Postgres history write failed: {ref}")
+    
+    # Write both in parallel
+    await asyncio.gather(
+        loop.run_in_executor(None, _write_redis_dedup),
+        loop.run_in_executor(None, _write_db_history),
+        return_exceptions=True
+    )
+
 # ═══════════════════════════════════════════════════════════════════════════
 # CLEANUP OPERATIONS
 # ═══════════════════════════════════════════════════════════════════════════
