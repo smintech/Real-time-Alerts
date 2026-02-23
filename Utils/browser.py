@@ -359,16 +359,19 @@ class SharedPlaywrightManager:
         
         try:
             loop = asyncio.get_running_loop()
+            impersonate_used = None                     # ← capture for logging
             
             def _sync_curl_get():
+                nonlocal impersonate_used
                 # Use real curl impersonation
                 impersonate = random.choice(["chrome110", "chrome120", "safari15_5"])
+                impersonate_used = impersonate          # ← save for outer scope
                 
                 headers = {
                     'User-Agent': random.choice(self._cfg["user_agent_list"]),
                     'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
                     'Accept-Language': 'en-NG,en-GB;q=0.9,en-US;q=0.8',
-                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Accept-Encoding': 'gzip, deflate',
                     'Cache-Control': 'max-age=0',
                     'Connection': 'keep-alive',
                     'DNT': '1',
@@ -392,31 +395,26 @@ class SharedPlaywrightManager:
                     timeout=timeout,
                     impersonate=impersonate,
                     allow_redirects=True,
-                    verify=False  # Allow SSL flexibility
+                    verify=False
                 )
                 
                 if response.status_code == 200:
                     content = response.content
-                    # Robust decoding
                     if isinstance(content, str):
                         return content
                     
                     encoding = response.encoding or 'utf-8'
-                    
-                    # Try declared encoding first
                     try:
                         return content.decode(encoding)
                     except:
                         pass
                     
-                    # Try common encodings
                     for enc in ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']:
                         try:
                             return content.decode(enc)
                         except:
                             continue
                     
-                    # Last resort
                     return content.decode('utf-8', errors='replace')
                 
                 LOG.debug(f"[CURL_CFFI] Status {response.status_code}")
@@ -427,8 +425,8 @@ class SharedPlaywrightManager:
                 timeout=timeout + 5
             )
             
+            # Binary check
             if result and isinstance(result, str):
-                # Check for binary/corrupted content
                 sample = result[:1000]
                 non_printable = sum(1 for c in sample if ord(c) < 32 and c not in '\n\r\t')
                 if non_printable > len(sample) * 0.1:
@@ -436,7 +434,7 @@ class SharedPlaywrightManager:
                     return ""
             
             if result:
-                LOG.debug(f"[CURL_CFFI] ✅ Success: {len(result)} bytes (via {impersonate})")
+                LOG.debug(f"[CURL_CFFI] ✅ Success: {len(result)} bytes (via {impersonate_used})")
             
             return result
             
