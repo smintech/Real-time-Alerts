@@ -1,5 +1,5 @@
 """
-Playwright browser management and fetch functions.
+Playwright browser management and fetch functions with curl_cffi support.
 """
 import asyncio
 import logging
@@ -53,7 +53,7 @@ if not _SCRAPER_PROXIES:
 _BROWSER_SEMAPHORE = asyncio.Semaphore(3)
 
 # -------------------------------------------------------------------
-# SharedPlaywrightManager (optimised, lazy browser)
+# Check for optional dependencies
 # -------------------------------------------------------------------
 _cloudscraper_spec = importlib.util.find_spec("cloudscraper")
 if _cloudscraper_spec is not None:
@@ -61,10 +61,19 @@ if _cloudscraper_spec is not None:
 else:
     cloudscraper = None
 
+_curl_cffi_spec = importlib.util.find_spec("curl_cffi")
+if _curl_cffi_spec is not None:
+    from curl_cffi import requests as curl_requests
+else:
+    curl_requests = None
+
+# -------------------------------------------------------------------
+# SharedPlaywrightManager (with curl_cffi support)
+# -------------------------------------------------------------------
 class SharedPlaywrightManager:
     """
-    Optimised hybrid manager:
-    - HTTP-first (cloudscraper → aiohttp) for most sites
+    Optimised hybrid manager with curl_cffi support:
+    - HTTP-first (curl_cffi → cloudscraper → aiohttp) for most sites
     - Lazy browser creation (only when needed)
     - Auto-recreate browser when Cloudflare blocks detected
     - Sequential processing to minimise memory
@@ -124,6 +133,18 @@ class SharedPlaywrightManager:
             self._cfg = dict(self.DEFAULTS)
             self._cfg.update(kwargs)
             LOG.info("[INIT] 🚀 Starting Playwright (lazy browser creation)...")
+            
+            # Log available HTTP libraries
+            if curl_requests:
+                LOG.info("[INIT] ✅ curl_cffi available (real curl fingerprint)")
+            else:
+                LOG.info("[INIT] ⚠️ curl_cffi not available - install with: pip install curl_cffi")
+            
+            if cloudscraper:
+                LOG.info("[INIT] ✅ cloudscraper available")
+            else:
+                LOG.info("[INIT] ⚠️ cloudscraper not available")
+            
             try:
                 self._playwright = await async_playwright().start()
                 self._sem = asyncio.Semaphore(self._cfg["max_concurrency"])
@@ -324,6 +345,103 @@ class SharedPlaywrightManager:
                 )
             )
         )
+
+    async def _curl_cffi_fetch(self, url: str, timeout: int = 20) -> str:
+        """
+        Fetch using curl_cffi - real curl TLS fingerprint.
+        """
+        if curl_requests is None:
+            LOG.debug("[CURL_CFFI] ⚠️ Not installed, skipping")
+            return ""
+        
+        LOG.debug(f"[CURL_CFFI] 📡 Fetching {url[:60]}... (real curl fingerprint)")
+        
+        try:
+            loop = asyncio.get_running_loop()
+            
+            def _sync_curl_get():
+                # Use real curl impersonation
+                impersonate = random.choice(["chrome110", "chrome120", "safari15_5"])
+                
+                headers = {
+                    'User-Agent': random.choice(self._cfg["user_agent_list"]),
+                    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8',
+                    'Accept-Language': 'en-NG,en-GB;q=0.9,en-US;q=0.8',
+                    'Accept-Encoding': 'gzip, deflate, br',
+                    'Cache-Control': 'max-age=0',
+                    'Connection': 'keep-alive',
+                    'DNT': '1',
+                    'Upgrade-Insecure-Requests': '1',
+                }
+                
+                # Add referer occasionally
+                if random.random() > 0.3:
+                    parsed = urlparse(url)
+                    referers = [
+                        'https://www.google.com.ng/',
+                        f'https://{parsed.netloc}/',
+                        'https://www.google.com/',
+                    ]
+                    headers['Referer'] = random.choice(referers)
+                
+                # Make request with curl_cffi
+                response = curl_requests.get(
+                    url,
+                    headers=headers,
+                    timeout=timeout,
+                    impersonate=impersonate,
+                    allow_redirects=True,
+                    verify=False  # Allow SSL flexibility
+                )
+                
+                if response.status_code == 200:
+                    content = response.content
+                    # Robust decoding
+                    if isinstance(content, str):
+                        return content
+                    
+                    encoding = response.encoding or 'utf-8'
+                    
+                    # Try declared encoding first
+                    try:
+                        return content.decode(encoding)
+                    except:
+                        pass
+                    
+                    # Try common encodings
+                    for enc in ['utf-8', 'latin-1', 'cp1252', 'iso-8859-1']:
+                        try:
+                            return content.decode(enc)
+                        except:
+                            continue
+                    
+                    # Last resort
+                    return content.decode('utf-8', errors='replace')
+                
+                LOG.debug(f"[CURL_CFFI] Status {response.status_code}")
+                return ""
+            
+            result = await asyncio.wait_for(
+                loop.run_in_executor(None, _sync_curl_get),
+                timeout=timeout + 5
+            )
+            
+            if result and isinstance(result, str):
+                # Check for binary/corrupted content
+                sample = result[:1000]
+                non_printable = sum(1 for c in sample if ord(c) < 32 and c not in '\n\r\t')
+                if non_printable > len(sample) * 0.1:
+                    LOG.warning(f"[CURL_CFFI] ⚠️ Response appears binary ({non_printable} non-printable)")
+                    return ""
+            
+            if result:
+                LOG.debug(f"[CURL_CFFI] ✅ Success: {len(result)} bytes (via {impersonate})")
+            
+            return result
+            
+        except Exception as e:
+            LOG.debug(f"[CURL_CFFI] ❌ Failed: {type(e).__name__}: {str(e)[:80]}")
+            return ""
 
     async def _cloudscraper_fetch(self, url: str, timeout: int = 20) -> str:
         if cloudscraper is None:
@@ -596,9 +714,18 @@ class SharedPlaywrightManager:
         partial_on_timeout: bool = True,
         min_http_length: int = 800
     ) -> str:
+        """
+        Smart fetch with progressive fallback:
+        1. curl_cffi (real curl fingerprint - MOST EFFECTIVE)
+        2. cloudscraper
+        3. aiohttp
+        4. Playwright (last resort)
+        """
         parsed = urlparse(url)
         hostname = (parsed.hostname or "").lower()
         LOG.info(f"[SMART_FETCH] 🎯 ENTRY for {url[:60]}")
+        
+        # MySchool always uses Playwright directly
         if "myschool.ng" in hostname:
             LOG.info(f"[SMART_FETCH] 🎭 Using Playwright directly for MySchool")
             return await self.fetch_html(
@@ -609,19 +736,32 @@ class SharedPlaywrightManager:
                 partial_on_timeout=partial_on_timeout,
                 recreate_on_block=True
             )
+        
         if prefer_http:
+            # Strategy 1: curl_cffi (BEST - real curl fingerprint)
+            LOG.info(f"[SMART_FETCH] 🔧 Trying curl_cffi (real curl fingerprint)...")
+            html = await self._curl_cffi_fetch(url, http_timeout)
+            if html and len(html) >= min_http_length:
+                LOG.info(f"[SMART_FETCH] ✅ curl_cffi success: {len(html)} bytes")
+                return html
+            
+            # Strategy 2: cloudscraper
             LOG.info(f"[SMART_FETCH] ☁️ Trying cloudscraper...")
             html = await self._cloudscraper_fetch(url, http_timeout)
             if html and len(html) >= min_http_length:
                 LOG.info(f"[SMART_FETCH] ✅ Cloudscraper success: {len(html)} bytes")
                 return html
+            
+            # Strategy 3: aiohttp
             LOG.info(f"[SMART_FETCH] 🌐 Trying aiohttp...")
             html = await self._aiohttp_fetch(url, http_timeout)
             if html and len(html) >= min_http_length:
                 LOG.info(f"[SMART_FETCH] ✅ Aiohttp success: {len(html)} bytes")
                 return html
+        
+        # Last resort: Playwright
         if allow_playwright:
-            LOG.info(f"[SMART_FETCH] 🎭 Falling back to Playwright...")
+            LOG.info(f"[SMART_FETCH] 🎭 Falling back to Playwright (last resort)...")
             return await self.fetch_html(
                 url,
                 wait_for_selector=wait_for_selector,
@@ -630,6 +770,7 @@ class SharedPlaywrightManager:
                 partial_on_timeout=partial_on_timeout,
                 recreate_on_block=True
             )
+        
         LOG.error(f"[SMART_FETCH] 💀 All methods failed for {url[:60]}")
         return ""
 
@@ -722,7 +863,7 @@ class SharedPlaywrightManager:
 shared_playwright = SharedPlaywrightManager()
 
 # -------------------------------------------------------------------
-# Legacy standalone fetch
+# Legacy standalone fetch (unchanged)
 # -------------------------------------------------------------------
 async def get_visible_text_playwright(page) -> str:
     """
