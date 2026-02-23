@@ -1,5 +1,5 @@
 """
-Playwright browser management and fetch functions with curl_cffi support.
+Playwright browser management and fetch functions.
 """
 import asyncio
 import logging
@@ -68,12 +68,12 @@ else:
     curl_requests = None
 
 # -------------------------------------------------------------------
-# SharedPlaywrightManager (with curl_cffi support)
+# SharedPlaywrightManager 
 # -------------------------------------------------------------------
 class SharedPlaywrightManager:
     """
     Optimised hybrid manager with curl_cffi support:
-    - HTTP-first (curl_cffi → cloudscraper → aiohttp) for most sites
+    - HTTP-first cloudscraper → aiohttp) for most sites
     - Lazy browser creation (only when needed)
     - Auto-recreate browser when Cloudflare blocks detected
     - Sequential processing to minimise memory
@@ -349,6 +349,7 @@ class SharedPlaywrightManager:
     async def _curl_cffi_fetch(self, url: str, timeout: int = 20) -> str:
         """
         Fetch using curl_cffi - real curl TLS fingerprint.
+        Most effective against TLS-based bot detection.
         """
         if curl_requests is None:
             LOG.debug("[CURL_CFFI] ⚠️ Not installed, skipping")
