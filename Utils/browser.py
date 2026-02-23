@@ -303,6 +303,28 @@ class SharedPlaywrightManager:
                 pass
         LOG.debug("[SETUP_PAGE] ✅ Resource blocking configured")
 
+    def _is_cloudflare_blocked(self, status: int, title: str, body: str) -> bool:
+        """
+        Detect common Cloudflare / anti-bot blocks.
+        """
+        title = (title or "").lower()
+        body = (body or "").lower()
+
+        return (
+            status == 403 or
+            "just a moment" in title or
+            "verifying you are human" in body or
+            "checking your browser" in body or
+            (
+                "cloudflare" in body and
+                (
+                    "challenge" in body or
+                    "ray id" in body or
+                    "attention required" in body
+                )
+            )
+        )
+
     async def _cloudscraper_fetch(self, url: str, timeout: int = 20) -> str:
         if cloudscraper is None:
             return ""
