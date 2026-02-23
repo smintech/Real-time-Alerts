@@ -982,50 +982,56 @@ async def mark_as_posted(ref: str, snapshot: dict):
         raise
 
 async def record_posted_hash(ref: str, content_hash: str, snapshot: dict):
-    """
-    Record hash AFTER successful post.
-    Writes to Redis + Postgres for duplicate detection.
+    """🔊 ULTRA-LOUD VERSION - every single step is logged"""
+    logger.critical(f"🔥 RECORD_POSTED_HASH STARTED → ref={ref} | hash={content_hash[:16]}... | snapshot_keys={list(snapshot.keys())}")
     
-    This is ONLY called after posting - never on skips.
-    """
     loop = asyncio.get_event_loop()
     now = datetime.now(timezone.utc)
     
     def _write_redis_dedup():
-        """Write Redis dedup keys (48h TTL)"""
         try:
             r = get_redis()
+            logger.info(f"🟢 Redis connected for dedup write (ref={ref})")
             
-            # Dedup key
             dedup_key = _channel_dedup_key(content_hash)
-            r.set(dedup_key, json.dumps({
+            payload = {
                 "ref": ref,
                 "posted_at": now.isoformat(),
-                "title": snapshot.get("title")
-            }), ex=REDIS_TTL_SECONDS)
+                "title": snapshot.get("title"),
+                "item_count": snapshot.get("item_count")
+            }
+            r.set(dedup_key, json.dumps(payload), ex=REDIS_TTL_SECONDS)
+            logger.critical(f"✅ REDIS DEDUP KEY WRITTEN → {dedup_key} | TTL={REDIS_TTL_SECONDS}s | payload={payload}")
             
-            # Recent posts sorted set
             recent_key = _channel_recent_key(ref)
             r.zadd(recent_key, {content_hash: now.timestamp()})
             r.expire(recent_key, REDIS_TTL_SECONDS)
             r.zremrangebyrank(recent_key, 0, -51)
+            logger.critical(f"✅ REDIS RECENT SET UPDATED → {recent_key} | new score={now.timestamp()}")
             
-        except Exception:
-            logger.exception(f"Redis dedup write failed: {ref}")
+        except Exception as e:
+            logger.critical(f"❌ REDIS DEDUP WRITE FAILED → {ref} | {type(e).__name__}: {e}", exc_info=True)
+            raise
     
     def _write_db_history():
-        """Write Postgres history (30d retention)"""
         try:
+            logger.info(f"🟢 Writing to Postgres history (ref={ref})")
             _db_record_post(ref, snapshot, POSTGRES_RETENTION_DAYS)
-        except Exception:
-            logger.exception(f"Postgres history write failed: {ref}")
+            logger.critical(f"✅ POSTGRES HISTORY INSERTED → ref={ref} | hash={content_hash[:16]}")
+        except Exception as e:
+            logger.critical(f"❌ POSTGRES HISTORY FAILED → {ref} | {type(e).__name__}: {e}", exc_info=True)
+            raise
     
-    # Write both in parallel
-    await asyncio.gather(
-        loop.run_in_executor(None, _write_redis_dedup),
-        loop.run_in_executor(None, _write_db_history),
-        return_exceptions=True
-    )
+    try:
+        results = await asyncio.gather(
+            loop.run_in_executor(None, _write_redis_dedup),
+            loop.run_in_executor(None, _write_db_history),
+            return_exceptions=False   # ← removed return_exceptions so errors are loud
+        )
+        logger.critical(f"🎉 RECORD_POSTED_HASH FULL SUCCESS → {ref}")
+    except Exception as e:
+        logger.critical(f"💥 RECORD_POSTED_HASH TOTAL FAILURE → {ref} | {e}", exc_info=True)
+        raise
 
 # ═══════════════════════════════════════════════════════════════════════════
 # CLEANUP OPERATIONS
