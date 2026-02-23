@@ -989,14 +989,13 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 idx += 1
                 continue
 
-            # ========== STABLE SORTING (NEW) ==========
+            # ========== STABLE SORTING ==========
             # Sort items deterministically: by date descending, then by title ascending
             items.sort(key=lambda x: (
-                x.get('date_obj') is None,                     # None dates last
+                x.get('date_obj') is None,
                 -x.get('date_obj', datetime.min).timestamp() if x.get('date_obj') else 0,
-                x.get('title', '').lower()                      # tie‑breaker
+                x.get('title', '').lower()
             ))
-            # ===========================================
 
             # Build formatted message
             LOG.info(f"📝 Building message for {source_name}...")
@@ -1063,7 +1062,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
 
             LOG.info(f"📝 Message built: {len(report_text)} chars")
 
-            # ========== UPDATED HASH COMPUTATION WITH DETAILED LOGGING ==========
+            # ========== HASH COMPUTATION ==========
             try:
                 # Prepare hash input data
                 hash_input_data = {
@@ -1098,12 +1097,11 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 LOG.exception(f"Hash error traceback for {source_name}:")
                 content_hash = "fallback_hash_" + str(time.time())
                 LOG.warning(f"⚠️  Using fallback hash: {content_hash}")
-            # ===============================================================
 
             snapshot_key = f"school_{_slugify(source_name)}"
             LOG.info(f"🔑 Snapshot key: {snapshot_key}")
 
-            # Duplicate check
+            # ========== DUPLICATE CHECK ==========
             if not force_mode:
                 try:
                     is_duplicate = await check_duplicate_post(
@@ -1125,7 +1123,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             else:
                 LOG.info(f"🚫 Duplicate check bypassed (force mode)")
 
-            # Recency check (unchanged)
+            # ========== RECENCY CHECK ==========
             if not force_mode:
                 try:
                     snapshot = await load_channel_snapshot(snapshot_key)
@@ -1162,7 +1160,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             }
 
         except asyncio.TimeoutError:
-            LOG.error(f"⏱️  TIMEOUT processing {source_name} after {timeout_seconds}")
+            LOG.error(f"⏱️  TIMEOUT processing {source_name} after {timeout_seconds}s")
             error_count += 1
         except Exception as e:
             LOG.error(f"❌ CRITICAL ERROR in {source_name}: {str(e)}")
@@ -1179,7 +1177,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(5)
 
     # ═══════════════════════════════════════════════════════════════════════
-    # END OF LOOP - POSTING PHASE
+    # END OF LOOP - SUMMARY
     # ═══════════════════════════════════════════════════════════════════════
     LOG.info(f"\n{'=' * 70}")
     LOG.info(f"📊 LOOP COMPLETE")
@@ -1263,12 +1261,16 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             except Exception as send_err:
                 LOG.error(f"❌ FAILED to send to {chat_id}: {str(send_err)}")
 
+        # ═══════════════════════════════════════════════════════════════════
+        # ✅ POST-POSTING: RECORD HASH FOR DUPLICATE DETECTION
+        # ═══════════════════════════════════════════════════════════════════
         if sent_to_any:
             posted_count += 1
             LOG.info(f"✅ SUCCESS: {source_name} posted")
 
             if not force_mode:
                 try:
+                    # 1. Update snapshot metadata (last_posted_at, etc.)
                     snapshot_data = {
                         "content_hash": item.get("content_hash"),
                         "item_count": item.get("item_count"),
@@ -1277,17 +1279,30 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                     }
                     await mark_as_posted(item.get("snapshot_key"), snapshot_data)
                     LOG.info(f"💾 Snapshot saved for {source_name}")
+                    
+                    await record_posted_hash(
+                        ref=item.get("snapshot_key"),
+                        content_hash=item.get("content_hash"),
+                        snapshot=snapshot_data
+                    )
+                    LOG.info(f"🔒 Dedup keys recorded: {item.get('content_hash')[:12]}")
+                    
                 except Exception as snap_err:
-                    LOG.error(f"⚠️  Snapshot save failed: {snap_err}")
+                    LOG.error(f"⚠️  Post recording failed: {snap_err}")
+                    LOG.exception(f"Full traceback for recording error:")
             else:
-                LOG.info(f"🚫 Snapshot skipped (force mode)")
+                LOG.info(f"🚫 Snapshot/dedup recording skipped (force mode)")
 
+            # Delay before next post
             if post_idx < len(to_post):
-                LOG.info(f"⏳ Waiting {send_delay}s...")
+                LOG.info(f"⏳ Waiting {send_delay}s before next post...")
                 await asyncio.sleep(send_delay)
         else:
             LOG.error(f"❌ COMPLETE FAILURE: {source_name} not sent to any target")
 
+    # ═══════════════════════════════════════════════════════════════════════
+    # FINAL SUMMARY
+    # ═══════════════════════════════════════════════════════════════════════
     LOG.info(f"\n{'=' * 70}")
     LOG.info(f"🏁 FINAL RESULT: {posted_count}/{len(to_post)} sources posted")
     LOG.info(f"{'=' * 70}\n")
