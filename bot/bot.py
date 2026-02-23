@@ -906,17 +906,16 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
 
     LOG.info(f"📋 DEFAULT_SCHOOL_SOURCES loaded: {len(DEFAULT_SCHOOL_SOURCES)} source(s)")
 
-    # Convert DEFAULT_SCHOOL_SOURCES to site_configs format for the unified scraper
+    # Convert DEFAULT_SCHOOL_SOURCES to site_configs format
     site_configs = {}
     for src_name, urls in DEFAULT_SCHOOL_SOURCES.items():
         if not urls:
             LOG.warning(f"⚠️  No URLs for {src_name}, skipping")
             continue
 
-        base_url = urls[0]  # Take the first URL as base URL
+        base_url = urls[0]
         domain = get_domain_from_url(base_url)
 
-        # Determine site type based on domain
         if 'myschool.ng' in domain:
             site_type = 'myschool'
         elif 'punchng.com' in domain:
@@ -929,7 +928,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
         site_configs[src_name] = {
             'base_url': base_url,
             'type': site_type,
-            'max_articles': 10  # Default max articles per source
+            'max_articles': 10
         }
 
         LOG.info(f"  📌 {src_name}: {base_url[:60]}... ({site_type})")
@@ -963,8 +962,8 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             LOG.info(f"🌐 Calling scrape_school_news for {source_name}...")
 
             single_site_config = {source_name: config}
-
             current_site_type = config.get('type', 'generic')
+            
             if current_site_type == 'myschool':
                 timeout_seconds = 800.0
                 LOG.info(f"⏰ Using extended timeout for MySchool: {timeout_seconds}s")
@@ -990,17 +989,15 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 idx += 1
                 continue
 
-            # ========== STABLE SORTING ==========
-            # Sort items deterministically: by date descending, then by title ascending
+            # Stable sorting
             items.sort(key=lambda x: (
                 x.get('date_obj') is None,
                 -x.get('date_obj', datetime.min).timestamp() if x.get('date_obj') else 0,
                 x.get('title', '').lower()
             ))
 
-            # Build formatted message
+            # Build message
             LOG.info(f"📝 Building message for {source_name}...")
-
             report_lines = [
                 f"<b>📢 {source_name}</b>",
                 f"<i>📅 Updated: {now.strftime('%b %d, %Y — %H:%M WAT')}</i>",
@@ -1009,7 +1006,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 "",
             ]
 
-            for i, item in enumerate(items[:8], 1):  # Show max 8 items
+            for i, item in enumerate(items[:8], 1):
                 try:
                     title = item.get('title', 'Untitled')
                     date = item.get('date', '')
@@ -1045,7 +1042,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
 
             report_text = "\n".join(report_lines)
 
-            # Truncate if too long
+            # Truncate if needed
             original_len = len(report_text)
             if original_len > 4000:
                 LOG.warning(f"⚠️  Message too long ({original_len}), truncating...")
@@ -1063,9 +1060,8 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
 
             LOG.info(f"📝 Message built: {len(report_text)} chars")
 
-            # ========== HASH COMPUTATION ==========
+            # Hash computation
             try:
-                # Prepare hash input data
                 hash_input_data = {
                     "title": source_name,
                     "item_count": len(items),
@@ -1080,7 +1076,6 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                     }
                 }
                 
-                # Log hash input data for debugging
                 LOG.info(f"🔐 HASH INPUT DATA for {source_name}:")
                 LOG.info(f"  - Source: {source_name}")
                 LOG.info(f"  - Item count: {len(items)}")
@@ -1089,7 +1084,6 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                     LOG.info(f"    {i}. Title: {item_data.get('title', 'N/A')[:80]}")
                     LOG.info(f"       Link: {item_data.get('link', 'N/A')[:80]}")
                 
-                # Compute hash
                 content_hash = compute_content_hash(hash_input_data)
                 LOG.info(f"✅ Generated hash for {source_name}: {content_hash}")
                 
@@ -1102,19 +1096,22 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             snapshot_key = f"school_{_slugify(source_name)}"
             LOG.info(f"🔑 Snapshot key: {snapshot_key}")
 
-            # ========== DUPLICATE CHECK ==========
+            # Duplicate check
             if not force_mode:
                 try:
+                    LOG.info(f"🔍 Running duplicate check for {source_name}...")
                     is_duplicate = await check_duplicate_post(
                         ref=snapshot_key,
                         content_hash=content_hash,
                         lookback_hours=48
                     )
                     if is_duplicate:
-                        LOG.info(f"⏭️  Duplicate for {source_name}, skipping")
+                        LOG.info(f"⏭️  Duplicate detected for {source_name}, skipping")
                         skipped_count += 1
                         idx += 1
                         continue
+                    else:
+                        LOG.info(f"✅ Not a duplicate: {source_name}")
                 except Exception as dup_err:
                     LOG.error(f"⚠️  Duplicate check failed for {source_name}: {dup_err}")
                     if not force_mode:
@@ -1124,9 +1121,10 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
             else:
                 LOG.info(f"🚫 Duplicate check bypassed (force mode)")
 
-            # ========== RECENCY CHECK ==========
+            # Recency check
             if not force_mode:
                 try:
+                    LOG.info(f"🕐 Running recency check for {source_name}...")
                     snapshot = await load_channel_snapshot(snapshot_key)
                     if snapshot and snapshot.get("last_posted_at"):
                         last_val = snapshot["last_posted_at"]
@@ -1144,10 +1142,14 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                         now_utc = now.astimezone(timezone.utc)
                         hours_since = (now_utc - last_dt).total_seconds() / 3600
                         if hours_since < 6:
-                            LOG.info(f"⏭️  Too recent ({hours_since:.1f}h), skipping")
+                            LOG.info(f"⏭️  Too recent ({hours_since:.1f}h < 6h), skipping")
                             skipped_count += 1
                             idx += 1
                             continue
+                        else:
+                            LOG.info(f"✅ Recency OK ({hours_since:.1f}h >= 6h)")
+                    else:
+                        LOG.info(f"✅ No previous post found (first time)")
                 except Exception as rec_err:
                     LOG.error(f"⚠️  Recency check failed for {source_name}: {rec_err}")
 
@@ -1178,7 +1180,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
         await asyncio.sleep(5)
 
     # ═══════════════════════════════════════════════════════════════════════
-    # END OF LOOP - SUMMARY
+    # END OF LOOP
     # ═══════════════════════════════════════════════════════════════════════
     LOG.info(f"\n{'=' * 70}")
     LOG.info(f"📊 LOOP COMPLETE")
@@ -1210,7 +1212,6 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
 
     LOG.info(f"📡 Targets: {targets}")
 
-    # Sort by number of items (most items first)
     try:
         eligible_candidates.sort(key=lambda x: -x.get("item_count", 0))
         to_post = eligible_candidates[:max_posts]
@@ -1263,36 +1264,94 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 LOG.error(f"❌ FAILED to send to {chat_id}: {str(send_err)}")
 
         # ═══════════════════════════════════════════════════════════════════
-        # ✅ POST-POSTING: RECORD HASH FOR DUPLICATE DETECTION
+        # POST-POSTING: SAVE & VERIFY
         # ═══════════════════════════════════════════════════════════════════
         if sent_to_any:
             posted_count += 1
-            LOG.info(f"✅ SUCCESS: {source_name} posted")
+            LOG.info(f"✅ POST SUCCESS: {source_name}")
+            LOG.info(f"")
+            LOG.info(f"{'🔸' * 35}")
+            LOG.info(f"💾 BEGINNING SAVE OPERATIONS for {source_name}")
+            LOG.info(f"{'🔸' * 35}")
 
             if not force_mode:
                 try:
-                    # 1. Update snapshot metadata (last_posted_at, etc.)
+                    snapshot_key = item.get("snapshot_key")
+                    content_hash = item.get("content_hash")
+                    
+                    LOG.info(f"📋 Preparing snapshot data...")
                     snapshot_data = {
-                        "content_hash": item.get("content_hash"),
+                        "content_hash": content_hash,
                         "item_count": item.get("item_count"),
                         "site": source_name,
                         "title": f"School Updates - {source_name}",
                     }
-                    await mark_as_posted(item.get("snapshot_key"), snapshot_data)
-                    LOG.info(f"💾 Snapshot saved for {source_name}")
+                    LOG.info(f"   ├─ ref: {snapshot_key}")
+                    LOG.info(f"   ├─ content_hash: {content_hash}")
+                    LOG.info(f"   ├─ item_count: {snapshot_data['item_count']}")
+                    LOG.info(f"   ├─ site: {snapshot_data['site']}")
+                    LOG.info(f"   └─ title: {snapshot_data['title']}")
                     
+                    # Step 1: Save snapshot
+                    LOG.info(f"")
+                    LOG.info(f"📥 STEP 1: Calling mark_as_posted()...")
+                    await mark_as_posted(snapshot_key, snapshot_data)
+                    LOG.info(f"   ✅ mark_as_posted() completed")
+                    
+                    # Step 2: Record dedup hash
+                    LOG.info(f"")
+                    LOG.info(f"🔒 STEP 2: Calling record_posted_hash()...")
                     await record_posted_hash(
-                        ref=item.get("snapshot_key"),
-                        content_hash=item.get("content_hash"),
+                        ref=snapshot_key,
+                        content_hash=content_hash,
                         snapshot=snapshot_data
                     )
-                    LOG.info(f"🔒 Dedup keys recorded: {item.get('content_hash')[:12]}")
+                    LOG.info(f"   ✅ record_posted_hash() completed")
+                    
+                    # Step 3: Verify what was saved
+                    LOG.info(f"")
+                    LOG.info(f"🔍 STEP 3: VERIFICATION - Checking what was saved...")
+                    LOG.info(f"")
+                    
+                    # 3a. Check snapshot
+                    LOG.info(f"   📂 Checking snapshot in storage...")
+                    saved_snapshot = await load_channel_snapshot(snapshot_key)
+                    if saved_snapshot:
+                        LOG.info(f"   ✅ Snapshot FOUND in storage:")
+                        LOG.info(f"      ├─ ref: {saved_snapshot.get('ref', 'N/A')}")
+                        LOG.info(f"      ├─ content_hash: {saved_snapshot.get('content_hash', 'N/A')}")
+                        LOG.info(f"      ├─ last_posted_at: {saved_snapshot.get('last_posted_at', 'N/A')}")
+                        LOG.info(f"      ├─ item_count: {saved_snapshot.get('item_count', 'N/A')}")
+                        LOG.info(f"      └─ site: {saved_snapshot.get('site', 'N/A')}")
+                    else:
+                        LOG.error(f"   ❌ Snapshot NOT FOUND in storage!")
+                    
+                    # 3b. Check duplicate detection
+                    LOG.info(f"")
+                    LOG.info(f"   🔍 Running duplicate check to verify hash was saved...")
+                    is_now_duplicate = await check_duplicate_post(
+                        ref=snapshot_key,
+                        content_hash=content_hash,
+                        lookback_hours=48
+                    )
+                    if is_now_duplicate:
+                        LOG.info(f"   ✅ VERIFICATION PASSED: Hash found in dedup storage")
+                        LOG.info(f"      → Future posts with this hash will be skipped ✅")
+                    else:
+                        LOG.error(f"   ❌ VERIFICATION FAILED: Hash NOT found in dedup storage!")
+                        LOG.error(f"      → Future duplicate posts WILL NOT be prevented! ⚠️")
+                    
+                    LOG.info(f"")
+                    LOG.info(f"{'🔸' * 35}")
+                    LOG.info(f"💾 SAVE OPERATIONS COMPLETE for {source_name}")
+                    LOG.info(f"{'🔸' * 35}")
+                    LOG.info(f"")
                     
                 except Exception as snap_err:
-                    LOG.error(f"⚠️  Post recording failed: {snap_err}")
-                    LOG.exception(f"Full traceback for recording error:")
+                    LOG.error(f"❌ POST RECORDING FAILED: {snap_err}")
+                    LOG.exception(f"Full traceback:")
             else:
-                LOG.info(f"🚫 Snapshot/dedup recording skipped (force mode)")
+                LOG.info(f"🚫 Save operations skipped (force mode enabled)")
 
             # Delay before next post
             if post_idx < len(to_post):
