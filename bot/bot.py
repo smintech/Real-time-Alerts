@@ -60,6 +60,7 @@ from bot.persistence import (
     cleanup_all_expired,
     wipe_channel_snapshots_redis,
     initialize_database,
+    record_posted_hash,
 )
 
 from Utils.format import format_telegram_alert, _safe_currency, update_exchange_rate
