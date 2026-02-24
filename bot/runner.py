@@ -270,15 +270,27 @@ async def job_fuel_prices(
 
 async def run_fuel_prices():
     """Background task for fuel prices."""
+    task_id = datetime.now(timezone.utc).isoformat()
+    logger.info(f"🔥 TASK_START [{task_id}] Fuel prices job started")
     touch_activity()
+    
     try:
+        logger.info(f"🔥 TASK [{task_id}] Getting bot context...")
         context = await get_bot_context()
-        await check_and_post_fuel_prices(context)
-        logger.info("Fuel prices completed successfully")
+        logger.info(f"🔥 TASK [{task_id}] Context obtained, calling check_and_post_fuel_prices...")
+        
+        result = await check_and_post_fuel_prices(context)
+        logger.info(f"🔥 TASK_SUCCESS [{task_id}] Fuel prices completed: {result}")
+        
     except Exception as e:
-        logger.exception(f"Fuel prices failed: {e}")
+        logger.exception(f"🔥 TASK_ERROR [{task_id}] Fuel prices failed")
+        # Re-log the error to make sure it's visible
+        logger.error(f"🔥 TASK_ERROR [{task_id}] Type: {type(e).__name__}")
+        logger.error(f"🔥 TASK_ERROR [{task_id}] Message: {str(e)}")
+        
     finally:
         touch_activity()
+        logger.info(f"🔥 TASK_END [{task_id}] Fuel prices job finished")
 
 @app.post("/v1/jobs/school-updates")
 async def job_school_updates(
