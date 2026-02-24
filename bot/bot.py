@@ -767,7 +767,7 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
 
     # Build message
     message_lines = [
-        "🌅 <b>Daily Fuel Price Report — Nigeria</b>",
+        "🌅 <b>Weekend Energy Price Report — Nigeria</b>",
         f"📅 {now.strftime('%B %d, %Y')} • <i>Morning update</i>",
         "",
         "┌" + "─" * 38 + "┐",
