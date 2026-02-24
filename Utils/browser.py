@@ -912,7 +912,7 @@ async def fetch_with_playwright_aggressive(
     return_visible_text: bool = False,
     wait_for_selector: Optional[str] = None,
     wait_timeout: int = 15000,
-    settle_after_selector_ms: int = 700
+    settle_after_selector_ms: int = 1000
 ) -> Union[str, Tuple[str, str]]:
     """
     PRODUCTION FETCH FUNCTION - OPTIMISED FOR KONGA
