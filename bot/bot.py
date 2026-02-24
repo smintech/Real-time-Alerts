@@ -653,10 +653,11 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
     now = datetime.now(TIMEZONE)
     current_weekday = now.weekday()
     current_day_name = now.strftime('%A')
-
-    if current_weekday != 5:  # 5 = Saturday
-        LOG.debug("⏭️  Skipping fuel price check — today is %s (%d), not Saturday",current_day_name,current_weekday)
-        return
+    
+    if not TEST_MODE:
+        if current_weekday != 5:  # 5 = Saturday
+            LOG.debug("⏭️  Skipping fuel price check — today is %s (%d), not Saturday",current_day_name,current_weekday)
+            return
     
     LOG.info("🛢️  Running weekly fuel price check (Saturday %02d:%02d:%02d)",now.hour,now.minute,now.second)
 
