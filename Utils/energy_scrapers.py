@@ -310,7 +310,13 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
             m = re.search(r'(\d+(?:\.\d+)?)', num_str.replace(",", ""))
             return float(m.group(1)) if m else None
     def find_price_in_text(text: str):
+        """Enhanced price finding with specific card structure patterns"""
         patterns = [
+            # New patterns for specific card structure
+            (r'Average\s+Petrol\s+Price\s*₦\s*([\d,]+(?:\.\d+)?)', "Average Petrol Price direct"),
+            (r'₦\s*([\d,]+(?:\.\d+)?)\s*from\s+last', "price before 'from last' context"),
+            (r'₦\s*([\d,]+(?:\.\d+)?)\s+(?:today|yesterday)', "price with day context"),
+            # Original patterns (with improvements)
             (r'₦\s*([\d,]+(?:\.\d+)?)', "₦ with digits"),
             (r'&#8358;\s*([\d,]+(?:\.\d+)?)', "HTML entity &#8358;"),
             (r'\bNGN[:\s]*([\d,]+(?:\.\d+)?)\b', "NGN textual"),
@@ -330,6 +336,61 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
                     LOG.debug(f"    │  ✗ parse error for '{num}': {e}")
                     continue
         return None, None, None
+    def find_percent_in_text(text: str) -> Optional[float]:
+        """Enhanced percentage change extraction with specific patterns"""
+        patterns = [
+            # New patterns for specific card structure
+            (r'([+\-])\s*([\d]+(?:\.\d+)?)\s*%\s*from\s+last\s+period', "percent from last period"),
+            (r'([+\-])\s*([\d]+(?:\.\d+)?)\s*%\s*(?:today|yesterday)', "percent with day context"),
+            (r'([+\-])\s*([\d]+(?:\.\d+)?)\s*%', "simple percent with sign"),
+            # Original patterns
+            (r'([+\-]\s*\d+(?:\.\d+)?)\s*%', "percent with sign direct"),
+        ]
+        for pat, desc in patterns:
+            m = re.search(pat, text, flags=re.IGNORECASE)
+            if m:
+                try:
+                    if len(m.groups()) >= 2:
+                        sign = m.group(1)
+                        value = float(m.group(2))
+                        result = value if sign == '+' else -value
+                    else:
+                        result = float(m.group(1).replace(" ", ""))
+                    LOG.info(f"    └─ ✓ Found percent via {desc}: {result}%")
+                    return result
+                except Exception as e:
+                    LOG.debug(f"    │  ✗ Percent parse error: {e}")
+                    continue
+        return None
+    def find_absolute_change_in_text(text: str) -> Optional[str]:
+        """Enhanced absolute change extraction with specific patterns"""
+        patterns = [
+            # New patterns for specific card structure
+            (r'([+\-])\s*₦\s*([\d,]+(?:\.\d+)?)\s*today', "naira amount today"),
+            (r'([+\-])\s*₦\s*([\d,]+(?:\.\d+)?)\s*(?:from|yesterday)', "naira amount with context"),
+            (r'₦\s*([+\-]\s*[\d,]+(?:\.\d+)?)\s*(?:today|from)', "naira sign amount"),
+            # Original patterns
+            (r'([+\-]\s*₦\s*[\d,]+(?:\.\d+)?)|₦\s*([+\-]\s*[\d,]+(?:\.\d+)?)|([+\-]\s*[\d,]+(?:\.\d+)?)\s*today', "absolute change variants"),
+        ]
+        for pat, desc in patterns:
+            m = re.search(pat, text, flags=re.IGNORECASE)
+            if m:
+                try:
+                    candidate = next((g for g in m.groups() if g), None)
+                    if candidate:
+                        if len(m.groups()) >= 2 and m.group(1) and m.group(2):
+                            # Reconstruct from separate sign and amount
+                            sign = m.group(1)
+                            amount = m.group(2)
+                            result = f"{sign}₦{amount}"
+                        else:
+                            result = candidate.replace(" ", "")
+                        LOG.info(f"    └─ ✓ Found absolute change via {desc}: {result}")
+                        return result
+                except Exception as e:
+                    LOG.debug(f"    │  ✗ Absolute change parse error: {e}")
+                    continue
+        return None
     if petrol_card:
         LOG.info("💰 STEP 2: Extracting Price Data from Card (detailed)")
         full_text = petrol_card.get_text(" ", strip=True)
@@ -338,6 +399,7 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
         LOG.info(f"  Card HTML length: {len(card_html_str)} bytes")
         LOG.info(f"  Card text preview: {full_text[:200]}...\n")
         extraction_log.append("CARD_HTML:" + (card_html_str if len(card_html_str) < 20000 else card_html_str[:20000] + "...<truncated>"))
+        # Extract price
         price_val, matched_text, pattern_desc = find_price_in_text(full_text)
         if price_val is not None:
             price_raw = price_val
@@ -345,21 +407,18 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
         else:
             LOG.warning("    └─ ✗ No price found inside selected card; will try card HTML and global fallbacks")
             extraction_log.append("✗ Price not found in selected card text")
-        pct_match = re.search(r'([+\-]\s*\d+(?:\.\d+)?)\s*%', full_text)
-        if pct_match:
-            try:
-                change_percent = float(pct_match.group(1).replace(" ", ""))
-                LOG.info(f"    └─ ✓ Percent found in card: {change_percent}%")
-                extraction_log.append(f"✓ Percent change (card): {change_percent}%")
-            except Exception as e:
-                LOG.debug(f"    │  ✗ Percent parse error: {e}")
-        abs_match = re.search(r'([+\-]\s*₦\s*[\d,]+(?:\.\d+)?)|₦\s*([+\-]\s*[\d,]+(?:\.\d+)?)|([+\-]\s*[\d,]+(?:\.\d+)?)\s*today', full_text)
-        if abs_match:
-            candidate = next((g for g in abs_match.groups() if g), None)
-            if candidate:
-                change_absolute = candidate.replace(" ", "")
-                LOG.info(f"    └─ ✓ Absolute change found in card: {change_absolute}")
-                extraction_log.append(f"✓ Absolute change (card): {change_absolute}")
+        # Extract percent change (enhanced)
+        pct_val = find_percent_in_text(full_text)
+        if pct_val is not None:
+            change_percent = pct_val
+            LOG.info(f"    └─ ✓ Percent found in card: {change_percent}%")
+            extraction_log.append(f"✓ Percent change (card): {change_percent}%")
+        # Extract absolute change (enhanced)
+        abs_val = find_absolute_change_in_text(full_text)
+        if abs_val is not None:
+            change_absolute = abs_val
+            LOG.info(f"    └─ ✓ Absolute change found in card: {change_absolute}")
+            extraction_log.append(f"✓ Absolute change (card): {change_absolute}")
     if price_raw is None:
         LOG.warning("⚠️  STEP 3: Card extraction failed or incomplete; attempting page-level and <script> search")
         page_text = soup.get_text(" ", strip=True)
@@ -399,6 +458,19 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
                 else:
                     LOG.warning("  └─ ✗ All global fallbacks failed to find a price\n")
                     extraction_log.append("✗ Global fallbacks failed")
+    # Extract percent and absolute change from page if not found in card
+    if change_percent is None:
+        page_text = soup.get_text(" ", strip=True)
+        pct_val = find_percent_in_text(page_text)
+        if pct_val is not None:
+            change_percent = pct_val
+            extraction_log.append(f"✓ Percent change (page): {change_percent}%")
+    if change_absolute is None:
+        page_text = soup.get_text(" ", strip=True)
+        abs_val = find_absolute_change_in_text(page_text)
+        if abs_val is not None:
+            change_absolute = abs_val
+            extraction_log.append(f"✓ Absolute change (page): {change_absolute}")
     # ---- Diagnostic collection ----
     LOG.info("🔬 STEP 4: Collecting Diagnostic Information")
     LOG.info("  Scanning all elements for ₦ character or price indicators...")
@@ -455,7 +527,7 @@ def _parse_fuelpricewatch(html: str, url: str = "https://app.fuelpricewatch.com/
         "success": success,
         "diagnostic_elements": [str(e) for e in found_elements[:10]],
         "matched_card_contents": matched_card_contents,
-        "parser_version": "2026.02.11-comprehensive-logging-v2",
+        "parser_version": "2026.02.24-enhanced-card-structure-v3",
         "execution_time_seconds": elapsed,
         "extraction_log": extraction_log,
     }
