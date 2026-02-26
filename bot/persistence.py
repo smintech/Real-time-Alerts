@@ -628,27 +628,110 @@ def _db_record_post(ref: str, snapshot: dict, retention_days: int):
     finally:
         return_pg_connection(conn)
 
-def _db_check_duplicate_content(content_hash: str, lookback_hours: int = 48) -> bool:
-    """Check if content hash exists in recent history."""
-    conn = None
-    try:
-        conn = get_pg_connection()
-        cur = conn.cursor()
+def _db_check_duplicate_content(content_hash: str, lookback_hours: int = 48) -> Optional[bool]:
+    """
+    Check if content hash exists in recent history with RESILIENT retry logic.
+    
+    Strategy:
+    1. Attempt up to 3 times on connection failure
+    2. VALIDATE connection health before querying (important!)
+    3. Close broken connections immediately
+    4. Return None if all retries fail (caller should handle gracefully)
+    5. Return bool (True/False) if check succeeds
+    
+    Returns:
+        True  → Content hash FOUND in recent history (is duplicate)
+        False → Content hash NOT found (is unique)
+        None  → Connection failed after 3 retries (caller should assume False/allow posting)
+    """
+    MAX_RETRIES = 3
+    
+    for attempt in range(MAX_RETRIES):
+        conn = None
+        try:
+            # Get connection from pool (this has internal retry logic)
+            conn = get_pg_connection()
+            
+            # VALIDATE connection is healthy before proceeding
+            test_cur = conn.cursor()
+            test_cur.execute("SELECT 1")
+            test_cur.close()
+            logger.debug(f"✓ Connection health check passed on attempt {attempt + 1} for hash={content_hash[:12]}")
+            
+            # Connection verified → proceed with duplicate check query
+            cur = conn.cursor()
+            cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
+            
+            cur.execute("""
+                SELECT 1 FROM channel_post_history
+                WHERE content_hash = %s AND posted_at > %s
+                LIMIT 1
+            """, (content_hash, cutoff))
+            
+            result = cur.fetchone()
+            cur.close()
+            conn.commit()
+            
+            is_duplicate = result is not None
+            logger.info(
+                f"✓ Duplicate check SUCCEEDED on attempt {attempt + 1}: "
+                f"hash={content_hash[:12]} | is_duplicate={is_duplicate}"
+            )
+            return is_duplicate
+            
+        except (psycopg2.OperationalError, psycopg2.InterfaceError) as e:
+            # Connection error (SSL, network, etc.) → close and retry
+            logger.warning(
+                f"⚠ Postgres duplicate check attempt {attempt + 1} FAILED (connection): "
+                f"hash={content_hash[:12]} | {type(e).__name__}: {str(e)[:100]}"
+            )
+            
+            if conn is not None:
+                try:
+                    pool_obj = get_pg_pool()
+                    pool_obj.putconn(conn, close=True)  # Force close broken connection
+                    logger.debug(f"  └─ Closed broken connection")
+                except Exception as close_err:
+                    logger.warning(f"  └─ Error closing broken connection: {close_err}")
+                    try:
+                        conn.close()
+                    except:
+                        pass
+            
+            if attempt < MAX_RETRIES - 1:
+                logger.info(f"  └─ Retrying in 1 second... ({attempt + 2}/{MAX_RETRIES})")
+                time.sleep(1)
+            else:
+                # All retries exhausted
+                logger.error(
+                    f"❌ Postgres duplicate check FAILED after {MAX_RETRIES} attempts: "
+                    f"hash={content_hash[:12]} | Giving up, allowing post (assume unique)"
+                )
+                return None
         
-        cutoff = datetime.now(timezone.utc) - timedelta(hours=lookback_hours)
-        
-        cur.execute("""
-            SELECT 1 FROM channel_post_history
-            WHERE content_hash = %s AND posted_at > %s
-            LIMIT 1
-        """, (content_hash, cutoff))
-        
-        result = cur.fetchone()
-        cur.close()
-        conn.commit()
-        return result is not None
-    finally:
-        return_pg_connection(conn)
+        except Exception as e:
+            # Unexpected error (SQL syntax, type error, etc.) → don't retry
+            logger.error(
+                f"❌ Unexpected error in duplicate check attempt {attempt + 1}: "
+                f"hash={content_hash[:12]} | {type(e).__name__}: {str(e)[:100]}"
+            )
+            
+            if conn is not None:
+                try:
+                    pool_obj = get_pg_pool()
+                    pool_obj.putconn(conn, close=True)
+                except:
+                    try:
+                        conn.close()
+                    except:
+                        pass
+            
+            # Don't retry on unexpected errors, just fail fast
+            return None
+    
+    # Fallback (should not reach here)
+    logger.error(f"❌ Duplicate check loop exhausted without result: hash={content_hash[:12]}")
+    return None
 
 def _snapshot_has_changed(current: Optional[Dict], incoming: Dict) -> bool:
     """
@@ -885,16 +968,21 @@ async def check_duplicate_post(
     """
     Check if this content was recently posted.
 
-    Fast path: Redis dedup key + sorted set lookup
-    Fallback: Postgres history table
+    FAST PATH: Redis dedup key + sorted set lookup
+    FALLBACK: Postgres history table (with resilient retry)
 
     Returns True if duplicate, False if unique.
     """
     loop = asyncio.get_event_loop()
 
-    logger.debug("Starting duplicate check: ref=%s hash=%s lookback=%sh", ref, content_hash[:12], lookback_hours)
+    logger.debug(
+        f"🔍 Starting duplicate check: ref={ref} | hash={content_hash[:12]} | lookback={lookback_hours}h"
+    )
 
-    # Fast path: Check Redis dedup key
+    # ─────────────────────────────────────────────────────────────────────────
+    # FAST PATH: Redis dedup (instant, no latency)
+    # ─────────────────────────────────────────────────────────────────────────
+    
     def _check_redis():
         try:
             r = get_redis()
@@ -902,19 +990,18 @@ async def check_duplicate_post(
                 logger.warning("Redis client not available")
                 return False
 
-            # Check dedup key
+            # Check dedup key (single hash)
             dedup_key = _channel_dedup_key(content_hash)
             try:
                 exists = r.exists(dedup_key)
             except Exception:
-                # defensive guard if redis client behaves unexpectedly
                 exists = False
 
             if exists:
-                logger.debug("Found dedup key in Redis: %s", dedup_key)
+                logger.info(f"⚡ REDIS FAST HIT: Found dedup key | hash={content_hash[:12]}")
                 return True
 
-            # Check recent posts sorted set
+            # Check recent posts sorted set (last N posts)
             recent_key = _channel_recent_key(ref)
             cutoff = (datetime.now(timezone.utc) - timedelta(hours=lookback_hours)).timestamp()
             recent_hashes = r.zrangebyscore(recent_key, cutoff, '+inf') or []
@@ -930,38 +1017,74 @@ async def check_duplicate_post(
                 else:
                     normalized.add(str(h))
 
-            logger.debug("Redis recent set (%s) size=%d", recent_key, len(normalized))
+            logger.debug(f"Redis recent set ({recent_key}) contains {len(normalized)} hashes")
+            
             if content_hash in normalized:
-                logger.debug("Found matching hash in Redis recent set for %s", ref)
+                logger.info(f"⚡ REDIS FAST HIT: Found in recent set | ref={ref} | hash={content_hash[:12]}")
                 return True
 
+            logger.debug(f"Redis fast-path found NO duplicate for {ref} | hash={content_hash[:12]}")
             return False
 
         except Exception:
-            logger.exception("Redis dedup check failed")
-            return False
+            logger.exception(f"Redis dedup check failed for {ref}, falling back to DB")
+            return None  # None = check failed, not "not found"
 
     try:
-        is_dup = await loop.run_in_executor(None, _check_redis)
-        if is_dup:
-            logger.info("Duplicate detected in Redis: %s (hash=%s)", ref, content_hash[:12])
+        redis_result = await loop.run_in_executor(None, _check_redis)
+        
+        if redis_result is True:
+            logger.info(f"✅ DUPLICATE DETECTED (Redis): ref={ref} hash={content_hash[:12]}")
             return True
-        logger.debug("Redis fast-path did not find duplicate for %s", ref)
-    except Exception:
-        logger.exception("Exception while running Redis check in executor; falling back to DB")
-
-    # Fallback: Check Postgres
-    try:
-        logger.debug("Running DB fallback duplicate check for %s", ref)
-        is_dup = await loop.run_in_executor(None, _db_check_duplicate_content, content_hash, lookback_hours)
-        if is_dup:
-            logger.info("Duplicate detected in Postgres: %s (hash=%s)", ref, content_hash[:12])
+        
+        if redis_result is False:
+            logger.debug(f"Redis returned False for {ref}, proceeding to DB check")
         else:
-            logger.debug("No duplicate found in Postgres for %s", ref)
-        return is_dup
+            logger.warning(f"Redis check failed (returned None), falling back to DB check")
+            
     except Exception:
-        logger.exception("DB dedup check failed")
-        return False
+        logger.exception(f"Exception running Redis check for {ref}, falling back to DB")
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # FALLBACK: Postgres with RESILIENT retry logic
+    # ─────────────────────────────────────────────────────────────────────────
+    
+    logger.info(
+        f"🔄 Postgres fallback duplicate check starting: ref={ref} | hash={content_hash[:12]}"
+    )
+    
+    try:
+        db_result = await loop.run_in_executor(
+            None, 
+            _db_check_duplicate_content, 
+            content_hash, 
+            lookback_hours
+        )
+        
+        if db_result is True:
+            logger.info(f"✅ DUPLICATE DETECTED (Postgres): ref={ref} hash={content_hash[:12]}")
+            return True
+        
+        if db_result is False:
+            logger.info(f"✅ UNIQUE (Postgres): ref={ref} hash={content_hash[:12]}")
+            return False
+        
+        # db_result is None → connection failed after 3 retries
+        logger.warning(
+            f"⚠️ Postgres check returned None (connection failed), ALLOWING POST as default "
+            f"(assume unique): ref={ref} hash={content_hash[:12]}"
+        )
+        return True  # Default to False (allow post) when connection fails
+        
+    except Exception as e:
+        logger.exception(
+            f"❌ Unhandled exception in Postgres fallback check: "
+            f"ref={ref} hash={content_hash[:12]} | {e}"
+        )
+        logger.warning(
+            f"⚠️ Postgres check failed with exception, ALLOWING POST as default (assume unique)"
+        )
+        return True
 
 async def mark_as_posted(ref: str, snapshot: dict):
     """
