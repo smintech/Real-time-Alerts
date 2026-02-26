@@ -3,7 +3,7 @@ from datetime import datetime, timezone
 from typing import Dict, Optional, Any
 from urllib.parse import urlparse
 import requests
-# Attempt to import a timezone object from your settings; fall back to UTC if unavailable.
+
 try:
     from bot.settings import TIMEZONE  # expected to be a tzinfo instance
     _TZ = TIMEZONE if hasattr(TIMEZONE, "tzname") else timezone.utc
@@ -12,24 +12,20 @@ except Exception:
 
 logger = logging.getLogger(__name__)
 if not logger.handlers:
-    # Basic logging config if the host app hasn't configured logging.
+
     logging.basicConfig(level=logging.INFO)
 
-LIVE_USD_NGN_RATE = 1650.0  # Updated initial fallback to a more realistic 2026 value (parallel market rates have been rising)
+LIVE_USD_NGN_RATE = 1650.0  
 
 async def update_exchange_rate():
     global LIVE_USD_NGN_RATE
     try:
-        # We fetch USDTNGN because it represents the actual street/parallel market value of USD in Naira
         url = "https://api.binance.com/api/v3/ticker/price?symbol=USDTNGN"
         response = requests.get(url, timeout=10)
         data = response.json()
         
         new_rate = float(data['price'])
         
-        # --- SAFEGUARD: Reasonable range check ---
-        # Prevents bad API data, network glitches, or future API changes from setting an unrealistic rate
-        # Range 1000–10000 allows for continued naira devaluation into 2026+ while blocking obvious errors
         if 1000 < new_rate < 10000:
             LIVE_USD_NGN_RATE = new_rate
             print(f"✅ Exchange Rate Updated: ₦{LIVE_USD_NGN_RATE:,.2f}")
@@ -46,7 +42,6 @@ def _safe_currency(value: Any, site: str = "jumia") -> str:
         if num <= 0:
             return "Price Unknown"
 
-        # Detect crypto/Binance products (assumes these prices are in USD/USDT)
         is_crypto_site = "binance" in site.lower() or "crypto" in site.lower()
         
         if is_crypto_site:
@@ -58,7 +53,6 @@ def _safe_currency(value: Any, site: str = "jumia") -> str:
             # Show both USD and approximate NGN value
             return f"${num:,.2f} (≈ ₦{naira_equivalent:,.0f})"
             
-        # Default for Nigerian e-commerce sites (Jumia, Konga, etc.) — prices already in NGN
         return f"₦{int(num):,}"
         
     except Exception:
