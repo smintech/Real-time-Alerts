@@ -83,7 +83,7 @@ def touch_activity():
 # -----------------------
 # Security
 # -----------------------
-API_SECRET_KEY = os.getenv("API_SECRET_KEY", "change-this-in-production")
+API_SECRET_KEY = os.getenv("API_SECRET_KEY")
 ALLOWED_IPS = os.getenv("ALLOWED_IPS", "").split(",") if os.getenv("ALLOWED_IPS") else []
 
 def verify_api_key(authorization: str = Header(None)) -> bool:
@@ -666,7 +666,7 @@ async def run_bot_with_signal():
         logger.info("🤖 Bot background task starting...")
         touch_activity()
         await run_bot()
-        logger.info("✅ Bot finished normally (unexpected - should run forever)")
+        logger.info("✅ Bot finished normally")
         
     except Exception as e:
         _bot_error = e
