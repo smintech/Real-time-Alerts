@@ -663,12 +663,6 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
 
     FUEL_TRACKING_KEY = "fuel_prices_nigeria"
 
-    # Wake-up window check
-    if not TEST_MODE:
-        if not (7 <= now.hour < 8):
-            LOG.warning("⚠️  Saturday fuel check ran outside 7-8 AM window (actual time: %02d:%02d)",now.hour,now.minute)
-            return
-
     # Load last snapshot
     snapshot = None
     if not TEST_MODE:
