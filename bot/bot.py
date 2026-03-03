@@ -1136,7 +1136,7 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
 
                         now_utc = now.astimezone(timezone.utc)
                         hours_since = (now_utc - last_dt).total_seconds() / 3600
-                        if hours_since < 6:
+                        if hours_since < 5:
                             LOG.info(f"⏭️  Too recent ({hours_since:.1f}h < 6h), skipping")
                             skipped_count += 1
                             idx += 1
