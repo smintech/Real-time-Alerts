@@ -1,8 +1,8 @@
 import pytz
 import os
 import re
-# Nigeria timezone (West Africa Time - no DST)
-TIMEZONE = pytz.timezone('Africa/Lagos')  # Standard and preferred name
+
+TIMEZONE = pytz.timezone('Africa/Lagos')
 
 # Deal scoring thresholds (% price drop)
 HIGH_DEAL_THRESHOLD = 15   # >15% drop → "high" deal
@@ -68,7 +68,6 @@ CHANNEL_MONITORED_URLS = {
         "SYMBOL:USDTUSD"
     ],
 
-    # New helpful / real product pages
 }
 
 MIN_DROP_PERCENT_FOR_CHANNEL = 3.0   # % price drop
@@ -103,9 +102,9 @@ DEFAULT_FREE_LIMIT = MAX_WATCHES_FREE
 
 DEFAULT_SCHOOL_SOURCES = {
     # --- Higher Education Regulators ---
-    "NUC (Universities)": [
-        "https://www.nuc.edu.ng/"
-    ],
+    #"NUC (Universities)": [
+        #"https://www.nuc.edu.ng/"
+    #],
     # --- Reliable Education News Aggregators (Best for "Daily" updates) ---
     "MySchool.ng": [
         "https://myschool.ng/news"
@@ -113,10 +112,6 @@ DEFAULT_SCHOOL_SOURCES = {
     "Punch Education": [
         "https://punchng.com/topics/education/"
     ],
-
-    #"Lagos State Education": [
-        #"https://lasubeb.lg.gov.ng/"
-    #],  # Replaced OEQA with LASUBEB (more active)
 }
 
 # ============================================================================
