@@ -836,9 +836,9 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
 
     message_lines.extend([
         "",
-        f"🔗 <a href=\"{https://t.me/real_time_alerts_energy}\">Visit Real Time Alerts(ENERGY UPDATES) for more Energy updates⚡️⛽️</a>",
+        f"🔗 <a href=\"https://t.me/real_time_alerts_energy\">Visit Real Time Alerts(ENERGY UPDATES) for more Energy updates⚡️⛽️</a>",
         "",
-        f"🔗 <a href=\"{https://t.me/Real_Time_Alert}\">Visit Real Time Alerts(SCHOOL NEWS) for school updates 🗞️📰</a>",
+        f"🔗 <a href=\"https://t.me/Real_Time_Alert\">Visit Real Time Alerts(SCHOOL NEWS) for school updates 🗞️📰</a>",
         "",
         "<i>Tap source links for live updates</i> 🔗",
     ])
@@ -1036,13 +1036,12 @@ async def check_and_post_school_updates(context: ContextTypes.DEFAULT_TYPE):
                 "",
                 f"🔗 <a href=\"{source_url}\">Visit {source_name}</a>",
                 "",
-                f"🔗 <a href=\"{https://t.me/real_time_alerts_energy}\">Visit Real Time Alerts(ENERGY UPDATES) for Energy updates⚡️⛽️</a>",
+                f"🔗 <a href=\"https://t.me/real_time_alerts_energy\">Visit Real Time Alerts(ENERGY UPDATES) for Energy updates⚡️⛽️</a>",
                 "",
-                f"🔗 <a href=\"{https://t.me/Real_Time_Alert}\">Visit Real Time Alerts(SCHOOL NEWS) for more school updates 🗞️📰</a>",
+                f"🔗 <a href=\"https://t.me/Real_Time_Alert\">Visit Real Time Alerts(SCHOOL NEWS) for more school updates 🗞️📰</a>",
                 "",
                 f"<i>#EducationUpdates #{source_name.replace(' ', '').replace('(', '').replace(')', '')}</i>"
             ])
-
             report_text = "\n".join(report_lines)
 
             # Truncate if needed
