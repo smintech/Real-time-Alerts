@@ -33,6 +33,7 @@ NOTIFY_ON_DELISTED = True      # send user notice on delist/OOS/pause
 # Channel auto-posting (optional feature)
 AUTO_POST_TO_CHANNEL = True  # Set to False to disable entirely
 CHANNEL_DEAL_CHAT_ID = [int(x.strip()) for x in os.getenv("CHANNEL", "").split(",") if x.strip()] # Your channel ID (make bot admin with post rights)
+FUEL_CHANNEL = [int(x.strip()) for x in os.getenv("FUEL_CHANNEL", "").split(",") if x.strip()]
 
 CHANNEL_MONITORED_URLS = {
     # Phones
