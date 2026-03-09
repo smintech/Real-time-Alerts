@@ -32,6 +32,7 @@ from bot.settings import (
     MAX_WATCHES_FREE,
     PAID_TIERS,
     DEFAULT_SCHOOL_SOURCES,
+    FUEL_CHANNEL
 )
 
 from Utils.utils import (
@@ -655,7 +656,7 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
     current_day_name = now.strftime('%A')
     
     if not TEST_MODE:
-        if current_weekday != 5:  # 5 = Saturday
+        if current_weekday not in (2, 5):  # 5 = Saturday
             LOG.debug("⏭️  Skipping fuel price check — today is %s (%d), not Saturday",current_day_name,current_weekday)
             return
     
@@ -847,7 +848,7 @@ async def check_and_post_fuel_prices(context: ContextTypes.DEFAULT_TYPE):
 
     # Send
     sent_successfully = False
-    targets = CHANNEL_DEAL_CHAT_ID if isinstance(CHANNEL_DEAL_CHAT_ID, list) else [CHANNEL_DEAL_CHAT_ID]
+    targets = FUEL_CHANNEL if isinstance(FUEL_CHANNEL, list) else [FUEL_CHANNEL]
     
     for chat_id in targets:
         try:
