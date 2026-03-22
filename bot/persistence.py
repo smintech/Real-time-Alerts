@@ -24,7 +24,7 @@ logger = logging.getLogger(__name__)
 # ═══════════════════════════════════════════════════════════════════════════
 
 REDIS_URL = os.getenv("REDIS_URL")
-REDIS_TTL_SECONDS = 48 * 3600  # 48 hours for fast dedup cache
+REDIS_TTL_SECONDS = 30 * 24 * 3600  # 48 hours for fast dedup cache
 POSTGRES_RETENTION_DAYS = int(os.getenv("POSTGRES_RETENTION_DAYS", "30"))  # 30 days default
 
 # Neon/PostgreSQL connection settings
