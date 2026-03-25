@@ -26,7 +26,7 @@ on:
 
 env:
   BASE_URL: https://real-time-alerts-1.onrender.com
-  WAKEUP_DELAY: 30
+  WAKEUP_DELAY: 50
 
 jobs:
   school-updates:
