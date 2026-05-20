@@ -5,8 +5,8 @@ on:
     # School updates: Every 6 hours (00:00, 06:00, 12:00, 18:00 UTC)
     - cron: "0 */6 * * *"
     # Fuel prices: Saturday 06:30 UTC (changed to avoid conflict)
-    - cron: "30 6 * * 3"  # Wednesday
-    - cron: "30 6 * * 6"  # Saturday
+    #- cron: "30 6 * * 3"  # Wednesday
+    #- cron: "30 6 * * 6"  # Saturday
     # Cleanup: Every Sunday at 03:00 UTC (weekly)
     - cron: "0 3 * * 0"
   workflow_dispatch:
